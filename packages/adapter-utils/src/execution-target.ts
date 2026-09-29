@@ -1274,6 +1274,64 @@ export async function ensureAdapterExecutionTargetFile(
 }
 
 /**
+ * Write a text file on a remote execution target. The body travels on stdin.
+ * It is not placed in argv or in an environment variable: both share Linux
+ * MAX_ARG_STRLEN, and a prompt past that limit is why this exists.
+ */
+export async function writeAdapterExecutionTargetTextFile(
+  runId: string,
+  target: AdapterExecutionTarget | null | undefined,
+  filePath: string,
+  body: string,
+  options: AdapterExecutionTargetShellOptions,
+): Promise<void> {
+  if (!target || target.kind === "local") {
+    throw new Error("Local prompt files are written on the host, not through the remote installer.");
+  }
+  if (!filePath.startsWith("/") || filePath.split("/").includes("..")) {
+    throw new Error(`Remote prompt path must be an absolute path inside the target: "${filePath}"`);
+  }
+  if (Buffer.byteLength(filePath) >= 131072) {
+    throw new Error(`Remote prompt path is ${Buffer.byteLength(filePath)} bytes and does not fit in one argument.`);
+  }
+  const command = remoteTextFileInstallCommand(filePath);
+  if (command.includes(body)) {
+    throw new Error("Refusing to place the prompt on the remote command line.");
+  }
+  const publishEnv: Record<string, string> = {};
+  const pathValue = options.env.PATH;
+  if (typeof pathValue === "string" && pathValue.length > 0 && Buffer.byteLength(pathValue) < 131072) {
+    publishEnv.PATH = pathValue;
+  }
+  for (const value of Object.values(publishEnv)) {
+    if (value === body || Buffer.byteLength(value) >= 131072) {
+      throw new Error("Refusing to publish a prompt file with the prompt in the environment.");
+    }
+  }
+  const runner = adapterExecutionTargetCommandRunner(target);
+  const shell = adapterExecutionTargetShellCommand(target);
+  const result = await runner.execute({
+    command: shell,
+    args: shellCommandArgs(command),
+    cwd: target.remoteCwd,
+    env: sanitizeRemoteExecutionEnv(publishEnv),
+    stdin: body,
+    timeoutMs: (options.timeoutSec ?? 60) * 1000,
+    bypassSession: true,
+  });
+  if (result.timedOut || (result.exitCode ?? 1) !== 0) {
+    throw new Error(
+      `Failed to publish the Grok prompt file for run ${runId} (${Buffer.byteLength(body)} bytes) into the execution target (exit ${result.exitCode ?? "null"}).`,
+    );
+  }
+}
+
+function remoteTextFileInstallCommand(filePath: string): string {
+  const quoted = `'${filePath.replace(/'/g, `'"'"'`)}'`;
+  return `cat > ${quoted} && chmod 600 ${quoted}`;
+}
+
+/**
  * Ensure a working directory exists (and is a directory) on the execution target.
  *
  * For local targets this delegates to the local `ensureAbsoluteDirectory` helper

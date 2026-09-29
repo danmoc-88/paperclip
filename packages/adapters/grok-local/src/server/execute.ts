@@ -16,6 +16,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
+  writeAdapterExecutionTargetTextFile,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asBoolean,
@@ -45,6 +46,13 @@ import {
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
+import {
+  LINUX_MAX_ARG_STRLEN,
+  formatGrokPromptDeliveryDiagnostic,
+  grokPromptExceedsSingleArgument,
+  paperclipGrokPromptRemotePath,
+  writePaperclipGrokPromptFile,
+} from "./grok-prompt-file.js";
 import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -455,7 +463,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const commandNotes = (() => {
-      const notes: string[] = ["Prompt is passed to Grok via --single in headless mode."];
+      const notes: string[] = [];
       if (alwaysApprove) notes.push("Added --always-approve for unattended execution.");
       if (stagedAssets.stagedInstructionsPath) {
         notes.push(`Staged project instructions at ${stagedAssets.stagedInstructionsPath} for native Grok discovery.`);
@@ -510,6 +518,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       heartbeatPromptChars: renderedPrompt.length,
     };
 
+    const scratchRecord = parseObject(context.paperclipScratch);
+    const scratchDir =
+      env.PAPERCLIP_RUN_SCRATCH_DIR ??
+      (scratchRecord.type === "heartbeat_run" && typeof scratchRecord.dir === "string"
+        ? scratchRecord.dir
+        : null);
+    const promptBytes = Buffer.byteLength(prompt);
+    let promptArg: { flag: "--single" | "--prompt-file"; value: string };
+    if (grokPromptExceedsSingleArgument(prompt)) {
+      const hostPath = await writePaperclipGrokPromptFile({ runId, prompt, scratchDir });
+      let agentPath = hostPath;
+      if (executionTargetIsRemote) {
+        agentPath = paperclipGrokPromptRemotePath(runId);
+        await writeAdapterExecutionTargetTextFile(runId, runtimeExecutionTarget, agentPath, prompt, {
+          cwd,
+          env,
+          timeoutSec: 60,
+        });
+      }
+      if (Buffer.byteLength(agentPath) >= LINUX_MAX_ARG_STRLEN) {
+        throw new Error(
+          `Grok prompt path is ${Buffer.byteLength(agentPath)} bytes and does not fit in one argument.`,
+        );
+      }
+      promptArg = { flag: "--prompt-file", value: agentPath };
+      commandNotes.unshift(
+        `Prompt is ${promptBytes} bytes, past the single-argument limit, so Grok reads it via --prompt-file. The full text stays in the run file.`,
+      );
+      await onLog(
+        "stdout",
+        formatGrokPromptDeliveryDiagnostic({
+          mode: "file",
+          bytes: promptBytes,
+          argBytes: Buffer.byteLength(agentPath),
+        }),
+      );
+    } else {
+      promptArg = { flag: "--single", value: prompt };
+      commandNotes.unshift("Prompt is passed to Grok via --single in headless mode.");
+    }
+
     const buildArgs = (resumeSessionId: string | null) => {
       const args = ["--cwd", effectiveExecutionCwd, "--output-format", "streaming-json"];
       if (resumeSessionId) args.push("--resume", resumeSessionId);
@@ -526,7 +575,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return asStringArray(config.args);
       })();
       if (extraArgs.length > 0) args.push(...extraArgs);
-      args.push("--single", prompt);
+      args.push(promptArg.flag, promptArg.value);
       return args;
     };
 
@@ -539,7 +588,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           cwd: effectiveExecutionCwd,
           commandNotes,
           commandArgs: args.map((value, index) => (
-            index === args.length - 1 ? `<prompt ${prompt.length} chars>` : value
+            args[index - 1] === "--single" ? `<prompt ${prompt.length} chars>` : value
           )),
           env: loggedEnv,
           prompt,

@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => {
     ensureCommandMock: vi.fn(async () => {}),
     resolveCommandForLogsMock: vi.fn(async () => "grok"),
     runProcessMock: vi.fn(),
+    writeTextFileMock: vi.fn(async () => {}),
     prepareRuntimeMock: vi.fn(
       async (input: { assets?: Array<{ key: string; localDir: string; followSymlinks?: boolean }> }) => {
         const override = state.prepareRuntimeResult;
@@ -44,6 +45,7 @@ const {
   ensureCommandMock,
   resolveCommandForLogsMock,
   runProcessMock,
+  writeTextFileMock,
   prepareRuntimeMock,
 } = mocks;
 
@@ -68,6 +70,8 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   resolveAdapterExecutionTargetTimeoutSec: (_target: unknown, timeoutSec: number) => timeoutSec,
   runAdapterExecutionTargetProcess: (...args: unknown[]) =>
     (mocks.runProcessMock as (...args: unknown[]) => unknown)(...args),
+  writeAdapterExecutionTargetTextFile: (...args: unknown[]) =>
+    (mocks.writeTextFileMock as (...args: unknown[]) => unknown)(...args),
 }));
 
 import { execute } from "./execute.js";
@@ -167,6 +171,7 @@ describe("grok_local execute", () => {
     prepareRuntimeMock.mockClear();
     resolveCommandForLogsMock.mockClear();
     runProcessMock.mockReset();
+    writeTextFileMock.mockReset();
   });
 
   afterEach(async () => {
@@ -687,5 +692,118 @@ describe("grok_local execute", () => {
         grokAuth({ key: "host-key", expiresAt: OLDER_EXPIRY }),
       );
     });
+  });
+
+  it("keeps a short prompt on --single", async () => {
+    let seenArgs: string[] = [];
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args) => {
+      seenArgs = args as string[];
+      return makeSuccessfulRunResult();
+    });
+
+    const ctx = await makeCtx("run-short-prompt", await makeTempRoot());
+    ctx.config = { ...ctx.config, promptTemplate: "krotki-prompt-ping" };
+    await execute(ctx);
+
+    const flagIndex = seenArgs.indexOf("--single");
+    expect(flagIndex).toBeGreaterThan(-1);
+    expect(seenArgs[flagIndex + 1]).toContain("krotki-prompt-ping");
+    expect(seenArgs).not.toContain("--prompt-file");
+    expect(writeTextFileMock).not.toHaveBeenCalled();
+  });
+
+  it("writes a prompt past 131072 bytes to the run file and does not pass it as an argument", async () => {
+    const marker = "Zażółć-grok-prompt-MARKER";
+    const promptTemplate = `${marker}${"ą".repeat(70_000)}`;
+    expect(Buffer.byteLength(promptTemplate)).toBeGreaterThan(131072);
+    const scratch = await makeTempRoot();
+    let seenArgs: string[] = [];
+    let seenEnv: Record<string, string> = {};
+    const logs: string[] = [];
+    let recordedPrompt = "";
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args, options) => {
+      seenArgs = args as string[];
+      seenEnv = (options as { env: Record<string, string> }).env;
+      return makeSuccessfulRunResult();
+    });
+
+    const ctx = await makeCtx("run-long-prompt", await makeTempRoot());
+    ctx.config = {
+      ...ctx.config,
+      promptTemplate,
+      env: { PAPERCLIP_RUN_SCRATCH_DIR: scratch },
+    };
+    ctx.context = { paperclipScratch: { type: "heartbeat_run", dir: scratch } };
+    ctx.onMeta = async (meta) => {
+      recordedPrompt = typeof meta.prompt === "string" ? meta.prompt : "";
+    };
+    ctx.onLog = async (_stream, chunk) => {
+      logs.push(chunk);
+    };
+
+    await execute(ctx);
+
+    const flagIndex = seenArgs.indexOf("--prompt-file");
+    expect(flagIndex).toBeGreaterThan(-1);
+    const promptPath = seenArgs[flagIndex + 1] ?? "";
+    expect(seenArgs).not.toContain("--single");
+    expect(promptPath.startsWith(scratch)).toBe(true);
+    expect(promptPath.endsWith("paperclip-grok-prompt.txt")).toBe(true);
+    const file = await fs.readFile(promptPath, "utf8");
+    expect(file).toBe(recordedPrompt);
+    expect(file).toContain(marker);
+    expect(Buffer.byteLength(file)).toBeGreaterThan(131072);
+    for (const arg of seenArgs) {
+      expect(Buffer.byteLength(arg)).toBeLessThan(131072);
+      expect(arg).not.toContain(marker);
+    }
+    for (const value of Object.values(seenEnv)) {
+      expect(value).not.toContain(marker);
+      expect(Buffer.byteLength(value)).toBeLessThan(131072);
+    }
+    expect(logs.join("")).toContain("grok prompt delivery=file");
+    expect(logs.join("")).not.toContain(marker);
+    expect(writeTextFileMock).not.toHaveBeenCalled();
+    const mode = (await fs.stat(promptPath)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it("publishes an oversized prompt into a remote target instead of argv", async () => {
+    mocks.state.isRemote = true;
+    const marker = "Zażółć-remote-prompt-MARKER";
+    const promptTemplate = `${marker}${"x".repeat(140_000)}`;
+    const scratch = await makeTempRoot();
+    let seenArgs: string[] = [];
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args) => {
+      seenArgs = args as string[];
+      return makeSuccessfulRunResult();
+    });
+
+    const ctx = await makeCtx("run-remote-long-prompt", await makeTempRoot());
+    ctx.config = {
+      ...ctx.config,
+      promptTemplate,
+      env: { PAPERCLIP_RUN_SCRATCH_DIR: scratch },
+    };
+    ctx.context = { paperclipScratch: { type: "heartbeat_run", dir: scratch } };
+    await execute(ctx);
+
+    expect(writeTextFileMock).toHaveBeenCalledTimes(1);
+    const published = writeTextFileMock.mock.calls[0] as unknown[];
+    const remotePath = published[2];
+    const body = published[3];
+    expect(remotePath).toBe("/tmp/paperclip-grok-prompt-run-remote-long-prompt.txt");
+    expect(typeof body).toBe("string");
+    expect(Buffer.byteLength(body as string)).toBeGreaterThan(131072);
+    expect(body).toContain(marker);
+    expect(seenArgs).toContain("--prompt-file");
+    expect(seenArgs).toContain("/tmp/paperclip-grok-prompt-run-remote-long-prompt.txt");
+    expect(seenArgs).not.toContain("--single");
+    for (const arg of seenArgs) {
+      expect(arg).not.toContain(marker);
+      expect(Buffer.byteLength(arg)).toBeLessThan(131072);
+    }
+    const hostFile = await fs.readFile(path.join(scratch, "paperclip-grok-prompt.txt"), "utf8");
+    expect(hostFile).toBe(body);
   });
 });
