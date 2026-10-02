@@ -41,8 +41,9 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker: executionB
   });
   const failedRun = runs?.find(run => run.runId === blocker.runId &&
     ["failed", "timed_out"].includes(run.status));
-  const interruptedRun = runs?.find(run => run.runId === blocker.runId &&
-    run.status === "interrupted");
+  const orphanedRun = runs?.find(run => run.runId === blocker.runId &&
+    run.status === "interrupted" && run.runtimeMode === "legacy" &&
+    run.errorCode === "orphaned_running_run");
   const reconcile = useMutation({
     mutationFn: () => issuesApi.resolveRecoveryAction(issueId, {
       actionId: reconciliationActionId!,
@@ -81,7 +82,7 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker: executionB
           {retry.isPending ? "Retrying…" : "Retry"}
         </Button>
       )}
-      {interruptedRun && reconciliationActionId && reconciliationCause === "legacy_execution_requires_reconciliation" && (
+      {orphanedRun && reconciliationActionId && reconciliationCause === "legacy_execution_requires_reconciliation" && (
         <form className="w-full" onSubmit={(event) => {
           event.preventDefault();
           if (!ownershipHeld && confirmed && outcomeEvidence.trim().length >= 20 && !reconcile.isPending) reconcile.mutate();

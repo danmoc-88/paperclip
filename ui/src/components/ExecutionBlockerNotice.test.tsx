@@ -56,10 +56,10 @@ describe("stopped task recovery notice", () => {
     expect(agentsApi.retryFailedRun).toHaveBeenCalledWith("agent", "failed-run", "company");
     expect(onRetried).toHaveBeenCalledOnce();
   });
-  it("requires evidence and confirmation to reconcile an interrupted run", async () => {
+  it("requires evidence and confirmation to reconcile an orphaned legacy run", async () => {
     await act(async () => {
       client.setQueryData([...(await import("../lib/queryKeys")).queryKeys.issues.runs("task")],
-        [{ runId: "failed-run", agentId: "agent", status: "interrupted" }]);
+        [{ runId: "failed-run", agentId: "agent", status: "interrupted", runtimeMode: "legacy", errorCode: "orphaned_running_run" }]);
       await new Promise(resolve => setTimeout(resolve, 10));
     });
     const submit = container.querySelector<HTMLButtonElement>('button[type="submit"]')!;
@@ -85,10 +85,25 @@ describe("stopped task recovery notice", () => {
     expect(agentsApi.retryFailedRun).not.toHaveBeenCalled();
     expect(onRetried).toHaveBeenCalledOnce();
   });
+  it.each([
+    { runtimeMode: "legacy", errorCode: "user_interrupted" },
+    { runtimeMode: "native", errorCode: "orphaned_running_run" },
+    { runtimeMode: "legacy", errorCode: null },
+    { runtimeMode: null, errorCode: "orphaned_running_run" },
+  ])("does not offer orphan recovery for $runtimeMode / $errorCode", async (run) => {
+    await act(async () => {
+      client.setQueryData([...(await import("../lib/queryKeys")).queryKeys.issues.runs("task")],
+        [{ runId: "failed-run", agentId: "agent", status: "interrupted", ...run }]);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.textContent).not.toContain("Record evidence and continue");
+    expect(issuesApi.resolveRecoveryAction).not.toHaveBeenCalled();
+  });
   it.each([true, false])("keeps reconciliation visible with ownership hold=%s", async (held) => {
     await act(async () => {
       client.setQueryData([...(await import("../lib/queryKeys")).queryKeys.issues.runs("task")],
-        [{ runId: "failed-run", agentId: "agent", status: "interrupted" }]);
+        [{ runId: "failed-run", agentId: "agent", status: "interrupted", runtimeMode: "legacy", errorCode: "orphaned_running_run" }]);
       root.render(<QueryClientProvider client={client}>
         <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried}
           blocker={held ? { recoveryActionId: null, runId: "failed-run", agentId: "agent",

@@ -9239,7 +9239,7 @@ export function issueRoutes(
               activeRecoveryAction.cause !== "legacy_execution_requires_reconciliation" ||
               executionReconciliation?.actionOutcome !== "not_performed"
             ) {
-              throw forbidden("Only the assigned agent can reconcile an orphaned run with verified unperformed actions.");
+              throw forbidden("Agent reconciliation requires the assigned agent, an orphaned legacy run, and the not_performed outcome.");
             }
           } else {
             assertBoard(req);
