@@ -177,32 +177,40 @@ export function ConnectionIntentInteractionBody({
   } : null;
 
   const resultOutcome = interaction.result?.outcome;
+  // Only `pending` is live. Every other status is read as terminal, including
+  // the ones this card has no copy of its own for: a withdrawn request is
+  // stored as `cancelled` with `result.outcome: "expired"` (connection intents
+  // have no `withdrawn` outcome), and `answered`/`failed` are just as dead.
+  // Enumerating terminal statuses instead left those on the live branch, where
+  // the setup query is disabled — so "Connect" opened an empty dialog.
   const status =
-    interaction.status === "accepted"
-      ? {
-          icon: CheckCircle2,
-          title: `${interaction.payload.serviceName} connected`,
-          body: isAi ? "This agent can now use the connection." : `${interaction.payload.requestingAgentName} can use this connection on the continuation run.`,
-        }
-      : interaction.status === "rejected"
+    interaction.status === "pending"
+      ? null
+      : interaction.status === "accepted"
         ? {
-            icon: XCircle,
-            title: "Connection declined",
-            body: isAi ? "The task still needs a working AI connection before it can run." : `${interaction.payload.requestingAgentName} was notified and can continue without it.`,
+            icon: CheckCircle2,
+            title: `${interaction.payload.serviceName} connected`,
+            body: isAi ? "This agent can now use the connection." : `${interaction.payload.requestingAgentName} can use this connection on the continuation run.`,
           }
-        : interaction.status === "expired"
+        : interaction.status === "rejected"
           ? {
+              icon: XCircle,
+              title: "Connection declined",
+              body: isAi ? "The task still needs a working AI connection before it can run." : `${interaction.payload.requestingAgentName} was notified and can continue without it.`,
+            }
+          : {
               icon: Clock,
               title:
                 resultOutcome === "superseded"
                   ? "Request superseded"
-                  : "Connection request expired",
+                  : interaction.status === "cancelled"
+                    ? "Connection request withdrawn"
+                    : "Connection request expired",
               body:
                 resultOutcome === "superseded"
                   ? "This request was replaced. Use the latest connection card instead."
                   : "This request is no longer active.",
-            }
-          : null;
+            };
   const StatusIcon = status?.icon;
 
   if (status && StatusIcon) {
@@ -259,7 +267,11 @@ export function ConnectionIntentInteractionBody({
 
   const repair = setupQuery.data?.aiRepair;
   const selectedReady = repair && setupQuery.data?.existingConnections.some((connection) => connection.id === repair.connection.id);
-  const setupContent = setupQuery.isLoading ? (
+  // `isPending` rather than `isLoading`: a query that has no data yet because
+  // it is disabled is not "loading", and reading it that way is what let the
+  // dialog render an empty body. Erroring queries leave `isPending`, so the
+  // error branch below still wins.
+  const setupContent = setupQuery.isPending ? (
                 <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-muted-foreground">
                   <Loader2 className="h-4 w-4 animate-spin" /> Loading
                   connection options…
@@ -285,7 +297,7 @@ export function ConnectionIntentInteractionBody({
               ) : setupProps ? (
                 renderSetup ? renderSetup(setupProps) : <ConnectionSetupFlow {...setupProps} />
               ) : null;
-  const inlineContent = setupQuery.isLoading || setupQuery.isError ? setupContent
+  const inlineContent = setupQuery.isPending || setupQuery.isError ? setupContent
     : selectedReady ? <div className="space-y-3">
         <p className="text-sm">{repair.connection.name} is ready.</p>
         <Button disabled={completeMutation.isPending} onClick={() => completeMutation.mutate(repair.connection.id)}>
