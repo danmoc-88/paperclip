@@ -72,6 +72,15 @@ export type PreDrainFacts = {
   hasAssigneeUser: boolean;
   assigneeAgentMatchesRunAgent: boolean;
   legacyExecutionNeedsReconciliation: boolean;
+  /**
+   * True when this run was cancelled because the issue was reassigned away from
+   * its agent, and the issue now belongs to a different agent. Reconciliation
+   * and an acknowledged cancellation both protect the finishing run's *own*
+   * continuation; a handoff has no such continuation to protect and creates no
+   * reconciliation owner for the cancellation, so holding the queue on either
+   * ground strands the new assignee's wake with nothing left to release it.
+   */
+  reassignedAwayFromRunAgent: boolean;
   /** True when the finishing run is cancelled and its stored result carries an acknowledged execution cancellation. */
   executionCancellationAcknowledged: boolean;
 };
@@ -85,7 +94,8 @@ export type PreDrainDecision =
  * Decides the pre-drain release outcome for one lock acquisition, before the
  * caller runs its own lock function. Check order is fixed: the issue-row
  * check runs first, then the blocked-notice check, then legacy-execution
- * reconciliation, then acknowledged execution cancellation. Each check
+ * reconciliation, then acknowledged execution cancellation -- the last two
+ * only while the issue has not been handed to another agent. Each check
  * returns as soon as it applies, so an earlier true condition can hide a
  * later one when both hold at the same time. "proceed" means none of the
  * four checks applied; the caller then runs its own write-carrying check
@@ -108,11 +118,11 @@ export function decidePreDrain(facts: PreDrainFacts): PreDrainDecision {
     };
   }
 
-  if (facts.legacyExecutionNeedsReconciliation) {
+  if (facts.legacyExecutionNeedsReconciliation && !facts.reassignedAwayFromRunAgent) {
     return { kind: "released" };
   }
 
-  if (facts.executionCancellationAcknowledged) {
+  if (facts.executionCancellationAcknowledged && !facts.reassignedAwayFromRunAgent) {
     return { kind: "released" };
   }
 

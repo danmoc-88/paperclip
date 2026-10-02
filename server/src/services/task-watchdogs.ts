@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -1074,6 +1074,23 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .groupBy(issueWorkProducts.issueId),
     ]);
+    // A wake deferred behind issue execution is only a maintained path while the
+    // lock it waits on is still held: that holder's release drains the queue.
+    // Once the lock is gone the wake owns no next action this watchdog could
+    // renew, so it must not read as a live queue over the stopped subtree.
+    const lockedIssueIds = new Set(
+      (
+        await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, subtreeIssueIds),
+            isNotNull(issues.executionRunId),
+          ))
+      ).map((row) => row.id),
+    );
+
     const latestCommentByIssueId = new Map(commentActivityRows.map((row) => [row.issueId, row.latestAt]));
     const latestDocumentByIssueId = new Map(documentActivityRows.map((row) => [row.issueId, row.latestAt]));
     const latestWorkProductByIssueId = new Map(workProductActivityRows.map((row) => [row.issueId, row.latestAt]));
@@ -1109,12 +1126,15 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         status: row.status,
         issueId: issueIdFromRunContext(row.contextSnapshot),
       })).concat(activeIssueRunRows),
-      queuedWakeRequests: wakeRows.map((row) => ({
-        companyId: row.companyId,
-        agentId: row.agentId,
-        status: row.status,
-        issueId: issueIdFromWakePayload(row.payload),
-      })),
+      queuedWakeRequests: wakeRows
+        .map((row) => ({
+          companyId: row.companyId,
+          agentId: row.agentId,
+          status: row.status,
+          issueId: issueIdFromWakePayload(row.payload),
+        }))
+        .filter((row) => row.status !== "deferred_issue_execution" ||
+          (row.issueId !== null && lockedIssueIds.has(row.issueId))),
       blockers: blockerRows,
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
@@ -1179,6 +1199,23 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
   }
 
   async function hasLivePathForIssue(companyId: string, issueId: string) {
+    // Same rule as `collectClassifierInput`: a wake deferred behind issue
+    // execution is a live path only while the lock it waits on is still held.
+    // Counting a stranded deferred wake as live is what makes this watchdog
+    // report `currentState: live` while being unable to renew that wake.
+    const executionLocked = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.id, issueId),
+        isNotNull(issues.executionRunId),
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    const wakeStatuses = TASK_WATCHDOG_WAKE_REQUEST_STATUSES.filter(
+      (status) => executionLocked || status !== "deferred_issue_execution",
+    );
     const [run, issueRun, wake] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
@@ -1207,7 +1244,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         .from(agentWakeupRequests)
         .where(and(
           eq(agentWakeupRequests.companyId, companyId),
-          inArray(agentWakeupRequests.status, [...TASK_WATCHDOG_WAKE_REQUEST_STATUSES]),
+          inArray(agentWakeupRequests.status, wakeStatuses),
           sql`(${agentWakeupRequests.payload}->>'issueId' = ${issueId}
             OR ${agentWakeupRequests.payload}->>'taskId' = ${issueId}
             OR ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId' = ${issueId}

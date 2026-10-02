@@ -19334,19 +19334,28 @@ export function heartbeatService(
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
+      const strandedIssueId = String(wake.payload?.issueId);
       if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
-      const [latest] = await db.select().from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
-      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+          !await readQueuedInteractionResponse(db, wake.companyId, strandedIssueId, wake.payload)) continue;
+      const latestIssueRun = (agentId?: string) => db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, wake.companyId),
+        agentId ? eq(heartbeatRuns.agentId, agentId) : undefined,
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${strandedIssueId}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1).then(rows => rows[0]);
+      // Handing an issue to its reviewer strands the new assignee's wake behind
+      // a lock the *previous* owner held, and that owner's run is the release
+      // key. Fall back to the issue's own last run when this agent never ran
+      // this issue itself, so a first wake after a handoff is not deferred
+      // forever. An own run that is still live keeps the strict path: its
+      // non-terminal status below leaves the wake deferred, as before.
+      const latest = await latestIssueRun(wake.agentId) ?? await latestIssueRun();
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       if (!latest || latest.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(latest.status)) continue;
       const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
         latest.errorCode === "execution_reconciliation_required";
-      if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
+      if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, strandedIssueId)) {
         await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
           logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");
         });

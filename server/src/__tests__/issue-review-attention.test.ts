@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests,
@@ -98,6 +99,46 @@ describeEmbeddedPostgres("issue review attention", () => {
     });
     return id;
   }
+
+  it("counts a wake deferred behind issue execution only while that lock is still held", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({ companyId, agentId, identifier: "RVA-9" });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_comment_mentioned",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+    });
+
+    const readAttention = async () =>
+      (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === issueId)
+        ?.reviewAttention;
+
+    // The lock the wake waits on is already gone: nothing is left to drain the
+    // queue, so this wake owns no next action and must not read as covered.
+    expect(await readAttention()).toMatchObject({ state: "stalled", paths: [] });
+
+    const holderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { wakeReason: "issue_assigned" },
+    });
+    await db.update(issues).set({ executionRunId: holderRunId }).where(eq(issues.id, issueId));
+
+    // With the lock held, the holder's release drains the queue: a maintained path.
+    expect(await readAttention()).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({ kind: "queued_wake", responder: "Review Agent" })],
+    });
+  });
 
   it("surfaces a pathless agent-owned review as stalled and a queued recovery as covered", async () => {
     const { companyId, agentId } = await seed();

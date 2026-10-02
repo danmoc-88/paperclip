@@ -4655,6 +4655,21 @@ async function listIssueReviewAttentionMap(
     }
   }
 
+  // A wake deferred behind issue execution is only a maintained path while the
+  // lock it waits on is still held: that holder's release drains the queue. Once
+  // the lock is gone, the wake owns no next action a reviewer or the watchdog can
+  // renew, so it must not read as a live queue here.
+  const lockedReviewIssueIds = new Set(
+    reviewIssues.filter((issue) => issue.executionRunId).map((issue) => issue.id),
+  );
+  const maintainedWakeRows = (
+    wakeRows as NonNullable<IssueGraphLivenessInput["queuedWakeRequests"]>
+  ).filter(
+    (row) =>
+      row.status !== "deferred_issue_execution" ||
+      (row.issueId !== null && lockedReviewIssueIds.has(row.issueId)),
+  );
+
   const livenessInput: IssueGraphLivenessInput = {
     issues: reviewIssues.map((issue) => ({
       id: issue.id,
@@ -4680,7 +4695,7 @@ async function listIssueReviewAttentionMap(
     relations: [],
     agents: agentRows,
     activeRuns: activeRunRows,
-    queuedWakeRequests: wakeRows,
+    queuedWakeRequests: maintainedWakeRows,
     pendingInteractions: interactionRows,
     pendingApprovals: approvalRows,
     openRecoveryIssues: recoveryPaths,

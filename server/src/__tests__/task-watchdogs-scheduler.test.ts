@@ -357,6 +357,66 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(watchdogIssues).toHaveLength(0);
   });
 
+  it("keeps the source live for a wake deferred behind a held execution lock, and stops once it is released", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-DEFER", status: "in_progress" });
+    const agentId = await seedAgent(companyId);
+    const childId = await seedIssue(companyId, {
+      parentId: sourceId,
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
+    await seedWatchdog(companyId, sourceId, agentId);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      status: "deferred_issue_execution",
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_comment_mentioned",
+      payload: { issueId: childId },
+    });
+    const [holderRun] = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+        contextSnapshot: { wakeReason: "issue_assigned" },
+      })
+      .returning({ id: heartbeatRuns.id });
+    await db
+      .update(issues)
+      .set({ executionRunId: holderRun!.id })
+      .where(eq(issues.id, childId));
+
+    const held = createService();
+    expect(await held.service.reconcileTaskWatchdogs({ companyId })).toMatchObject({
+      checked: 1,
+      triggered: 0,
+      live: 1,
+    });
+    expect(held.wakes).toHaveLength(0);
+
+    // Release the lock without draining the queue: the deferred wake now owns no
+    // next action, and this watchdog cannot renew it, so it must not read as live.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, holderRun!.id));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, childId));
+
+    const released = createService();
+    expect(await released.service.reconcileTaskWatchdogs({ companyId })).toMatchObject({
+      checked: 1,
+      triggered: 1,
+      live: 0,
+    });
+    expect(released.wakes).toHaveLength(1);
+  });
+
   it("does not keep the source live for runs under a nested task-watchdog issue", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-NEST", status: "done" });
