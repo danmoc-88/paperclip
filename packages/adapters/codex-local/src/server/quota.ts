@@ -9,7 +9,6 @@ import {
 } from "./parse.js";
 
 const CODEX_USAGE_SOURCE_RPC = "codex-rpc";
-const CODEX_USAGE_SOURCE_WHAM = "codex-wham";
 const MAX_QUOTA_ERROR_BODY_BYTES = 4_000;
 
 export function codexHomeDir(): string {
@@ -382,14 +381,24 @@ export interface CodexRpcQuotaSnapshot {
 
 function unixSecondsToIso(value: number | null | undefined): string | null {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  return new Date(value * 1000).toISOString();
+  const date = new Date(value * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function rpcWindowLabel(fallback: string, minutes: number | null | undefined): string {
+  if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes <= 0) return fallback;
+  const duration = minutes === 10080 ? "Weekly" : minutes < 60 ? `${minutes}m`
+    : minutes < 1440 ? `${minutes / 60}h` : `${minutes / 1440}d`;
+  return fallback.replace(/(?:5h|Weekly) limit$/, `${duration} limit`);
 }
 
 function buildCodexRpcWindow(label: string, window: CodexRpcWindow | null | undefined): QuotaWindow | null {
   if (!window) return null;
   return {
-    label,
-    usedPercent: normalizeCodexUsedPercent(window.usedPercent),
+    label: rpcWindowLabel(label, window.windowDurationMins),
+    // RPC reports percent, not a fraction (0.5 means 0.5%, not 50%).
+    usedPercent: typeof window.usedPercent === "number" && Number.isFinite(window.usedPercent)
+      && window.usedPercent >= 0 && window.usedPercent <= 100 ? window.usedPercent : null,
     resetsAt: unixSecondsToIso(window.resetsAt),
     valueLabel: null,
     detail: null,
@@ -405,7 +414,7 @@ function parseCreditBalance(value: string | number | null | undefined): string |
     if (Number.isFinite(parsed)) {
       return `$${parsed.toFixed(2)} remaining`;
     }
-    return value.trim();
+    return null;
   }
   return null;
 }
@@ -468,9 +477,10 @@ type PendingRequest = {
 };
 
 class CodexRpcClient {
+  // Inherit configured approvals. No model turn or command RPC is permitted.
   private proc = spawn(
     "codex",
-    ["-s", "read-only", "-a", "untrusted", "app-server"],
+    ["-s", "read-only", "app-server"],
     { stdio: ["pipe", "pipe", "pipe"], env: process.env },
   );
 
@@ -484,19 +494,26 @@ class CodexRpcClient {
     this.proc.stderr.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     this.proc.stderr.on("data", (chunk: string) => {
-      this.stderr += chunk;
+      this.stderr = (this.stderr + chunk).slice(-MAX_QUOTA_ERROR_BODY_BYTES);
     });
     this.proc.on("exit", () => {
       for (const request of this.pending.values()) {
         clearTimeout(request.timer);
-        request.reject(new Error(this.stderr.trim() || "codex app-server closed unexpectedly"));
+        request.reject(quotaProbeError(this.stderr));
+      }
+      this.pending.clear();
+    });
+    this.proc.stdin.on?.("error", () => {
+      for (const request of this.pending.values()) {
+        clearTimeout(request.timer);
+        request.reject(quotaProbeError(""));
       }
       this.pending.clear();
     });
     this.proc.on("error", (err: Error) => {
       for (const request of this.pending.values()) {
         clearTimeout(request.timer);
-        request.reject(err);
+        request.reject(quotaProbeError(err.message));
       }
       this.pending.clear();
     });
@@ -516,13 +533,20 @@ class CodexRpcClient {
       } catch {
         continue;
       }
+      // Server requests (including approval/token refresh) are never executed.
+      if (typeof parsed.method === "string") continue;
       const id = typeof parsed.id === "number" ? parsed.id : null;
       if (id == null) continue;
       const pending = this.pending.get(id);
       if (!pending) continue;
       this.pending.delete(id);
       clearTimeout(pending.timer);
-      pending.resolve(parsed);
+      if (parsed.error) {
+        const error = parsed.error as { code?: number; message?: string };
+        pending.reject(quotaProbeError(typeof error.message === "string" ? error.message : "", error.code));
+      } else {
+        pending.resolve(parsed);
+      }
     }
   }
 
@@ -558,15 +582,6 @@ class CodexRpcClient {
     return (message.result as CodexRpcRateLimitsResult | undefined) ?? {};
   }
 
-  async fetchAccount(): Promise<CodexRpcAccountResult | null> {
-    try {
-      const message = await this.request("account/read");
-      return (message.result as CodexRpcAccountResult | undefined) ?? null;
-    } catch {
-      return null;
-    }
-  }
-
   async shutdown() {
     this.proc.kill("SIGTERM");
   }
@@ -576,76 +591,99 @@ export async function fetchCodexRpcQuota(): Promise<CodexRpcQuotaSnapshot> {
   const client = new CodexRpcClient();
   try {
     await client.initialize();
-    const [limits, account] = await Promise.all([
-      client.fetchRateLimits(),
-      client.fetchAccount(),
-    ]);
-    return mapCodexRpcQuota(limits, account);
+    const limits = await client.fetchRateLimits();
+    return mapCodexRpcQuota(limits);
   } finally {
     await client.shutdown();
   }
 }
 
-function formatProviderError(source: string, error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return `${source}: ${message}`;
+type QuotaFailureStatus = "auth_error" | "version_error" | "unavailable";
+
+class QuotaProbeError extends Error {
+  constructor(readonly quotaStatus: QuotaFailureStatus, readonly errorFamily?: CodexAuthRefreshFailureClass) {
+    super(`Codex app-server: quota unknown (${quotaStatus})`);
+  }
+}
+
+function quotaProbeError(message: string, code?: number): QuotaProbeError {
+  const family = classifyCodexAuthRefreshFailure({ errorMessage: message });
+  if (family || code === 401 || code === 403 || /\b(?:401|403|unauthorized|not authenticated|not logged in|authentication required)\b/i.test(message)) {
+    return new QuotaProbeError("auth_error", family ?? undefined);
+  }
+  if (code === -32601 || /invalid value.*(?:ask-for-approval|untrusted)|unexpected argument|unrecognized (?:option|subcommand)/i.test(message)) {
+    return new QuotaProbeError("version_error");
+  }
+  // Never return raw RPC errors, stderr, tokens, paths, or provider bodies.
+  return new QuotaProbeError("unavailable");
 }
 
 export function readCodexQuotaErrorFamily(error: unknown): CodexAuthRefreshFailureClass | null {
   if (error instanceof CodexQuotaAuthError) return error.errorFamily;
+  if (error instanceof QuotaProbeError) return error.errorFamily ?? null;
   const message = error instanceof Error ? error.message : String(error);
   return classifyCodexAuthRefreshFailure({ errorMessage: message });
 }
 
-export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
-  const errors: string[] = [];
-  let rpcErrorFamily: CodexAuthRefreshFailureClass | null = null;
+interface QuotaState {
+  key: string;
+  lastSuccessful: ProviderQuotaResult["lastSuccessful"];
+  authFailure?: ProviderQuotaResult;
+  pending?: Promise<ProviderQuotaResult>;
+}
+let quotaState: QuotaState | undefined;
 
+async function quotaContextKey(): Promise<string> {
+  const home = codexHomeDir();
+  // Metadata only. The collector never reads or copies credentials. A sign-in
+  // or config change permits one new attempt; polling alone does not.
+  const metadata = await Promise.all(["auth.json", "config.toml"].map(async (file) => {
+    try {
+      const stat = await fs.stat(path.join(home, file));
+      return `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    } catch { return "missing"; }
+  }));
+  return JSON.stringify([home, ...metadata]);
+}
+
+async function collectQuota(state: QuotaState): Promise<ProviderQuotaResult> {
   try {
     const rpc = await fetchCodexRpcQuota();
-    if (rpc.windows.length > 0) {
-      return { provider: "openai", source: CODEX_USAGE_SOURCE_RPC, ok: true, windows: rpc.windows };
+    if (!rpc.windows.some(w => w.usedPercent !== null || (w.valueLabel !== null && w.valueLabel !== "N/A"))) {
+      throw new QuotaProbeError("unavailable");
     }
+    state.lastSuccessful = { observedAt: new Date().toISOString(), windows: rpc.windows };
+    return { provider: "openai", source: CODEX_USAGE_SOURCE_RPC, ok: true,
+      quotaStatus: "available", windows: rpc.windows, lastSuccessful: state.lastSuccessful };
   } catch (error) {
-    errors.push(formatProviderError("Codex app-server", error));
-    const errorFamily = readCodexQuotaErrorFamily(error);
-    if (errorFamily) {
-      rpcErrorFamily = errorFamily;
+    const failure = error instanceof QuotaProbeError ? error : quotaProbeError("");
+    const last = state.lastSuccessful;
+    const history = last
+      ? ` Last successful observation at ${last.observedAt} (historical): ${last.windows.map(w => `${w.label}: ${w.usedPercent === null ? "unknown" : `${w.usedPercent}% used`}`).join(", ")}.`
+      : " No successful observation in this process for the current auth context.";
+    const result: ProviderQuotaResult = {
+      provider: "openai", source: CODEX_USAGE_SOURCE_RPC, ok: false,
+      quotaStatus: failure.quotaStatus, error: failure.message + history,
+      windows: [], lastSuccessful: last ?? null,
+      ...(failure.errorFamily ? { errorFamily: failure.errorFamily } : {}),
+    };
+    if (failure.quotaStatus === "auth_error") {
+      // A failed SDK refresh can update auth metadata. Latch the resulting
+      // context, so that write alone cannot cause a polling refresh loop.
+      state.key = await quotaContextKey();
+      state.authFailure = result;
     }
+    return result;
   }
+}
 
-  const auth = await readCodexToken();
-  if (auth) {
-    try {
-      const windows = await fetchCodexQuota(auth.token, auth.accountId);
-      return { provider: "openai", source: CODEX_USAGE_SOURCE_WHAM, ok: true, windows };
-    } catch (error) {
-      errors.push(formatProviderError("ChatGPT WHAM usage", error));
-      const errorFamily = readCodexQuotaErrorFamily(error);
-      if (errorFamily) {
-        return {
-          provider: "openai",
-          source: CODEX_USAGE_SOURCE_WHAM,
-          ok: false,
-          errorFamily,
-          error: errors.join("; "),
-          windows: [],
-        };
-      }
-    }
-  } else {
-    errors.push("no local codex auth token");
+export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
+  const key = await quotaContextKey();
+  if (!quotaState || quotaState.key !== key) quotaState = { key, lastSuccessful: null };
+  const state = quotaState;
+  if (state.authFailure) return state.authFailure;
+  if (!state.pending) {
+    state.pending = collectQuota(state).finally(() => { state.pending = undefined; });
   }
-
-  const result: ProviderQuotaResult = {
-    provider: "openai",
-    ok: false,
-    error: errors.join("; "),
-    windows: [],
-  };
-  if (rpcErrorFamily) {
-    result.source = CODEX_USAGE_SOURCE_RPC;
-    result.errorFamily = rpcErrorFamily;
-  }
-  return result;
+  return state.pending;
 }
