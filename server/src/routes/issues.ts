@@ -9232,8 +9232,20 @@ export function issueRoutes(
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
-          assertBoard(req);
+          const agentReconciliation = req.actor.type === "agent";
+          if (agentReconciliation) {
+            if (
+              req.actor.agentId !== lockedIssue.assigneeAgentId ||
+              activeRecoveryAction.cause !== "legacy_execution_requires_reconciliation" ||
+              executionReconciliation?.actionOutcome !== "not_performed"
+            ) {
+              throw forbidden("Only the assigned agent can reconcile an orphaned run with verified unperformed actions.");
+            }
+          } else {
+            assertBoard(req);
+          }
           await validateExecutionReconciliation({
+            requireOrphanedRun: agentReconciliation,
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,
             issueId: lockedIssue.id,

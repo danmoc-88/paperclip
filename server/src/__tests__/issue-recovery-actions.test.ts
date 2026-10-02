@@ -1660,6 +1660,58 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
+  it.each([
+    ["assigned orphan", "coder", "orphaned_running_run", "not_performed", false, 200],
+    ["manager cannot attest for owner", "manager", "orphaned_running_run", "not_performed", false, 403],
+    ["other interruption", "coder", "interrupted", "not_performed", false, 409],
+    ["completed effects need board", "coder", "orphaned_running_run", "completed", false, 403],
+    ["live process", "coder", "orphaned_running_run", "not_performed", true, 409],
+    ["pending cleanup", "coder", "orphaned_running_run", "not_performed", false, 409],
+    ["failed cleanup", "coder", "orphaned_running_run", "not_performed", false, 409],
+    ["missing process evidence", "coder", "orphaned_running_run", "not_performed", false, 409],
+    ["controller still leased", "coder", "orphaned_running_run", "not_performed", false, 409],
+  ])("reconciles orphaned runs: %s", async (_label, actor, errorCode, actionOutcome, live, status) => {
+    const { companyId, coderId, managerId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "interrupted" });
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", errorCode,
+      processPid: _label === "missing process evidence" ? null : live ? process.pid : 2147483647,
+      controllerLeaseExpiresAt: _label === "controller still leased" ? new Date(Date.now() + 60_000) : null,
+    }).where(eq(heartbeatRuns.id, runId));
+    if (_label === "pending cleanup" || _label === "failed cleanup") {
+      await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId,
+        releasedAt: new Date(), status: _label === "pending cleanup" ? "pending_cleanup" : "released",
+        cleanupStatus: _label === "failed cleanup" ? "failed" : null });
+    }
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "active_run_watchdog", ownerType: "board",
+      returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: runId, evidence: { runId }, nextAction: "Reconcile observed outcomes.",
+    });
+    const actorRunId = randomUUID();
+    const actorId = actor === "coder" ? coderId : managerId;
+    await seedHeartbeatRun({ companyId, agentId: actorId, runId: actorRunId,
+      issueId: sourceIssueId, status: "running" });
+    const app = createApp({ type: "agent", agentId: actorId,
+      companyId, runId: actorRunId, source: "agent_jwt" });
+    const body = { actionId: action.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome,
+        outcomeEvidence: "Inspected process and action receipts: no external action was submitted." } };
+    const response = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(status);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    if (status === 200) {
+      expect(recorded!.evidence).toMatchObject({ continuationDelivery: "pending",
+        executionReconciliation: { runId, actionOutcome: "not_performed", actorId: coderId } });
+      expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("todo");
+      await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0]).toEqual(recorded);
+    } else {
+      expect(recorded!.status).toBe("active");
+      expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("in_progress");
+    }
+  });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;

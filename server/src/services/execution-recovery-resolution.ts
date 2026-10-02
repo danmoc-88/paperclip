@@ -30,6 +30,7 @@ export async function validateExecutionReconciliation(input: {
   agentId: string | null;
   sourceRunId: unknown;
   decision: ExecutionReconciliation | undefined;
+  requireOrphanedRun?: boolean;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || !agentId) {
@@ -70,6 +71,18 @@ export async function validateExecutionReconciliation(input: {
       "The recovery source or task owner changed. Inspect the current execution before continuing.",
     );
   }
+  // Agent reconciliation is narrower than the board's evidence path. The
+  // server backstop must have recorded process loss; a client assertion alone
+  // never grants authority over arbitrary interrupted or failed executions.
+  if (input.requireOrphanedRun && (
+    run.runtimeMode !== "legacy" ||
+    run.status !== "interrupted" ||
+    run.errorCode !== "orphaned_running_run" ||
+    (!run.processPid && !run.processGroupId) ||
+    (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())
+  )) {
+    throw conflict("Agent reconciliation requires a verified orphaned legacy execution.");
+  }
   for (const pid of [
     run.processPid,
     run.processGroupId ? -run.processGroupId : null,
@@ -107,7 +120,11 @@ export async function validateExecutionReconciliation(input: {
       and(
         eq(environmentLeases.companyId, companyId),
         eq(environmentLeases.heartbeatRunId, run.id),
-        isNull(environmentLeases.releasedAt),
+        or(
+          isNull(environmentLeases.releasedAt),
+          eq(environmentLeases.status, "pending_cleanup"),
+          eq(environmentLeases.cleanupStatus, "failed"),
+        ),
       ),
     )
     .limit(1);
