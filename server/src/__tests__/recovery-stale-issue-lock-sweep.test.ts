@@ -6,6 +6,8 @@ import {
   agents,
   companies,
   createDb,
+  environments,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -46,6 +48,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
   afterEach(async () => {
     mockTelemetryClient.track.mockClear();
+    await db.delete(environmentLeases);
+    await db.delete(environments);
     await db.delete(nativeRunFinalizations);
     await db.delete(issueComments);
     await db.delete(issueRelations);
@@ -105,6 +109,101 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
     return { companyId, agentId, failedRunId, runningRunId };
   }
+
+  async function seedStrandedLease() {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    let environmentId = randomUUID();
+    const leaseId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Installed restart awaits reconciliation",
+      status: "in_progress", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "interrupted",
+      errorCode: "orphaned_running_run", processPid: 2_000_000_000,
+      finishedAt: new Date(), contextSnapshot: { issueId },
+      resultJson: { operationOutcome: "installed", restartLog: "restarting paperclipai" },
+    }).where(eq(heartbeatRuns.id, runningRunId));
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "local" }).onConflictDoNothing();
+    environmentId = (await db.select().from(environments).where(eq(environments.driver, "local")))[0].id;
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId,
+      heartbeatRunId: runningRunId, status: "active", provider: "local", leasePolicy: "ephemeral",
+      metadata: { driver: "local" } });
+    return { companyId, agentId, runId: runningRunId, issueId, environmentId, leaseId };
+  }
+
+  it("cleans an already-terminal local orphan without replay or erasing installed effects", async () => {
+    const { runId, leaseId, issueId } = await seedStrandedLease();
+    const heartbeat = heartbeatService(db);
+    await heartbeat.sweepStaleIssueLocks();
+    await heartbeat.sweepStaleIssueLocks();
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease.status).toBe("failed");
+    expect(lease.releasedAt).not.toBeNull();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run.status).toBe("interrupted");
+    expect(run.resultJson).toEqual({ operationOutcome: "installed", restartLog: "restarting paperclipai" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.status).toBe("in_progress");
+    expect(issue.executionRunId).toBeNull();
+    const events = await db.select().from(activityLog).where(eq(activityLog.entityId, leaseId));
+    expect(events.filter(event => event.action === "environment.lease_released")).toHaveLength(1);
+  });
+
+  it("serializes concurrent cleanup without duplicate release events", async () => {
+    const { leaseId } = await seedStrandedLease();
+    await Promise.all([heartbeatService(db).sweepStaleIssueLocks(), heartbeatService(db).sweepStaleIssueLocks()]);
+    const events = await db.select().from(activityLog).where(eq(activityLog.entityId, leaseId));
+    expect(events.filter(event => event.action === "environment.lease_released")).toHaveLength(1);
+  });
+
+  it("does not interpret a process permission error as death", async () => {
+    const { leaseId } = await seedStrandedLease();
+    const original = process.kill;
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === 2_000_000_000) throw Object.assign(new Error("denied"), { code: "EPERM" });
+      return original(pid, signal);
+    });
+    try { await heartbeatService(db).sweepStaleIssueLocks(); }
+    finally { kill.mockRestore(); }
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease.releasedAt).toBeNull();
+  });
+
+  it("cleans a newly terminalized orphan in the same sweep", async () => {
+    const { runId, leaseId, issueId } = await seedStrandedLease();
+    await db.update(heartbeatRuns).set({ status: "running", errorCode: null, finishedAt: null })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    await heartbeatService(db).sweepStaleIssueLocks();
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease.releasedAt).not.toBeNull();
+  });
+
+  it.each(["live_pid", "live_group", "controller", "unknown_process", "native", "remote",
+    "retained", "driver_mismatch", "ordinary_interruption", "mixed_resources"])(
+    "preserves lease without safe local orphan evidence: %s", async (condition) => {
+      const { runId, leaseId, companyId, environmentId } = await seedStrandedLease();
+      const runChanges = condition === "live_pid" ? { processPid: process.pid }
+        : condition === "live_group" ? { processGroupId: process.pid }
+        : condition === "controller" ? { controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }
+        : condition === "unknown_process" ? { processPid: null }
+        : condition === "native" ? { runtimeMode: "native" }
+        : condition === "ordinary_interruption" ? { errorCode: "user_interrupted" } : null;
+      // Use the real current process group, which can differ from this worker's PID.
+      if (condition === "live_group") {
+        const { execFileSync } = await import("node:child_process");
+        runChanges!.processGroupId = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim());
+      }
+      if (runChanges) await db.update(heartbeatRuns).set(runChanges).where(eq(heartbeatRuns.id, runId));
+      if (condition === "remote") await db.update(environmentLeases).set({ provider: "remote" }).where(eq(environmentLeases.id, leaseId));
+      if (condition === "retained") await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment" }).where(eq(environmentLeases.id, leaseId));
+      if (condition === "driver_mismatch") await db.update(environmentLeases).set({ metadata: { driver: "sandbox" } }).where(eq(environmentLeases.id, leaseId));
+      if (condition === "mixed_resources") await db.insert(environmentLeases).values({ companyId, environmentId,
+        heartbeatRunId: runId, status: "active", provider: "remote" });
+      await heartbeatService(db).sweepStaleIssueLocks();
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      expect(lease.status).toBe("active");
+      expect(lease.releasedAt).toBeNull();
+    });
 
   it("clears lock columns when checkoutRunId points at a terminal heartbeat run", async () => {
     const { companyId, agentId, failedRunId } = await seed();

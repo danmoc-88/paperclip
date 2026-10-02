@@ -126,6 +126,7 @@ import {
   documentAnnotationThreads,
   documentRevisions,
   environmentLeases,
+  environments,
   issueDocuments,
   executionWorkspaces,
   heartbeatRunEvents,
@@ -19285,7 +19286,74 @@ export function heartbeatService(
   }
 
   async function sweepStaleIssueLocks() {
-    return recovery.sweepStaleIssueLocks();
+    const result = await recovery.sweepStaleIssueLocks();
+    // The stale-lock backstop can commit interrupted without reaching adapter
+    // finally. Include old terminal runs even after their issue locks were cleared.
+    // Cleanup is not an execution outcome and never authorizes replay.
+    const candidates = await db.select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.runtimeMode, "legacy"),
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "orphaned_running_run"),
+        exists(db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+          eq(environmentLeases.heartbeatRunId, heartbeatRuns.id),
+          eq(environmentLeases.companyId, heartbeatRuns.companyId),
+          eq(environmentLeases.status, "active"),
+          eq(environmentLeases.provider, "local"),
+        ))),
+      )).orderBy(asc(heartbeatRuns.updatedAt)).limit(50);
+    for (const candidate of candidates) {
+      try {
+        await db.transaction(async (tx) => {
+          const [run] = await tx.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, candidate.id),
+            eq(heartbeatRuns.runtimeMode, "legacy"),
+            eq(heartbeatRuns.status, "interrupted"),
+            eq(heartbeatRuns.errorCode, "orphaned_running_run"),
+            or(isNull(heartbeatRuns.controllerLeaseExpiresAt),
+              lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)),
+          )).for("update", { skipLocked: true });
+          if (!run || liveRunExecutions.has(run.id) || runningProcesses.has(run.id) ||
+              adapterExecutionControls.has(run.id) || (!run.processPid && !run.processGroupId)) return;
+          // A permission error is not evidence of death. Never signal a process.
+          for (const pid of [run.processPid, run.processGroupId ? -run.processGroupId : null]) {
+            if (!pid) continue;
+            try { process.kill(pid, 0); return; }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") return; }
+          }
+          const [coordinator] = await tx.select({ id: nativeRunFinalizations.runId })
+            .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
+          if (coordinator) return;
+          // Lock the run and its leases through release. A concurrent sweeper or
+          // controller cannot change the evidence used here. Exclude mixed and
+          // retained resources: their provider lifecycle needs its own proof.
+          const leases = await tx.select().from(environmentLeases)
+            .where(eq(environmentLeases.heartbeatRunId, run.id)).for("update");
+          if (!leases.length || leases.some(lease =>
+            lease.companyId !== run.companyId || lease.provider !== "local" ||
+            lease.providerLeaseId !== null || lease.leasePolicy !== "ephemeral" ||
+            lease.status !== "active" || lease.releasedAt !== null ||
+            lease.cleanupStatus !== null || !lease.environmentId ||
+            (lease.metadata?.driver !== undefined && lease.metadata.driver !== "local")
+          )) return;
+          for (const lease of leases) {
+            const [environment] = await tx.select({ driver: environments.driver }).from(environments)
+              .where(eq(environments.id, lease.environmentId!)).for("update");
+            if (environment?.driver !== "local") return;
+          }
+          const released = await environmentRunOrchestrator(tx as unknown as Db).releaseForRun({
+            heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId,
+            status: "failed", failureReason: "orphaned_running_run",
+          });
+          if (released.errors.length || released.released.length !== leases.length) {
+            throw new Error("Orphaned local lease cleanup did not release every lease");
+          }
+        });
+      } catch (error) {
+        logger.warn({ err: error, runId: candidate.id }, "orphaned local lease cleanup deferred");
+      }
+    }
+    return result;
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
