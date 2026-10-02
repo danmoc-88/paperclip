@@ -1014,6 +1014,8 @@ issue locks are already clear. It requires recorded process identities that are
 absent, an expired controller lease, no tracked execution or native coordinator,
 and exclusively local active leases with a matching local driver. It locks and
 rechecks the run and lease evidence, then uses the existing release orchestrator.
+Candidates are paged by immutable run ID within each sweep, advancing past skipped
+rows; a full page of unsafe leases cannot starve later eligible leases.
 Remote, retained, mixed, and uncertain resources remain blocked. Cleanup preserves
 the recorded operation outcome and task state; it neither records `not_performed`
 nor retries work. Reconciliation of installed or other external effects remains

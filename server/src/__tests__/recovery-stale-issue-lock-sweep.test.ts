@@ -148,6 +148,37 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(events.filter(event => event.action === "environment.lease_released")).toHaveLength(1);
   });
 
+  it("advances past full pages of skipped orphans without skipping releases as rows disappear", async () => {
+    const { companyId, agentId, environmentId } = await seedStrandedLease();
+    const runIds = Array.from({ length: 103 }, (_, i) =>
+      `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`);
+    const releasable = new Set([50, 102]);
+    await db.insert(heartbeatRuns).values(runIds.map((id, i) => ({
+      id, companyId, agentId, invocationSource: "manual", runtimeMode: "legacy",
+      status: "interrupted", errorCode: "orphaned_running_run",
+      processPid: releasable.has(i) ? 2_000_000_000 : process.pid,
+      finishedAt: new Date(0), updatedAt: new Date(0),
+    })));
+    await db.insert(environmentLeases).values(runIds.map(heartbeatRunId => ({
+      companyId, environmentId, heartbeatRunId, status: "active",
+      provider: "local", leasePolicy: "ephemeral", metadata: { driver: "local" },
+    })));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.sweepStaleIssueLocks();
+    await heartbeat.sweepStaleIssueLocks();
+    const leases = await db.select().from(environmentLeases)
+      .where(eq(environmentLeases.companyId, companyId));
+    for (const [i, runId] of runIds.entries()) {
+      const lease = leases.find(row => row.heartbeatRunId === runId)!;
+      expect(lease.status).toBe(releasable.has(i) ? "failed" : "active");
+      expect(lease.releasedAt !== null).toBe(releasable.has(i));
+      const events = await db.select().from(activityLog).where(eq(activityLog.entityId, lease.id));
+      expect(events.filter(event => event.action === "environment.lease_released"))
+        .toHaveLength(releasable.has(i) ? 1 : 0);
+    }
+  });
+
   it("serializes concurrent cleanup without duplicate release events", async () => {
     const { leaseId } = await seedStrandedLease();
     await Promise.all([heartbeatService(db).sweepStaleIssueLocks(), heartbeatService(db).sweepStaleIssueLocks()]);
