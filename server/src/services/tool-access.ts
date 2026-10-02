@@ -407,19 +407,107 @@ function oauthProviderErrorMessage(
 export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH =
   "/api/tools/oauth/client-metadata";
 
+/** How long the CIMD readability probe waits before giving up as inconclusive. */
+const OAUTH_CLIENT_ID_METADATA_PROBE_TIMEOUT_MS = 2500;
+
+/**
+ * Fetch this deployment's own metadata document the way an authorization server
+ * would and report whether that server could use the result.
+ *
+ * `false` means the document is definitely unusable as a `client_id`: the
+ * authorization server would receive a redirect, an error status, or a body that
+ * is not this deployment's document. The common cause is an access proxy
+ * (Cloudflare Access, an SSO reverse proxy, basic auth) covering the whole host
+ * including this one route, which answers an unauthenticated fetch with a login
+ * page instead of JSON.
+ *
+ * `null` means inconclusive — a transport error, a timeout, a server error, or a
+ * same-origin redirect. The probe runs from inside Paperclip's own network, so
+ * it can fail for reasons that would not affect an external fetch. Inconclusive
+ * therefore keeps the previous behaviour rather than silently changing which
+ * client registration method is used.
+ */
+async function probeOAuthClientIdMetadataDocument(input: {
+  metadataUrl: string;
+  redirectUri: string;
+  fetchImpl: typeof fetch;
+  timeoutMs: number;
+}): Promise<boolean | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), input.timeoutMs);
+  try {
+    // `redirect: "manual"` is what makes an access proxy visible: following the
+    // redirect would land on a login page that answers 200 with HTML.
+    const response = await input.fetchImpl(input.metadataUrl, {
+      method: "GET",
+      redirect: "manual",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+    // A redirect off this origin is the access-proxy signature: the fetch is
+    // being sent to an identity provider's login page. A same-origin redirect
+    // stays inconclusive — it may be a canonicalisation the authorization
+    // server follows without trouble.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) return null;
+      try {
+        return new URL(location, input.metadataUrl).origin ===
+          new URL(input.metadataUrl).origin
+          ? null
+          : false;
+      } catch {
+        return null;
+      }
+    }
+    // A server error says nothing about the route being public, so it must not
+    // move this deployment off CIMD permanently.
+    if (response.status >= 500) return null;
+    if (response.status !== 200) return false;
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!/\bjson\b/i.test(contentType)) return false;
+    const body: unknown = await response.json();
+    if (!body || typeof body !== "object") return false;
+    const document = body as Record<string, unknown>;
+    if (document.client_id !== input.metadataUrl) return false;
+    const redirectUris = document.redirect_uris;
+    if (
+      !Array.isArray(redirectUris) ||
+      !redirectUris.includes(input.redirectUri)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Resolve the URL Paperclip would use as a CIMD client id, but only when its
- * hostname is not known to resolve into a private network.
+ * hostname is not known to resolve into a private network and the document
+ * itself answers an unauthenticated fetch with this deployment's own metadata.
  *
  * An authorization server fetches this URL from outside Paperclip's network and
  * will normally apply an SSRF guard. Tailscale/MagicDNS names are HTTPS but
  * resolve into 100.64.0.0/10, so presenting one as a client id can only produce
  * an `invalid_client` response. A local DNS failure remains inconclusive because
  * split-horizon public DNS may still let the authorization server resolve it.
+ *
+ * Reachability is not enough: the route is published as publicly readable, but
+ * an access proxy in front of the whole host answers an unauthenticated fetch
+ * with a login page. The authorization server then rejects the client id, and
+ * the operator sees only a generic "client metadata is temporarily unavailable"
+ * error with nothing naming the proxy (SAK-787). Returning `null` for a document
+ * that is demonstrably unreadable lets the existing dynamic-registration path
+ * take over instead of failing sign-in for every such server.
  */
 export async function resolveOAuthClientIdMetadataDocumentUrl(
   redirectUri: string,
   lookup?: RemoteHttpEndpointLookup,
+  probe?: { fetchImpl?: typeof fetch; timeoutMs?: number },
 ): Promise<string | null> {
   try {
     const parsed = new URL(redirectUri);
@@ -449,6 +537,25 @@ export async function resolveOAuthClientIdMetadataDocumentUrl(
       ) {
         return null;
       }
+    }
+    // Deliberately not cached: an operator who opens the route expects the next
+    // connection attempt to use CIMD again, without waiting out a TTL.
+    const readable = await probeOAuthClientIdMetadataDocument({
+      metadataUrl,
+      redirectUri,
+      fetchImpl: probe?.fetchImpl ?? fetch,
+      timeoutMs:
+        probe?.timeoutMs ?? OAUTH_CLIENT_ID_METADATA_PROBE_TIMEOUT_MS,
+    });
+    if (readable === false) {
+      logger.warn(
+        {
+          metadataUrl,
+          event: "oauth_client_id_metadata_document_unreadable",
+        },
+        "Client ID Metadata Document is not publicly readable; falling back to dynamic client registration. An access proxy in front of this host is the usual cause.",
+      );
+      return null;
     }
     return metadataUrl;
   } catch {

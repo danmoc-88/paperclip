@@ -38,7 +38,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { toolAccessService } from "../services/tool-access.js";
+import {
+  OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
+  oauthClientIdMetadataDocument,
+  toolAccessService,
+} from "../services/tool-access.js";
 import { ComposioApiError, type ComposioClient } from "../services/composio.js";
 import { createComposioSessionManager } from "../services/composio-session-manager.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
@@ -82,6 +86,13 @@ type FixtureOptions = {
   requiredHeader?: { name: string; value: string };
   /** Advertise Client ID Metadata Document support on the authorization server. */
   cimd?: boolean;
+  /**
+   * Model an access proxy (Cloudflare Access, an SSO reverse proxy) covering the
+   * whole Paperclip host: an unauthenticated fetch of the otherwise public
+   * metadata document is answered with a login redirect instead of the document
+   * (SAK-787).
+   */
+  clientMetadataBehindAccessProxy?: boolean;
   /** Advertise a dynamic client registration endpoint. */
   dcr?: boolean;
   /** Serve authorization-server metadata under the RFC 8414 insertion path only. */
@@ -203,6 +214,25 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
 
     if (href === resourceMetadataUrl) {
       return jsonResponse({ resource: MCP_URL, authorization_servers: [ISSUER] });
+    }
+
+    // Paperclip serves its own metadata document on whatever origin it is
+    // reached at, so the fixture answers for any callback origin a test uses
+    // rather than for one hard-coded base URL.
+    if (new URL(href).pathname === OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH) {
+      if (options.clientMetadataBehindAccessProxy) {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: "https://fixture-team.cloudflareaccess.test/cdn-cgi/access/login",
+            "content-type": "text/html",
+          },
+        });
+      }
+      return jsonResponse(oauthClientIdMetadataDocument({
+        clientId: href,
+        redirectUri: new URL("/api/tools/oauth/callback", href).toString(),
+      }));
     }
 
     // RFC 8414 inserts the well-known segment before the issuer path; OIDC
@@ -1407,6 +1437,33 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     // The client_id *is* the document URL, so nothing was registered.
     expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe(CLIENT_METADATA_DOCUMENT_URL);
     expect(fixture.requestsTo("/register")).toHaveLength(0);
+  });
+
+  it("registers dynamically when an access proxy hides the Client ID Metadata Document", async () => {
+    // SAK-787: the route is published as public, but an access proxy in front of
+    // the whole host answers an unauthenticated fetch with a login redirect. The
+    // authorization server then refuses the client id, and sign-in used to fail
+    // outright instead of falling back to the registration endpoint the server
+    // advertises.
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      cimd: true,
+      clientMetadataBehindAccessProxy: true,
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture gated CIMD" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("dcr");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
   });
 
   it("replaces a private-only Client ID Metadata Document with dynamic registration", async () => {
