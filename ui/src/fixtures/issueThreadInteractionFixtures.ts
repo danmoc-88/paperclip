@@ -969,6 +969,22 @@ export const expiredConnectionIntentInteraction = createConnectionIntentInteract
   result: { version: 1, outcome: "expired" },
   resolvedAt: new Date("2026-04-20T15:12:00.000Z"),
 });
+/**
+ * Withdrawn by its requester. The server stores that as `status: "cancelled"`
+ * with `result.outcome: "expired"` — a connection intent has no `withdrawn`
+ * outcome — so a card that enumerates terminal statuses one by one misses it.
+ */
+export const withdrawnConnectionIntentInteraction = createConnectionIntentInteraction({
+  id: "interaction-connection-intent-withdrawn",
+  status: "cancelled",
+  result: {
+    version: 1,
+    outcome: "expired",
+    reason: "The agent finished without this connection.",
+  },
+  resolvedByAgentId: "11111111-1111-4111-8111-111111111111",
+  resolvedAt: new Date("2026-04-20T15:12:00.000Z"),
+});
 
 export const executedSecretProposalInteraction = createSecretProposalConfirmationInteraction({
   id: "interaction-secret-proposal-executed",
