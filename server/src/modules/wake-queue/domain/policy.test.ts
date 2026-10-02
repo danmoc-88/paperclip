@@ -29,6 +29,7 @@ const basePreDrainFacts: PreDrainFacts = {
   hasAssigneeUser: false,
   assigneeAgentMatchesRunAgent: true,
   legacyExecutionNeedsReconciliation: false,
+  reassignedAwayFromRunAgent: false,
   executionCancellationAcknowledged: false,
 };
 
@@ -97,6 +98,39 @@ describe("decidePreDrain", () => {
       name: "proceed: none of the pre-drain conditions apply",
       facts: basePreDrainFacts,
       expected: { kind: "proceed" },
+    },
+    {
+      // Reconciliation and an acknowledged cancellation both guard the
+      // finishing run's own continuation. A handoff retires that continuation
+      // and creates no reconciliation owner, so the new assignee's deferred
+      // wake must still be drained.
+      name: "proceed: reconciliation is set but the issue was handed to another agent",
+      facts: {
+        ...basePreDrainFacts,
+        assigneeAgentMatchesRunAgent: false,
+        legacyExecutionNeedsReconciliation: true,
+        reassignedAwayFromRunAgent: true,
+      },
+      expected: { kind: "proceed" },
+    },
+    {
+      name: "proceed: the cancellation is acknowledged but the issue was handed to another agent",
+      facts: {
+        ...basePreDrainFacts,
+        assigneeAgentMatchesRunAgent: false,
+        executionCancellationAcknowledged: true,
+        reassignedAwayFromRunAgent: true,
+      },
+      expected: { kind: "proceed" },
+    },
+    {
+      name: "released: reconciliation still holds while the run's own agent keeps the issue",
+      facts: {
+        ...basePreDrainFacts,
+        legacyExecutionNeedsReconciliation: true,
+        reassignedAwayFromRunAgent: false,
+      },
+      expected: { kind: "released" },
     },
     {
       name: "the blocked-notice check is evaluated before legacy-execution reconciliation",

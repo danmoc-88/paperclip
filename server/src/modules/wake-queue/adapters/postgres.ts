@@ -67,6 +67,11 @@ import type { RunSummary } from "../application/types.js";
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+/** The two cancellation codes that mean "the issue moved to another agent", not "this run failed". */
+const REASSIGNMENT_CANCELLATION_ERROR_CODES = new Set([
+  "issue_reassigned",
+  "lock_released_on_reassignment",
+]);
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = typeof issues.$inferSelect;
@@ -1100,6 +1105,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
           legacyExecutionNeedsReconciliation: legacyExecutionNeedsReconciliation(run),
+          reassignedAwayFromRunAgent:
+            run.status === "cancelled" &&
+            REASSIGNMENT_CANCELLATION_ERROR_CODES.has(run.errorCode ?? "") &&
+            Boolean(issueRow?.assigneeAgentId) &&
+            issueRow?.assigneeAgentId !== run.agentId,
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
