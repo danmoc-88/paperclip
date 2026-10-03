@@ -5413,10 +5413,12 @@ export function issueRoutes(
             },
           );
         }
-        // Read on another connection, so a checkout can still land before the
-        // write does. The write re-decides it under the row lock.
-        recordIssueWriteRunLockPremise(req, issue.id, actorAgentId);
       }
+      // Any idle status, including todo, can become a live checkout before
+      // the write. Re-check under the write's row lock even when this snapshot
+      // did not need describeRunLock. Board, watchdog and checkout-management
+      // callers return above and keep their separate authority.
+      recordIssueWriteRunLockPremise(req, issue.id, actorAgentId);
       // Past the run lock the issue is idle, so only channels that have not
       // adopted the default-open rule still refuse another agent's issue.
       if (!options.allowVisibleIssueWrite) {
