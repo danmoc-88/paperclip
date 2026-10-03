@@ -13799,14 +13799,20 @@ export function issueRoutes(
         }
       } catch (err) {
         // A checkout landed between the gate's reading and the write's row
-        // lock. Answer with the gate's own copy, so a caller cannot tell the
-        // two refusals apart by their shape, only by the run ids they name.
+        // lock. Keep the gate's response shape, but name the owner from the
+        // transaction: reassignment can make the gate's snapshot stale too.
         const runLockDetails = foreignRunLockConflictDetails(err);
         if (runLockDetails) {
           await denyIssueWrite(
             req,
             res,
-            existing,
+            {
+              identifier: existing.identifier,
+              assigneeAgentId:
+                typeof runLockDetails.assigneeAgentId === "string"
+                  ? runLockDetails.assigneeAgentId
+                  : null,
+            },
             "issue_write_assignee_run_lock",
             runLockDetails,
           );

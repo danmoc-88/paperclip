@@ -6411,6 +6411,43 @@ describeEmbeddedPostgres("issueService.describeRunLock", () => {
     });
   });
 
+  it("reports the new owner after reassignment and real checkout", async () => {
+    const { issueId } = await seed(null);
+    const before = await svc.getById(issueId);
+    expect(before).not.toBeNull();
+    await expect(svc.describeRunLock(issueId)).resolves.toMatchObject({ held: false });
+    const nextOwnerId = randomUUID();
+    const peerAgentId = randomUUID();
+    await db.insert(agents).values([
+      { id: nextOwnerId, companyId: before!.companyId, name: "NewOwner", role: "engineer", status: "active", adapterType: "codex_local" },
+      { id: peerAgentId, companyId: before!.companyId, name: "Peer", role: "engineer", status: "active", adapterType: "codex_local" },
+    ]);
+    // An authorized reassignment and checkout happen after the idle gate read.
+    await svc.update(issueId, { assigneeAgentId: nextOwnerId });
+    const nextOwnerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextOwnerRunId, companyId: before!.companyId,
+      agentId: nextOwnerId, status: "running", contextSnapshot: { issueId },
+    });
+    await svc.checkout(issueId, nextOwnerId, ["in_progress"], nextOwnerRunId);
+
+    await expect(svc.update(
+      issueId, { title: "Peer edit", actorAgentId: peerAgentId }, undefined, undefined, undefined,
+      { foreignRunLockGuard: { actorAgentId: peerAgentId } },
+    )).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_write_assignee_run_lock",
+        issueId, assigneeAgentId: nextOwnerId, actorAgentId: peerAgentId,
+        checkoutRunId: nextOwnerRunId, executionRunId: nextOwnerRunId, liveRunId: nextOwnerRunId,
+      },
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({
+      assigneeAgentId: nextOwnerId, title: before!.title,
+      checkoutRunId: nextOwnerRunId, executionRunId: nextOwnerRunId,
+    });
+  });
+
   it.each(["title", "blocked"])(
     "refuses a peer %s write after a real checkout from todo",
     async (kind) => {

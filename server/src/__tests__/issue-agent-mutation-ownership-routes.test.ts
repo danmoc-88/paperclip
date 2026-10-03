@@ -321,6 +321,7 @@ function createRunContextDb(
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
   chatBindings: Array<{ id: string; companyId: string; issueId: string; state: string }> = [],
+  agentNames: Array<{ id: string; name: string }> = [],
 ) {
   const chatBindingQueries: ReturnType<PgDialect["sqlToQuery"]>[] = [];
   const runRows = Array.isArray(runAgentOrRows)
@@ -341,6 +342,7 @@ function createRunContextDb(
     // generic issue fixture here would invent an unrelated replay row.
     if (settledRecoveryQuery) return [];
     const keys = Object.keys(selection);
+    if (keys.length === 2 && keys.includes("id") && keys.includes("name")) return agentNames;
     if (keys.includes("entityId")) return [];
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
@@ -1792,6 +1794,62 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.details.whoCanAct).toBeTruthy();
     expect(res.body.details.sanctionedPath).toBeTruthy();
   });
+
+  it.each([false, true])(
+    "uses the transactional owner in the full run-lock denial (reassigned: %s)",
+    async (reassigned) => {
+      const nextOwnerId = "88888888-8888-4888-8888-888888888888";
+      const transactionalOwnerId = reassigned ? nextOwnerId : ownerAgentId;
+      const transactionalOwnerName = reassigned ? "NewOwner" : "OldOwner";
+      const db = createRunContextDb({}, peerAgentId, undefined, [], [
+        { id: ownerAgentId, name: "OldOwner" },
+        { id: nextOwnerId, name: "NewOwner" },
+        { id: peerAgentId, name: "Peer" },
+      ]);
+      const app = await createApp(peerActor(), db);
+      const runLock = {
+        held: true,
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+        liveRunId: ownerRunId,
+      };
+      // First capture the complete gate response for the owner seen by the
+      // transaction, then reproduce an idle gate followed by a service denial.
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: transactionalOwnerId }));
+      mockIssueService.describeRunLock.mockResolvedValue(runLock);
+      const gate = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Peer edit" });
+      expect(gate.status).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+      mockIssueService.describeRunLock.mockResolvedValue({
+        held: false, checkoutRunId: null, executionRunId: null, liveRunId: null,
+      });
+      const { HttpError: CurrentHttpError } =
+        await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.update.mockRejectedValue(new CurrentHttpError(409, "Another agent's run owns this task", {
+        code: "issue_write_assignee_run_lock",
+        issueId,
+        assigneeAgentId: transactionalOwnerId,
+        actorAgentId: peerAgentId,
+        checkoutRunId: runLock.checkoutRunId,
+        executionRunId: runLock.executionRunId,
+        liveRunId: runLock.liveRunId,
+      }));
+      const service = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Peer edit" });
+
+      expect(mockIssueService.update.mock.calls[0]?.[5]).toEqual({
+        foreignRunLockGuard: { actorAgentId: peerAgentId },
+      });
+      expect(service.status).toBe(gate.status);
+      expect(service.body).toEqual(gate.body);
+      expect(service.body.details.assigneeAgentId).toBe(transactionalOwnerId);
+      for (const copy of [service.body.error, service.body.details.whoCanAct, service.body.details.sanctionedPath]) {
+        expect(copy).toContain(transactionalOwnerName);
+        if (reassigned) expect(copy).not.toContain("OldOwner");
+      }
+    },
+  );
 
   it.each([
     ["done", "todo", 403, "Agent cannot request follow-up for another agent's issue"],
