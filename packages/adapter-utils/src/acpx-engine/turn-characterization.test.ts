@@ -227,7 +227,7 @@ describe("ACPX engine turn characterization", () => {
     runtimeSessionName: "runtime-session",
   };
 
-  it("passes exactly the six turn inputs to startTurn", async () => {
+  it("passes exactly the seven turn inputs to startTurn", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     let captured: Record<string, unknown> | null = null;
@@ -276,9 +276,21 @@ describe("ACPX engine turn characterization", () => {
     const signal = input.signal as AbortSignal;
     expect(signal).toBeInstanceOf(AbortSignal);
     expect(signal.aborted).toBe(false);
-    // Exactly the six documented keys are threaded.
+    // The typed terminal-failure sink is threaded for every adapter, so the
+    // engine records the agent's failure category even when the adapter ships
+    // no classifier of its own.
+    expect(typeof input.onTerminalSessionFailure).toBe("function");
+    // Exactly the seven documented keys are threaded.
     expect(Object.keys(input).sort()).toEqual(
-      ["handle", "mode", "requestId", "signal", "text", "timeoutMs"].sort(),
+      [
+        "handle",
+        "mode",
+        "onTerminalSessionFailure",
+        "requestId",
+        "signal",
+        "text",
+        "timeoutMs",
+      ].sort(),
     );
   });
 

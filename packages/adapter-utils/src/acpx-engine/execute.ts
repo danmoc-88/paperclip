@@ -4106,6 +4106,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // (the cancel-before-close order). The turn wrapper assigns it in `turnStart`.
       let activeTurn: AcpRuntimeTurn | null = null;
       let terminalFailureClassification: AcpxTerminalFailureClassification | null = null;
+      // The agent's typed failure category for this turn, recorded for every
+      // adapter whether or not it ships a classifier. Never provider text.
+      let terminalSessionFailureCategory: string | null = null;
       // How the settlement `endSession` step must release the runtime for the path
       // this run took. Each exit path that acquired the runtime records it before it
       // returns; a build or create-runtime failure never registers the runtime, so
@@ -4787,14 +4790,22 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           timeoutMs: startTimeoutMs,
           signal,
           // The callback belongs to this turn, including when a runtime is reused.
-          // Raw provider text must never enter the result or the run log.
-          ...(deps.classifyTerminalSessionFailure
-            ? {
-                onTerminalSessionFailure: (failure: AcpxTerminalSessionFailure) => {
-                  terminalFailureClassification = deps.classifyTerminalSessionFailure!(failure, new Date(now()));
-                },
-              }
-            : {}),
+          // Raw provider text must never enter the result or the run log. The
+          // category is the agent's own closed vocabulary (connection, access,
+          // limit, service, request, unknown), so it carries no provider text
+          // and is recorded for every adapter — an adapter without a
+          // classifier otherwise leaves a failed turn with no machine-readable
+          // reason at all, which is what made a run failing on this path
+          // undiagnosable from its stored record.
+          onTerminalSessionFailure: (failure: AcpxTerminalSessionFailure) => {
+            terminalSessionFailureCategory =
+              typeof failure.category === "string" && failure.category.trim().length > 0
+                ? failure.category.trim()
+                : "unknown";
+            if (deps.classifyTerminalSessionFailure) {
+              terminalFailureClassification = deps.classifyTerminalSessionFailure(failure, new Date(now()));
+            }
+          },
         });
         activeTurn = turn;
         // A latched sandbox duplex-channel loss otherwise has no way to reach
@@ -5016,11 +5027,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
           ? terminalFailureClassification
           : null;
+        const failureCategory = !timedOut && !channelLost && terminal.status === "failed"
+          ? terminalSessionFailureCategory
+          : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
+          ...(failureCategory ? { failureCategory } : {}),
         });
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status. A
@@ -5050,6 +5065,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           costUsd: turnUsage.costUsd,
           resultJson: {
             status: channelLost ? "failed" : terminal.status,
+            ...(failureCategory ? { terminalSessionFailureCategory: failureCategory } : {}),
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
               ? {
