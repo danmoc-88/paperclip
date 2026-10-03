@@ -1061,6 +1061,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect.anything(),
       undefined,
       expect.any(Array),
+      { foreignRunLockGuard: { actorAgentId: peerAgentId } },
     );
   });
 
@@ -1628,6 +1629,7 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockIssueService.update.mock.calls[0]?.[5]).toBeUndefined();
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
   });
 
@@ -1652,6 +1654,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockIssueService.update.mock.calls[0]?.[5]).toBeUndefined();
   });
 
   it.each([
@@ -1717,6 +1720,23 @@ describe("agent issue mutation checkout ownership", () => {
   // The gate reads the lock on its own connection, so a checkout can still land
   // between that reading and the write. The write has to re-decide it under the
   // row lock, which it can only do if the gate hands the premise down.
+  it.each(["todo", "blocked", "backlog", "in_review"])(
+    "carries the peer write guard from %s even before a checkout exists",
+    async (status) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Peer passed the gate before checkout" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.describeRunLock).not.toHaveBeenCalled();
+      expect(mockIssueService.update.mock.calls[0]?.[5]).toEqual({
+        foreignRunLockGuard: { actorAgentId: peerAgentId },
+      });
+    },
+  );
+
   it("carries the cleared run lock into the write that has to re-check it", async () => {
     mockIssueService.describeRunLock.mockResolvedValue({
       held: false,
@@ -2764,6 +2784,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status }));
+      expect(mockIssueService.update.mock.calls[0]?.[5]).toBeUndefined();
     });
 
     it("lets a watchdog run transition a watched issue to in_review with a live review path", async () => {

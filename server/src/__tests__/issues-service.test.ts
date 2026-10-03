@@ -6411,8 +6411,52 @@ describeEmbeddedPostgres("issueService.describeRunLock", () => {
     });
   });
 
-  it("lets the cleared peer write through while the task stays unheld", async () => {
+  it.each(["title", "blocked"])(
+    "refuses a peer %s write after a real checkout from todo",
+    async (kind) => {
+      const { issueId } = await seed(null);
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+      const before = await db.select().from(issues).where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      const peerAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: peerAgentId, companyId: before.companyId,
+        name: "Peer", role: "engineer", status: "active", adapterType: "codex_local",
+      });
+      // The route admits this snapshot and passes the guard tested in the route suite.
+      expect(before.status).toBe("todo");
+      const ownerRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: ownerRunId, companyId: before.companyId,
+        agentId: before.assigneeAgentId!, status: "running", contextSnapshot: { issueId },
+      });
+      const checkedOut = await svc.checkout(issueId, before.assigneeAgentId!, ["todo"], ownerRunId);
+      expect(checkedOut).toMatchObject({ status: "in_progress", checkoutRunId: ownerRunId });
+
+      const patch = kind === "title" ? { title: "Peer overwrote active owner" } : { status: "blocked" };
+      await expect(svc.update(
+        issueId, { ...patch, actorAgentId: peerAgentId }, undefined, undefined, undefined,
+        { foreignRunLockGuard: { actorAgentId: peerAgentId } },
+      )).rejects.toMatchObject({
+        status: 409,
+        details: { code: "issue_write_assignee_run_lock", checkoutRunId: ownerRunId },
+      });
+      await expect(readLockColumns(issueId)).resolves.toEqual({
+        title: "Start layer", status: "in_progress",
+        checkoutRunId: ownerRunId, executionRunId: ownerRunId,
+      });
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ownerRunId))
+        .then((rows) => rows[0]!);
+      expect(run.status).toBe("running");
+    },
+  );
+
+  it.each([
+    ["todo", "title"], ["todo", "blocked"],
+    ["in_progress", "title"], ["in_progress", "blocked"],
+  ])("lets the cleared peer %s write of %s through while unheld", async (status, kind) => {
     const { issueId } = await seed(null);
+    await db.update(issues).set({ status }).where(eq(issues.id, issueId));
     const peerAgentId = randomUUID();
     const issue = await db
       .select({ companyId: issues.companyId })
@@ -6431,16 +6475,17 @@ describeEmbeddedPostgres("issueService.describeRunLock", () => {
       permissions: {},
     });
 
+    const patch = kind === "title" ? { title: "Powiązane ze zgłoszeniem" } : { status: "blocked" };
     const updated = await svc.update(
       issueId,
-      { title: "Powiązane ze zgłoszeniem", actorAgentId: peerAgentId },
+      { ...patch, actorAgentId: peerAgentId },
       undefined,
       undefined,
       undefined,
       { foreignRunLockGuard: { actorAgentId: peerAgentId } },
     );
 
-    expect(updated?.title).toBe("Powiązane ze zgłoszeniem");
+    expect(updated).toMatchObject({ ...patch, checkoutRunId: null, executionRunId: null });
   });
 });
 
