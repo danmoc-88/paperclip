@@ -15,6 +15,14 @@ export const PAPERCLIP_WAKE_PAYLOAD_FILE_NAME = "paperclip-wake-payload.json";
 export const PAPERCLIP_WAKE_PAYLOAD_PATH_ENV = "PAPERCLIP_WAKE_PAYLOAD_PATH";
 export const PAPERCLIP_WAKE_PAYLOAD_JSON_ENV = "PAPERCLIP_WAKE_PAYLOAD_JSON";
 export const PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV = "PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH";
+/**
+ * Set once the document has been published to the machine that will run the
+ * agent. From then on the pointer names a path on that machine, which this side
+ * cannot read — so an unreadable pointer is expected and not a fault. Without
+ * the marker an unreadable pointer means the document is gone, and starting an
+ * agent on an empty task is worse than refusing to start it.
+ */
+export const PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV = "PAPERCLIP_WAKE_PAYLOAD_REMOTE";
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const RUN_DIR_PREFIXES = ["paperclip-run-", "paperclip-wake-"];
@@ -132,6 +140,7 @@ export async function retargetPaperclipWakePayloadEnv(input: {
   await input.publish(remotePath, body);
   rewritePaperclipWakePayloadPointerPath(input.env, remotePath);
   delete input.env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
+  input.env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV] = "1";
   return true;
 }
 
@@ -188,6 +197,7 @@ export async function materializePaperclipWakePayloadEnv(
   if (bytes <= PAPERCLIP_WAKE_PAYLOAD_INLINE_MAX_BYTES) {
     delete env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV];
     delete env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
+    delete env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV];
     return {
       delivery: "inline",
       rewritten: false,
@@ -216,6 +226,8 @@ export async function materializePaperclipWakePayloadEnv(
   env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV] = pointerJson;
   env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV] = filePath;
   env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV] = filePath;
+  // A freshly written local document supersedes any earlier remote hand-off.
+  delete env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV];
   return {
     delivery: "file",
     rewritten: true,
@@ -258,6 +270,12 @@ async function assertExistingPointer(
     assertFileMatchesPointer(local, pointer);
     return;
   }
+  // The pointer names a path on the machine that will run the agent, so this
+  // side has nothing to check. Only a published hand-off earns that pass.
+  if (env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV] === "1") return;
+  throw new Error(
+    `Wake payload file is missing (${pointer.bytes} bytes). Refusing to start without the full context.`,
+  );
 }
 
 function assertFileMatchesPointer(file: Buffer, pointer: PaperclipWakePayloadPointer): void {

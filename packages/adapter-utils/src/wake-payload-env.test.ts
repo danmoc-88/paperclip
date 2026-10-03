@@ -14,6 +14,7 @@ import {
   paperclipWakePayloadFileNote,
   paperclipWakePayloadRemoteInstallCommand,
   paperclipWakePayloadSandboxMounts,
+  retargetPaperclipWakePayloadEnv,
 } from "./wake-payload-env.js";
 
 const MARKER = "Zażółć gęślą jaźń";
@@ -222,6 +223,61 @@ process.stdout.write("full-context-ok");
     expect(second.rewritten).toBe(false);
     expect(second.path).toBe(first.path);
     expect(await fs.readFile(first.path ?? "", "utf8")).toBe(payload);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  // The document is the task. Starting an agent that cannot read it produces a
+  // run with no instructions, which is harder to notice than a refused start.
+  it("refuses to start when the pointer names a file that is gone", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-gone-"));
+    const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: oversizedWakeJson() };
+    const first = await materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir });
+    await fs.rm(first.path ?? "", { force: true });
+
+    await expect(
+      materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir }),
+    ).rejects.toThrow(/Wake payload file is missing/);
+
+    // Same verdict once the local-path hint is gone, which is the shape a
+    // re-entered start carries.
+    delete (env as Record<string, string>).PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH;
+    await expect(
+      materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir }),
+    ).rejects.toThrow(/Wake payload file is missing/);
+
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("accepts an unreadable pointer only after the document was published to the target", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-remote-"));
+    const payload = oversizedWakeJson();
+    const env: Record<string, string> = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload };
+    await materializePaperclipWakePayloadEnv(env, { runId: "remote", scratchDir: dir });
+
+    const published: Array<{ remotePath: string; body: string }> = [];
+    const retargeted = await retargetPaperclipWakePayloadEnv({
+      env,
+      runId: "remote",
+      publish: async (remotePath, body) => {
+        published.push({ remotePath, body });
+      },
+    });
+
+    expect(retargeted).toBe(true);
+    expect(published).toHaveLength(1);
+    expect(published[0]?.body).toBe(payload);
+    expect(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH).toBeUndefined();
+    expect(env.PAPERCLIP_WAKE_PAYLOAD_REMOTE).toBe("1");
+
+    // The pointer now names a path on the target, so this side must not fail
+    // the start over a file it was never meant to read.
+    const delivery = await materializePaperclipWakePayloadEnv(env, {
+      runId: "remote",
+      scratchDir: dir,
+    });
+    expect(delivery.delivery).toBe("file");
+    expect(delivery.path).toBe(published[0]?.remotePath);
+
     await fs.rm(dir, { recursive: true, force: true });
   });
 
