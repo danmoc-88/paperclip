@@ -922,6 +922,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       evidence: { executionReconciliation: { runId: run.id } },
       fingerprint: `legacy-execution:${run.id}`, nextAction: "Resolved.",
     });
+    const settledActions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     const changed = await terminalizeLegacyExecution({ db, run, status: "cancelled" });
     expect(changed?.status).toBe("cancelled");
     expect(changed?.executionStatusDeliveryId).toBeTruthy();
@@ -931,6 +933,10 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       db, run: changed!, status: "cancelled", patch: { resultJson: { summary: "Late stop evidence" } },
     });
     expect(amended?.resultJson?.summary).toBe("Late stop evidence");
+    // A real transition and late evidence must preserve the resolved action,
+    // not reopen recovery or create another active action for the same run.
+    expect(await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual(settledActions);
   });
 
   it.each(["process", "http", null])("does not reuse a cancelled %s action as a conversation settlement", async adapterType => {
