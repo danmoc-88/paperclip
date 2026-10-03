@@ -76,7 +76,7 @@ describe("paperclip wake payload environment", () => {
   it("keeps a small payload inline, including Polish characters", async () => {
     const payload = JSON.stringify({ marker: MARKER, note: "mały pakiet" });
     const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload, PAPERCLIP_WAKE_PAYLOAD_PATH: "/tmp/stale.json" };
-    const delivery = await materializePaperclipWakePayloadEnv(env, { runId: "small" });
+    const delivery = await materializePaperclipWakePayloadEnv(env, { runId: "small", transport: "local" });
 
     expect(delivery.delivery).toBe("inline");
     expect(env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBe(payload);
@@ -92,6 +92,7 @@ describe("paperclip wake payload environment", () => {
     const delivery = await materializePaperclipWakePayloadEnv(env, {
       runId: "boundary",
       scratchDir: dir,
+      transport: "local",
     });
     const file = await fs.readFile(delivery.path ?? "", "utf8");
 
@@ -195,7 +196,7 @@ process.stdout.write("full-context-ok");
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-note-"));
     const payload = oversizedWakeJson();
     const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload };
-    const delivery = await materializePaperclipWakePayloadEnv(env, { runId: "note", scratchDir: dir });
+    const delivery = await materializePaperclipWakePayloadEnv(env, { runId: "note", scratchDir: dir, transport: "local" });
     const note = paperclipWakePayloadFileNote(env);
     const pointer = JSON.parse(env.PAPERCLIP_WAKE_PAYLOAD_JSON);
 
@@ -217,8 +218,8 @@ process.stdout.write("full-context-ok");
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-idem-"));
     const payload = oversizedWakeJson();
     const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload };
-    const first = await materializePaperclipWakePayloadEnv(env, { runId: "idem", scratchDir: dir });
-    const second = await materializePaperclipWakePayloadEnv(env, { runId: "idem", scratchDir: dir });
+    const first = await materializePaperclipWakePayloadEnv(env, { runId: "idem", scratchDir: dir, transport: "local" });
+    const second = await materializePaperclipWakePayloadEnv(env, { runId: "idem", scratchDir: dir, transport: "local" });
     expect(first.rewritten).toBe(true);
     expect(second.rewritten).toBe(false);
     expect(second.path).toBe(first.path);
@@ -231,18 +232,18 @@ process.stdout.write("full-context-ok");
   it("refuses to start when the pointer names a file that is gone", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-gone-"));
     const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: oversizedWakeJson() };
-    const first = await materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir });
+    const first = await materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir, transport: "local" });
     await fs.rm(first.path ?? "", { force: true });
 
     await expect(
-      materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir }),
+      materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir, transport: "local" }),
     ).rejects.toThrow(/Wake payload file is missing/);
 
     // Same verdict once the local-path hint is gone, which is the shape a
     // re-entered start carries.
     delete (env as Record<string, string>).PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH;
     await expect(
-      materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir }),
+      materializePaperclipWakePayloadEnv(env, { runId: "gone", scratchDir: dir, transport: "local" }),
     ).rejects.toThrow(/Wake payload file is missing/);
 
     await fs.rm(dir, { recursive: true, force: true });
@@ -252,7 +253,7 @@ process.stdout.write("full-context-ok");
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-remote-"));
     const payload = oversizedWakeJson();
     const env: Record<string, string> = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload };
-    await materializePaperclipWakePayloadEnv(env, { runId: "remote", scratchDir: dir });
+    await materializePaperclipWakePayloadEnv(env, { runId: "remote", scratchDir: dir, transport: "local" });
 
     const published: Array<{ remotePath: string; body: string }> = [];
     const retargeted = await retargetPaperclipWakePayloadEnv({
@@ -274,9 +275,87 @@ process.stdout.write("full-context-ok");
     const delivery = await materializePaperclipWakePayloadEnv(env, {
       runId: "remote",
       scratchDir: dir,
+      transport: "remote",
     });
     expect(delivery.delivery).toBe("file");
     expect(delivery.path).toBe(published[0]?.remotePath);
+
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  // The marker says the document was published somewhere, not that this start
+  // is the one going there. A local start reusing that environment has to read
+  // the document here, or it starts an agent on an empty task.
+  it("refuses a local start on an environment left behind by a remote hand-off", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-reentry-"));
+    const payload = oversizedWakeJson();
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "",
+      PAPERCLIP_WAKE_PAYLOAD_JSON: payload,
+    };
+    await materializePaperclipWakePayloadEnv(env, {
+      runId: "reentry",
+      scratchDir: dir,
+      transport: "local",
+    });
+    await retargetPaperclipWakePayloadEnv({
+      env,
+      runId: "reentry",
+      publish: async () => {},
+    });
+    expect(env.PAPERCLIP_WAKE_PAYLOAD_REMOTE).toBe("1");
+    expect(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH).toBeUndefined();
+
+    await expect(
+      materializePaperclipWakePayloadEnv({ ...env }, {
+        runId: "reentry",
+        scratchDir: dir,
+        transport: "local",
+      }),
+    ).rejects.toThrow(/Wake payload file is missing/);
+
+    // The same env through the real local start seam: no child may reach the
+    // agent, so the spawn callback must never fire.
+    const spawned: number[] = [];
+    await expect(
+      runChildProcess("reentry-run", process.execPath, ["-e", "process.exit(0)"], {
+        cwd: dir,
+        env: { ...env },
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async (meta) => {
+          spawned.push(meta.pid);
+        },
+      }),
+    ).rejects.toThrow(/Wake payload file is missing/);
+    expect(spawned).toEqual([]);
+
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("refuses to publish a document that no longer matches the pointer", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-swap-"));
+    const env: Record<string, string> = { PAPERCLIP_WAKE_PAYLOAD_JSON: oversizedWakeJson() };
+    const delivery = await materializePaperclipWakePayloadEnv(env, {
+      runId: "swap",
+      scratchDir: dir,
+      transport: "local",
+    });
+    await fs.writeFile(delivery.path ?? "", JSON.stringify({ marker: "podmiana" }));
+
+    const published: string[] = [];
+    await expect(
+      retargetPaperclipWakePayloadEnv({
+        env,
+        runId: "swap",
+        publish: async (_remotePath, body) => {
+          published.push(body);
+        },
+      }),
+    ).rejects.toThrow(/does not match the pointer/);
+    expect(published).toEqual([]);
+    expect(env.PAPERCLIP_WAKE_PAYLOAD_REMOTE).toBeUndefined();
 
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -300,7 +379,7 @@ process.stdout.write("full-context-ok");
       await fs.mkdir(scratch);
       const payload = oversizedWakeJson();
       const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload, PAPERCLIP_RUN_SCRATCH_DIR: scratch };
-      await materializePaperclipWakePayloadEnv(env, { runId: "sandbox", scratchDir: scratch });
+      await materializePaperclipWakePayloadEnv(env, { runId: "sandbox", scratchDir: scratch, transport: "local" });
       const mounts = paperclipWakePayloadSandboxMounts(env);
       const target = await buildLocalProcessSandboxSpawnTarget({
         executable: process.execPath,
