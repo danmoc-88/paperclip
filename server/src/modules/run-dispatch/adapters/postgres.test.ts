@@ -23,6 +23,7 @@ import {
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
+import { terminalizeLegacyExecution } from "../../../services/legacy-execution-recovery.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
@@ -855,6 +856,64 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, previousRunId))).toHaveLength(0);
     // The upgrade does not silently resume historical blocked work.
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("blocked");
+  });
+
+  it("settles an interrupted conversation once across repeated stranded-work visits", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "interrupted", errorCode: "process_lost",
+      contextSnapshot: { issueId }, runtimeMode: "legacy",
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+    }).returning();
+    // Each scheduler visit re-terminalizes the source before folding old holds.
+    for (let tick = 0; tick < 40; tick++) {
+      await terminalizeLegacyExecution({ db, run, status: run.status });
+      await settleUnrecoverableExecutions(db, new Date(Date.now() + tick * 30_000));
+    }
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "resolved", outcome: "cancelled", evidence: { runId: run.id } });
+    const audit = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(audit.filter(event => event.action === "issue.execution_recovery_settled")).toHaveLength(1);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("in_progress");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+
+    // Concurrent revisits also preserve the settlement.
+    await Promise.all(Array.from({ length: 4 }, () => terminalizeLegacyExecution({ db, run, status: run.status })));
+    await settleUnrecoverableExecutions(db);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(1);
+
+    // A different failed run still gets its own action and settlement.
+    const [nextRun] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "interrupted", errorCode: "process_lost",
+      contextSnapshot: { issueId }, runtimeMode: "legacy",
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+    }).returning();
+    await terminalizeLegacyExecution({ db, run: nextRun, status: nextRun.status });
+    await settleUnrecoverableExecutions(db);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(2);
+  });
+
+  it.each(["process", "http", null])("does not reuse a cancelled %s action as a conversation settlement", async adapterType => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "interrupted", errorCode: "process_lost",
+      contextSnapshot: { issueId }, runtimeMode: "legacy",
+      runnerProfileJson: adapterType ? { adapterDispatch: { adapterType } } : {},
+    }).returning();
+    const [oldAction] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", status: "resolved", outcome: "cancelled",
+      evidence: { runId: run.id }, fingerprint: `legacy-execution:${run.id}`, nextAction: "Inspect previous execution.",
+    }).returning();
+    await terminalizeLegacyExecution({ db, run, status: run.status });
+    const blocker = await getExecutionBlocker(db, companyId, issueId);
+    expect(blocker).toMatchObject({ cause: "legacy_execution_requires_reconciliation" });
+    expect(blocker?.recoveryActionId).not.toBe(oldAction.id);
   });
 
   it.each(["process", "http", null])("keeps a historical %s hold after switching to a conversation adapter", async historicalAdapter => {

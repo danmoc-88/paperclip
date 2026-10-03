@@ -1,7 +1,7 @@
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
-import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
+import { conversationRecoveryActionPredicate, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -115,14 +115,22 @@ export async function terminalizeLegacyExecution(input: {
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       !["done", "cancelled"].includes(task.status)
     ) {
-      // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Preserve the recorded decision.
+      // Periodic stranded-work checks revisit terminal runs while the issue
+      // remains in progress. Preserve both operator decisions and completed
+      // conversation settlements instead of creating a new action each tick.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
           eq(issueRecoveryActions.sourceIssueId, task.id),
           eq(issueRecoveryActions.status, "resolved"),
-          sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+          or(
+            sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+            and(
+              eq(issueRecoveryActions.outcome, "cancelled"),
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              conversationRecoveryActionPredicate(),
+            ),
+          ),
         )).limit(1);
       if (reconciled) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
