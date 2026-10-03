@@ -868,8 +868,20 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
     }).returning();
     // Each scheduler visit re-terminalizes the source before folding old holds.
+    let firstDelivery: string | null = null;
+    let firstUpdatedAt: Date | null = null;
     for (let tick = 0; tick < 40; tick++) {
-      await terminalizeLegacyExecution({ db, run, status: run.status });
+      const changed = await terminalizeLegacyExecution({ db, run, status: run.status });
+      if (tick === 0) {
+        expect(changed?.executionStatusDeliveryId).toBeTruthy();
+        firstDelivery = changed!.executionStatusDeliveryId;
+        firstUpdatedAt = changed!.updatedAt;
+      } else {
+        expect(changed).toBeNull();
+      }
+      const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(stored.executionStatusDeliveryId).toBe(firstDelivery);
+      expect(stored.updatedAt).toEqual(firstUpdatedAt);
       await settleUnrecoverableExecutions(db, new Date(Date.now() + tick * 30_000));
     }
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
@@ -881,7 +893,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
 
     // Concurrent revisits also preserve the settlement.
-    await Promise.all(Array.from({ length: 4 }, () => terminalizeLegacyExecution({ db, run, status: run.status })));
+    const revisits = await Promise.all(Array.from({ length: 4 }, () => terminalizeLegacyExecution({ db, run, status: run.status })));
+    expect(revisits).toEqual([null, null, null, null]);
     await settleUnrecoverableExecutions(db);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(1);
 
@@ -891,9 +904,33 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       contextSnapshot: { issueId }, runtimeMode: "legacy",
       runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
     }).returning();
-    await terminalizeLegacyExecution({ db, run: nextRun, status: nextRun.status });
+    expect(await terminalizeLegacyExecution({ db, run: nextRun, status: nextRun.status })).not.toBeNull();
     await settleUnrecoverableExecutions(db);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(2);
+  });
+
+  it.each(["running", "interrupted"])("preserves a real transition from %s despite a saved settlement", async status => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status, contextSnapshot: { issueId }, runtimeMode: "legacy",
+    }).returning();
+    await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", status: "resolved", outcome: "cancelled",
+      evidence: { executionReconciliation: { runId: run.id } },
+      fingerprint: `legacy-execution:${run.id}`, nextAction: "Resolved.",
+    });
+    const changed = await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+    expect(changed?.status).toBe("cancelled");
+    expect(changed?.executionStatusDeliveryId).toBeTruthy();
+    // Even a stale caller snapshot cannot create another delivery.
+    expect(await terminalizeLegacyExecution({ db, run, status: "cancelled" })).toBeNull();
+    const amended = await terminalizeLegacyExecution({
+      db, run: changed!, status: "cancelled", patch: { resultJson: { summary: "Late stop evidence" } },
+    });
+    expect(amended?.resultJson?.summary).toBe("Late stop evidence");
   });
 
   it.each(["process", "http", null])("does not reuse a cancelled %s action as a conversation settlement", async adapterType => {

@@ -75,6 +75,33 @@ export async function terminalizeLegacyExecution(input: {
           )
           .for("update")
       : [];
+    // Check the durable settlement under the issue lock before changing the
+    // delivery marker. A repeated sweep must not enqueue another status event.
+    const [reconciled] = task ? await tx.select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId),
+        eq(issueRecoveryActions.sourceIssueId, task.id),
+        eq(issueRecoveryActions.status, "resolved"),
+        or(
+          sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+          and(
+            eq(issueRecoveryActions.outcome, "cancelled"),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+            conversationRecoveryActionPredicate(),
+          ),
+        ),
+      )).limit(1) : [];
+    if (reconciled && (!patch || Object.keys(patch).length === 0)
+      && task?.executionRunId !== run.id && task?.checkoutRunId !== run.id) {
+      const [current] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      )).for("update");
+      // Read persisted status: callers can carry a stale pre-terminal snapshot.
+      // Never suppress the first transition, a new patch, or a different outcome.
+      if (current?.status === status && ["failed", "timed_out", "interrupted", "cancelled"].includes(status)) {
+        return null;
+      }
+    }
     const [updated] = await tx
       .update(heartbeatRuns)
       .set({
@@ -115,23 +142,6 @@ export async function terminalizeLegacyExecution(input: {
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       !["done", "cancelled"].includes(task.status)
     ) {
-      // Periodic stranded-work checks revisit terminal runs while the issue
-      // remains in progress. Preserve both operator decisions and completed
-      // conversation settlements instead of creating a new action each tick.
-      const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
-        .from(issueRecoveryActions).where(and(
-          eq(issueRecoveryActions.companyId, run.companyId),
-          eq(issueRecoveryActions.sourceIssueId, task.id),
-          eq(issueRecoveryActions.status, "resolved"),
-          or(
-            sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
-            and(
-              eq(issueRecoveryActions.outcome, "cancelled"),
-              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              conversationRecoveryActionPredicate(),
-            ),
-          ),
-        )).limit(1);
       if (reconciled) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,

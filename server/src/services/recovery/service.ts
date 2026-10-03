@@ -4408,14 +4408,18 @@ export function recoveryService(
             ),
           );
         if (source && legacyExecutionNeedsReconciliation(source)) {
-          await terminalizeLegacyExecution({
+          const changed = await terminalizeLegacyExecution({
             db,
             run: source,
             status: source.status,
             fromStatuses: [source.status],
           });
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
+          if (changed) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
       }
