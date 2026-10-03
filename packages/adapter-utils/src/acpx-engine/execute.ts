@@ -37,6 +37,11 @@ import {
   type SandboxAdditionalSource,
 } from "@paperclipai/adapter-utils/execution-target";
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
+import {
+  formatPaperclipWakePayloadDiagnostic,
+  materializePaperclipWakePayloadEnv,
+  paperclipWakePayloadFileNote,
+} from "../wake-payload-env.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
@@ -1986,6 +1991,28 @@ async function buildRuntime(input: {
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  // acpx spawns the agent process itself, so this env never passes through
+  // `runChildProcess` / `runAdapterExecutionTargetProcess` — the two seams that
+  // already spill an oversized wake document to a run file. Without the spill
+  // here, Linux rejects a single `PAPERCLIP_WAKE_PAYLOAD_JSON` string above
+  // MAX_ARG_STRLEN (131072 bytes) and `AcpClient.spawnAgentProcess` fails with
+  // `spawn E2BIG` in the `ensure_session` phase, before the agent starts.
+  // Remote lanes keep the inline value: the spilled file lives on the host, and
+  // the agent runs on the far side of the transport, where that path resolves
+  // to nothing. Publishing it there needs the transport's own channel, which
+  // this seam does not own.
+  if (!executionTargetIsRemote) {
+    const wakeScratchDir =
+      env.PAPERCLIP_RUN_SCRATCH_DIR ??
+      (scratch.type === "heartbeat_run" && typeof scratch.dir === "string" ? scratch.dir : null);
+    const wakeDelivery = await materializePaperclipWakePayloadEnv(env, {
+      runId,
+      scratchDir: wakeScratchDir,
+    });
+    if (wakeDelivery.rewritten) {
+      await input.ctx.onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));
+    }
+  }
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
   // validates the value against its internal available-models list and rejects
@@ -3010,6 +3037,9 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const paperclipEnvNote = externalChatTurn ? "" : renderPaperclipEnvNote(env);
   const apiAccessNote = externalChatTurn ? "" : renderApiAccessNote(env);
   const prompt = joinPromptSections([
+    // Empty unless this run's wake document was spilled to a file. The agent
+    // otherwise reads only the small pointer and never sees the task.
+    paperclipWakePayloadFileNote(env),
     promptInstructionsPrefix,
     renderedBootstrapPrompt,
     wakePrompt,
