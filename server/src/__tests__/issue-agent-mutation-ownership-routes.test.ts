@@ -1714,6 +1714,65 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // The gate reads the lock on its own connection, so a checkout can still land
+  // between that reading and the write. The write has to re-decide it under the
+  // row lock, which it can only do if the gate hands the premise down.
+  it("carries the cleared run lock into the write that has to re-check it", async () => {
+    mockIssueService.describeRunLock.mockResolvedValue({
+      held: false,
+      checkoutRunId: null,
+      executionRunId: null,
+      liveRunId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Stranded update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update.mock.calls[0]?.[5]).toEqual({
+      foreignRunLockGuard: { actorAgentId: peerAgentId },
+    });
+  });
+
+  it("answers the gate's own copy when the write finds the lock taken after all", async () => {
+    const { HttpError: CurrentHttpError } =
+      await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockIssueService.describeRunLock.mockResolvedValue({
+      held: false,
+      checkoutRunId: null,
+      executionRunId: null,
+      liveRunId: null,
+    });
+    mockIssueService.update.mockRejectedValue(
+      new CurrentHttpError(409, "Another agent's run owns this task", {
+        code: "issue_write_assignee_run_lock",
+        issueId,
+        assigneeAgentId: ownerAgentId,
+        actorAgentId: peerAgentId,
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+        liveRunId: null,
+      }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({
+      code: "issue_write_assignee_run_lock",
+      boundary: "Run checkout lock",
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+    // Same shape as the pre-screen refusal, so a caller cannot tell which of
+    // the two decided — only which run it names.
+    expect(res.body.details.whoCanAct).toBeTruthy();
+    expect(res.body.details.sanctionedPath).toBeTruthy();
+  });
+
   it.each([
     ["done", "todo", 403, "Agent cannot request follow-up for another agent's issue"],
     ["cancelled", "todo", 409, "Cancelled issues must be restored through the dedicated restore flow"],

@@ -37,6 +37,15 @@ export const ISSUE_WRITE_DENIAL_CODES = [
 export type IssueWriteDenialCode = (typeof ISSUE_WRITE_DENIAL_CODES)[number];
 
 /**
+ * The run-lock refusal is decided twice: once by the route's pre-screen, and
+ * again inside the write, under the row lock, because a checkout can land in
+ * between. The second decision travels as an error and is matched on this code,
+ * so both ends have to name the same one.
+ */
+export const ISSUE_WRITE_ASSIGNEE_RUN_LOCK_DENIAL_CODE: IssueWriteDenialCode =
+  "issue_write_assignee_run_lock";
+
+/**
  * Why the write stopped, which drives icon + colour. `boundary` is an
  * authorization wall, `lock` is run-lifecycle machinery that will clear on its
  * own, `cap` is a rate backstop, and `attribution` is a rejected spoof.

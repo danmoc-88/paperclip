@@ -6293,6 +6293,155 @@ describeEmbeddedPostgres("issueService.describeRunLock", () => {
     expect(lock.checkoutRunId).toBe(runId);
     expect(lock.liveRunId).toBeNull();
   });
+
+  // The gate reads the lock on its own connection, so its answer can go stale
+  // before the write lands. These cover that interleaving: the gate clears the
+  // peer, the owner's run checks out, and the write arrives on a premise that
+  // is already false.
+  async function seedClearedPeerWrite() {
+    const { issueId } = await seed(null);
+    const issue = await db
+      .select({
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    const peerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: peerAgentId,
+      companyId: issue.companyId,
+      name: "Nadzór",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // What the gate reads before it lets the peer through.
+    await expect(svc.describeRunLock(issueId)).resolves.toMatchObject({
+      held: false,
+    });
+
+    // The owner's run takes the checkout in between.
+    const ownerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: ownerRunId,
+      companyId: issue.companyId,
+      agentId: issue.assigneeAgentId!,
+      status: "running",
+      invocationSource: "manual",
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: ownerRunId, executionRunId: ownerRunId })
+      .where(eq(issues.id, issueId));
+
+    return { issueId, peerAgentId, ownerRunId };
+  }
+
+  function readLockColumns(issueId: string) {
+    return db
+      .select({
+        title: issues.title,
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+  }
+
+  it("refuses a peer field write whose cleared run lock closed before the write", async () => {
+    const { issueId, peerAgentId, ownerRunId } = await seedClearedPeerWrite();
+
+    await expect(
+      svc.update(
+        issueId,
+        { title: "Przepisane przez nadzór", actorAgentId: peerAgentId },
+        undefined,
+        undefined,
+        undefined,
+        { foreignRunLockGuard: { actorAgentId: peerAgentId } },
+      ),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_write_assignee_run_lock",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      },
+    });
+
+    await expect(readLockColumns(issueId)).resolves.toMatchObject({
+      title: "Start layer",
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+  });
+
+  // The write that does the most damage: `blocked` nulls both lock columns, so
+  // it would release a checkout under a run that is still going.
+  it("refuses a peer blocked patch that would null the lock of a live run", async () => {
+    const { issueId, peerAgentId, ownerRunId } = await seedClearedPeerWrite();
+
+    await expect(
+      svc.update(
+        issueId,
+        { status: "blocked", actorAgentId: peerAgentId },
+        undefined,
+        undefined,
+        undefined,
+        { foreignRunLockGuard: { actorAgentId: peerAgentId } },
+      ),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_write_assignee_run_lock" },
+    });
+
+    await expect(readLockColumns(issueId)).resolves.toMatchObject({
+      status: "in_progress",
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+  });
+
+  it("lets the cleared peer write through while the task stays unheld", async () => {
+    const { issueId } = await seed(null);
+    const peerAgentId = randomUUID();
+    const issue = await db
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    await db.insert(agents).values({
+      id: peerAgentId,
+      companyId: issue.companyId,
+      name: "Nadzór",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const updated = await svc.update(
+      issueId,
+      { title: "Powiązane ze zgłoszeniem", actorAgentId: peerAgentId },
+      undefined,
+      undefined,
+      undefined,
+      { foreignRunLockGuard: { actorAgentId: peerAgentId } },
+    );
+
+    expect(updated?.title).toBe("Powiązane ze zgłoszeniem");
+  });
 });
 
 describeEmbeddedPostgres("accepted plan decomposition", () => {
