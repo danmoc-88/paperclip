@@ -10,6 +10,7 @@ const ownerRunId = "55555555-5555-4555-8555-555555555555";
 
 const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
+  describeRunLock: vi.fn(),
   getById: vi.fn(),
 }));
 
@@ -176,6 +177,13 @@ describe("external object routes", () => {
     vi.resetAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    // The checkout in these cases is a real one, held by the owner's live run.
+    mockIssueService.describeRunLock.mockResolvedValue({
+      held: true,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      liveRunId: ownerRunId,
+    });
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async ({ action }: { action: string }) => ({
       allowed: action === "issue:read" || action === "issue:mutate",

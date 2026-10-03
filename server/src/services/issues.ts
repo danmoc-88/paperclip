@@ -7688,6 +7688,58 @@ export function issueService(db: Db) {
     });
   }
 
+  // Answers "does a run actually hold this task right now", for the peer-write
+  // gate. `in_progress` on its own is not a claim: when a run dies before it
+  // can release the task the status outlives it, and then no run is ever going
+  // to clear the lock. Same rule as clearCheckoutRunIfTerminal — a terminal run
+  // holds no real claim — joined with the live-run predicate behind
+  // GET /api/issues/:issueId/live-runs, so the refusal cannot contradict what a
+  // supervisor reads from the API.
+  async function describeRunLock(issueId: string): Promise<{
+    held: boolean;
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+    liveRunId: string | null;
+  }> {
+    await clearExecutionRunIfTerminal(issueId);
+    await clearCheckoutRunIfTerminal(issueId);
+
+    const current = await db
+      .select({
+        companyId: issues.companyId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!current) throw notFound("Issue not found");
+
+    // A run that never reached checkout still owns the task, so the row's lock
+    // columns alone would miss it.
+    const liveRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, current.companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    return {
+      held: Boolean(
+        current.checkoutRunId || current.executionRunId || liveRun?.id,
+      ),
+      checkoutRunId: current.checkoutRunId,
+      executionRunId: current.executionRunId,
+      liveRunId: liveRun?.id ?? null,
+    };
+  }
+
   async function addStopRelayCommentIfNeeded(
     child: typeof issues.$inferSelect,
     dbOrTx: any = db,
@@ -7810,6 +7862,7 @@ export function issueService(db: Db) {
   const service = {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    describeRunLock,
     addStopRelayCommentIfNeeded,
 
     list: async (companyId: string, filters?: IssueFilters) => {

@@ -6171,6 +6171,130 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.describeRunLock", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-run-lock-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seed(
+    run: { status: string; contextIssueId?: boolean } | null,
+    issueColumns: { checkoutRunId?: string | null; executionRunId?: string | null } = {},
+  ) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = run ? randomUUID() : null;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Koordynator",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    if (run && runId) {
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: run.status,
+        invocationSource: "manual",
+        contextSnapshot: run.contextIssueId === false ? {} : { issueId },
+      });
+    }
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Start layer",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: issueColumns.checkoutRunId === undefined ? null : issueColumns.checkoutRunId,
+      executionRunId: issueColumns.executionRunId === undefined ? null : issueColumns.executionRunId,
+    });
+
+    return { issueId, runId };
+  }
+
+  // The state the ACP start failures left behind: `in_progress`, both lock
+  // columns null, and no run anywhere. Nothing holds the task.
+  it("reports no lock on an in-progress issue whose run never recorded a checkout", async () => {
+    const { issueId } = await seed(null);
+
+    await expect(svc.describeRunLock(issueId)).resolves.toEqual({
+      held: false,
+      checkoutRunId: null,
+      executionRunId: null,
+      liveRunId: null,
+    });
+  });
+
+  it("reports no lock once the run holding the checkout is terminal", async () => {
+    const { issueId, runId } = await seed({ status: "failed" }, { checkoutRunId: null });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+    const lock = await svc.describeRunLock(issueId);
+
+    expect(lock.held).toBe(false);
+    expect(lock.checkoutRunId).toBeNull();
+    expect(lock.liveRunId).toBeNull();
+  });
+
+  it.each(["queued", "running"])("reports a lock while a %s run targets the issue", async (status) => {
+    const { issueId, runId } = await seed({ status });
+
+    await expect(svc.describeRunLock(issueId)).resolves.toEqual({
+      held: true,
+      checkoutRunId: null,
+      executionRunId: null,
+      liveRunId: runId,
+    });
+  });
+
+  it("reports a lock from the checkout column when the run predates the context snapshot", async () => {
+    const { issueId, runId } = await seed({ status: "running", contextIssueId: false });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+    const lock = await svc.describeRunLock(issueId);
+
+    expect(lock.held).toBe(true);
+    expect(lock.checkoutRunId).toBe(runId);
+    expect(lock.liveRunId).toBeNull();
+  });
+});
+
 describeEmbeddedPostgres("accepted plan decomposition", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
