@@ -159,6 +159,7 @@ export {
   type AttachmentArtifactWorkProductLike,
 } from "./markdown-work-products.js";
 export {
+  ISSUE_WRITE_ASSIGNEE_RUN_LOCK_DENIAL_CODE,
   ISSUE_WRITE_DENIAL_CODES,
   describeIssueWriteDenial,
   isIssueWriteDenialCode,

@@ -94,6 +94,7 @@ import {
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
+  ISSUE_WRITE_ASSIGNEE_RUN_LOCK_DENIAL_CODE,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
@@ -2048,6 +2049,15 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
   "cancelled",
   "timed_out",
 ]);
+
+/** Which run, if any, holds a task against a peer's write. */
+export interface IssueRunLock {
+  held: boolean;
+  checkoutRunId: string | null;
+  executionRunId: string | null;
+  liveRunId: string | null;
+}
+
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -7688,6 +7698,102 @@ export function issueService(db: Db) {
     });
   }
 
+  // Decides "does a run hold this task right now" from an issue row the caller
+  // has already read. A lock column counts only while the run it names is still
+  // live — the same rule clearCheckoutRunIfTerminal applies when it nulls the
+  // column, stated as a pure read so it can run inside the caller's transaction
+  // under the caller's row lock. The live-run term is the predicate behind
+  // GET /api/issues/:issueId/live-runs, so a refusal built from this cannot
+  // contradict what a supervisor reads from the API.
+  async function readRunLock(
+    dbOrTx: any,
+    issue: {
+      id: string;
+      companyId: string;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    },
+  ): Promise<IssueRunLock> {
+    const lockRunIds = [...new Set(
+      [issue.checkoutRunId, issue.executionRunId].filter(
+        (value): value is string => Boolean(value),
+      ),
+    )];
+    const liveLockRunIds: Set<string> = lockRunIds.length === 0
+      ? new Set<string>()
+      : await dbOrTx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.id, lockRunIds),
+              notInArray(heartbeatRuns.status, [
+                ...TERMINAL_HEARTBEAT_RUN_STATUSES,
+              ]),
+            ),
+          )
+          .then(
+            (rows: Array<{ id: string }>) =>
+              new Set(rows.map((row) => row.id)),
+          );
+
+    // A run that never reached checkout still owns the task, so the row's lock
+    // columns alone would miss it.
+    const liveRun = await dbOrTx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+        ),
+      )
+      .limit(1)
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+
+    const checkoutRunId =
+      issue.checkoutRunId && liveLockRunIds.has(issue.checkoutRunId)
+        ? issue.checkoutRunId
+        : null;
+    const executionRunId =
+      issue.executionRunId && liveLockRunIds.has(issue.executionRunId)
+        ? issue.executionRunId
+        : null;
+    return {
+      held: Boolean(checkoutRunId || executionRunId || liveRun?.id),
+      checkoutRunId,
+      executionRunId,
+      liveRunId: liveRun?.id ?? null,
+    };
+  }
+
+  // Answers "does a run actually hold this task right now", for the peer-write
+  // gate. `in_progress` on its own is not a claim: when a run dies before it
+  // can release the task the status outlives it, and then no run is ever going
+  // to clear the lock. This is the pre-screen — it clears a terminal run off the
+  // lock columns and produces the refusal copy. The decision that guards the
+  // write itself is taken again inside `update`, under the row lock, because
+  // nothing holds the task still between this read and that write.
+  async function describeRunLock(issueId: string): Promise<IssueRunLock> {
+    await clearExecutionRunIfTerminal(issueId);
+    await clearCheckoutRunIfTerminal(issueId);
+
+    const current = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!current) throw notFound("Issue not found");
+
+    return readRunLock(db, current);
+  }
+
   async function addStopRelayCommentIfNeeded(
     child: typeof issues.$inferSelect,
     dbOrTx: any = db,
@@ -7810,6 +7916,7 @@ export function issueService(db: Db) {
   const service = {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    describeRunLock,
     addStopRelayCommentIfNeeded,
 
     list: async (companyId: string, filters?: IssueFilters) => {
@@ -10533,7 +10640,15 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: {
+        bindRuntimeSharedWorkspace?: boolean;
+        /**
+         * Set by a caller whose peer write was cleared by the run-lock gate.
+         * Re-decides that same question under the write's row lock; a caller
+         * that never leaned on the gate has no premise here to re-check.
+         */
+        foreignRunLockGuard?: { actorAgentId: string } | null;
+      } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -10845,6 +10960,33 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // The route's peer-write gate read the run lock on its own connection
+        // and found it open. Nothing held the task still in between, so a
+        // checkout that landed since then would otherwise be overwritten by a
+        // write that was cleared against a task nobody owned — and a `blocked`
+        // patch would null both lock columns under a run that is still going.
+        // Decide again here, under the row lock the write already takes, so the
+        // answer and the write cannot disagree.
+        if (
+          options.foreignRunLockGuard &&
+          receiptExisting.status === "in_progress" &&
+          receiptExisting.assigneeAgentId &&
+          receiptExisting.assigneeAgentId !==
+            options.foreignRunLockGuard.actorAgentId
+        ) {
+          const runLock = await readRunLock(tx, receiptExisting);
+          if (runLock.held) {
+            throw conflict("Another agent's run owns this task", {
+              code: ISSUE_WRITE_ASSIGNEE_RUN_LOCK_DENIAL_CODE,
+              issueId: receiptExisting.id,
+              assigneeAgentId: receiptExisting.assigneeAgentId,
+              actorAgentId: options.foreignRunLockGuard.actorAgentId,
+              checkoutRunId: runLock.checkoutRunId,
+              executionRunId: runLock.executionRunId,
+              liveRunId: runLock.liveRunId,
+            });
+          }
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });

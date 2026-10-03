@@ -135,6 +135,7 @@ import {
   type SuggestTasksInteraction,
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
+  ISSUE_WRITE_ASSIGNEE_RUN_LOCK_DENIAL_CODE,
   issueWriteDenialCodeForResponsibleUserDenial,
   issueWriteDenialResponse,
   type IssueWriteDenialCode,
@@ -5090,6 +5091,51 @@ export function issueRoutes(
     };
   }
 
+  /**
+   * Issues this request's peer write was cleared on because no run held them,
+   * keyed by issue id. The gate reads the lock on its own connection, so that
+   * answer can go stale before the write lands; recording the premise lets the
+   * write re-decide it under the row lock. A write with no entry here never
+   * leaned on the gate's run-lock reading and has nothing to re-check.
+   */
+  const issueWriteRunLockPremises = new WeakMap<Request, Map<string, string>>();
+
+  function recordIssueWriteRunLockPremise(
+    req: Request,
+    issueId: string,
+    actorAgentId: string,
+  ) {
+    const existing = issueWriteRunLockPremises.get(req) ?? new Map();
+    existing.set(issueId, actorAgentId);
+    issueWriteRunLockPremises.set(req, existing);
+  }
+
+  function issueWriteRunLockPremise(
+    req: Request,
+    issueId: string,
+  ): { actorAgentId: string } | null {
+    const actorAgentId = issueWriteRunLockPremises.get(req)?.get(issueId);
+    return actorAgentId ? { actorAgentId } : null;
+  }
+
+  /**
+   * The run ids a failed in-transaction run-lock guard named, or null. Matched
+   * on status and code rather than `instanceof`: the error crosses a module
+   * boundary on its way up, and the guard's own code is the precise marker.
+   */
+  function foreignRunLockConflictDetails(
+    err: unknown,
+  ): Record<string, unknown> | null {
+    if (!err || typeof err !== "object") return null;
+    const { status, details } = err as { status?: unknown; details?: unknown };
+    if (status !== 409) return null;
+    if (!details || typeof details !== "object" || Array.isArray(details))
+      return null;
+    const record = details as Record<string, unknown>;
+    if (record.code !== ISSUE_WRITE_ASSIGNEE_RUN_LOCK_DENIAL_CODE) return null;
+    return record;
+  }
+
   /** Respond to a denied issue write with copy that names boundary, who, and path. */
   async function denyIssueWrite(
     req: Request,
@@ -5347,17 +5393,29 @@ export function issueRoutes(
       if (issue.status === "in_progress") {
         // Run/checkout ownership stays assignee-scoped even though writes are
         // open, so this lock clears on its own — the copy routes to comments.
-        return denyIssueWrite(
-          req,
-          res,
-          issue,
-          "issue_write_assignee_run_lock",
-          {
-            issueId: issue.id,
-            assigneeAgentId: issue.assigneeAgentId,
-            actorAgentId,
-          },
-        );
+        // It has to be a real run that holds the task, though: an issue whose
+        // run died before releasing it keeps `in_progress` forever, and then
+        // the denial would promise a release that never comes.
+        const runLock = await svc.describeRunLock(issue.id);
+        if (runLock.held) {
+          return denyIssueWrite(
+            req,
+            res,
+            issue,
+            "issue_write_assignee_run_lock",
+            {
+              issueId: issue.id,
+              assigneeAgentId: issue.assigneeAgentId,
+              actorAgentId,
+              checkoutRunId: runLock.checkoutRunId,
+              executionRunId: runLock.executionRunId,
+              liveRunId: runLock.liveRunId,
+            },
+          );
+        }
+        // Read on another connection, so a checkout can still land before the
+        // write does. The write re-decides it under the row lock.
+        recordIssueWriteRunLockPremise(req, issue.id, actorAgentId);
       }
       // Past the run lock the issue is idle, so only channels that have not
       // adopted the default-open rule still refuse another agent's issue.
@@ -13513,7 +13571,29 @@ export function issueRoutes(
         updateFields.status === "done";
       const shouldCollectTerminalIssueActions =
         updateFields.status === "done" || updateFields.status === "cancelled";
+      // The gate above may have cleared this write against a run lock it read
+      // on another connection. Carry that premise into the write so it is
+      // decided again under the row lock instead of trusted across the gap.
+      const runLockPremise = issueWriteRunLockPremise(req, id);
       const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
+        if (runLockPremise) {
+          // The premise is the last positional, so this shape has to name every
+          // earlier slot — the branches below say which ones carry a value.
+          return svc.update(
+            id,
+            issueUpdateData,
+            tx ?? db,
+            shouldCollectCompletionPublication
+              ? postCommitActivityPublications
+              : undefined,
+            tx &&
+              (shouldCollectCompletionPublication ||
+                shouldCollectTerminalIssueActions)
+              ? postCommitIssueActions
+              : undefined,
+            { foreignRunLockGuard: runLockPremise },
+          );
+        }
         if (tx) {
           if (shouldCollectCompletionPublication) {
             return svc.update(
@@ -13716,6 +13796,20 @@ export function issueRoutes(
           issue = await updateIssue();
         }
       } catch (err) {
+        // A checkout landed between the gate's reading and the write's row
+        // lock. Answer with the gate's own copy, so a caller cannot tell the
+        // two refusals apart by their shape, only by the run ids they name.
+        const runLockDetails = foreignRunLockConflictDetails(err);
+        if (runLockDetails) {
+          await denyIssueWrite(
+            req,
+            res,
+            existing,
+            "issue_write_assignee_run_lock",
+            runLockDetails,
+          );
+          return;
+        }
         if (err instanceof HttpError && err.status === 422) {
           logger.warn(
             {

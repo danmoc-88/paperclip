@@ -20,6 +20,7 @@ const mockIssueService = vi.hoisted(() => ({
   create: vi.fn(),
   createChild: vi.fn(),
   decomposeAcceptedPlan: vi.fn(),
+  describeRunLock: vi.fn(),
   getAttachmentById: vi.fn(),
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
@@ -494,6 +495,15 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
     mockIssueService.decomposeAcceptedPlan.mockReset();
+    // The default fixture stands for a task a live run really holds, which is
+    // what the run-lock cases below mean by "active checkout".
+    mockIssueService.describeRunLock.mockReset();
+    mockIssueService.describeRunLock.mockResolvedValue({
+      held: true,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      liveRunId: ownerRunId,
+    });
     mockIssueService.getAttachmentById.mockReset();
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getById.mockReset();
@@ -1656,6 +1666,111 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  // A task whose run died before it could release the checkout keeps
+  // `in_progress` with nothing holding it. Refusing a peer write there promises
+  // a release that never arrives: the status is the only thing left holding the
+  // lock, and only the assignee's own next run can change it.
+  // Only the channels that already adopted default-open writes open up here;
+  // `PUT /documents/:key` still refuses a peer on its own rule, lock or no lock.
+  it.each([
+    ["status and dependencies", { status: "blocked", blockedByIssueIds: [] }],
+    ["title", { title: "Stranded update" }],
+  ])(
+    "allows a peer agent to patch %s on an in-progress issue no run holds",
+    async (_kind, patch) => {
+      mockIssueService.describeRunLock.mockResolvedValue({
+        held: false,
+        checkoutRunId: null,
+        executionRunId: null,
+        liveRunId: null,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(patch);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.describeRunLock).toHaveBeenCalledWith(issueId);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    },
+  );
+
+  it("names the run that holds the task when it refuses a peer write", async () => {
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    // The copy promises the lock releases itself, so the refusal has to carry
+    // the run that is going to release it.
+    expect(res.body.details).toMatchObject({
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      liveRunId: ownerRunId,
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The gate reads the lock on its own connection, so a checkout can still land
+  // between that reading and the write. The write has to re-decide it under the
+  // row lock, which it can only do if the gate hands the premise down.
+  it("carries the cleared run lock into the write that has to re-check it", async () => {
+    mockIssueService.describeRunLock.mockResolvedValue({
+      held: false,
+      checkoutRunId: null,
+      executionRunId: null,
+      liveRunId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Stranded update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update.mock.calls[0]?.[5]).toEqual({
+      foreignRunLockGuard: { actorAgentId: peerAgentId },
+    });
+  });
+
+  it("answers the gate's own copy when the write finds the lock taken after all", async () => {
+    const { HttpError: CurrentHttpError } =
+      await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockIssueService.describeRunLock.mockResolvedValue({
+      held: false,
+      checkoutRunId: null,
+      executionRunId: null,
+      liveRunId: null,
+    });
+    mockIssueService.update.mockRejectedValue(
+      new CurrentHttpError(409, "Another agent's run owns this task", {
+        code: "issue_write_assignee_run_lock",
+        issueId,
+        assigneeAgentId: ownerAgentId,
+        actorAgentId: peerAgentId,
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+        liveRunId: null,
+      }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({
+      code: "issue_write_assignee_run_lock",
+      boundary: "Run checkout lock",
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+    // Same shape as the pre-screen refusal, so a caller cannot tell which of
+    // the two decided — only which run it names.
+    expect(res.body.details.whoCanAct).toBeTruthy();
+    expect(res.body.details.sanctionedPath).toBeTruthy();
   });
 
   it.each([
