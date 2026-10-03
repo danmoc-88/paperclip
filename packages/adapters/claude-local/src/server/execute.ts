@@ -325,6 +325,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const wakeDelivery = await materializePaperclipWakePayloadEnv(env, {
     runId,
     scratchDir,
+    transport: executionTargetIsRemote ? "remote" : "local",
   });
   if (wakeDelivery.delivery === "file") {
     await onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));

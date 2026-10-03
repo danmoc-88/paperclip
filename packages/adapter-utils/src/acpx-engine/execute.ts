@@ -2008,6 +2008,7 @@ async function buildRuntime(input: {
     const wakeDelivery = await materializePaperclipWakePayloadEnv(env, {
       runId,
       scratchDir: wakeScratchDir,
+      transport: "local",
     });
     if (wakeDelivery.rewritten) {
       await input.ctx.onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));

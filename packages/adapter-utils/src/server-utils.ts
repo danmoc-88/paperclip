@@ -4620,6 +4620,7 @@ export async function runChildProcess(
   const wakeDelivery = await materializePaperclipWakePayloadEnv(opts.env, {
     runId,
     scratchDir: opts.env.PAPERCLIP_RUN_SCRATCH_DIR ?? null,
+    transport: opts.remoteExecution ? "remote" : "local",
   });
   if (wakeDelivery.rewritten) {
     await opts.onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));

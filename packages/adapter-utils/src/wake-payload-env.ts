@@ -18,8 +18,10 @@ export const PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV = "PAPERCLIP_WAKE_PAYLOAD_LOC
 /**
  * Set once the document has been published to the machine that will run the
  * agent. From then on the pointer names a path on that machine, which this side
- * cannot read — so an unreadable pointer is expected and not a fault. Without
- * the marker an unreadable pointer means the document is gone, and starting an
+ * cannot read — so an unreadable pointer is expected and not a fault. The
+ * marker only excuses a start that is itself crossing a transport: it says the
+ * document was published, not that this start is the one going there. On a
+ * local start an unreadable pointer means the document is gone, and starting an
  * agent on an empty task is worse than refusing to start it.
  */
 export const PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV = "PAPERCLIP_WAKE_PAYLOAD_REMOTE";
@@ -42,6 +44,9 @@ export interface PaperclipWakePayloadPointer {
   bytes: number;
   sha256: string;
 }
+
+/** Whether the start being prepared runs on this machine or across a transport. */
+export type PaperclipWakePayloadTransport = "local" | "remote";
 
 export function formatPaperclipWakePayloadDiagnostic(
   delivery: PaperclipWakePayloadDelivery,
@@ -135,9 +140,15 @@ export async function retargetPaperclipWakePayloadEnv(input: {
 }): Promise<boolean> {
   const localPath = input.env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
   if (!localPath) return false;
-  const body = await fs.readFile(localPath, "utf8");
+  const pointer = readPaperclipWakePayloadPointer(input.env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]);
+  if (!pointer) throw new Error("Wake payload pointer is missing.");
+  const body = await fs.readFile(localPath);
+  // Publish the document the pointer describes, not whatever sits at that path
+  // now. The pointer travels to the target unchanged, so a file swapped in
+  // between the spill and the hand-off would only surface on the far side.
+  assertFileMatchesPointer(body, pointer);
   const remotePath = paperclipWakePayloadRemotePath(input.runId);
-  await input.publish(remotePath, body);
+  await input.publish(remotePath, body.toString("utf8"));
   rewritePaperclipWakePayloadPointerPath(input.env, remotePath);
   delete input.env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
   input.env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV] = "1";
@@ -175,6 +186,13 @@ export async function materializePaperclipWakePayloadEnv(
     runId: string;
     scratchDir?: string | null;
     directory?: string | null;
+    /**
+     * Where the process this environment starts actually runs. A local start
+     * reads the document on this machine, so a pointer it cannot read refuses
+     * the start. Only a start that crosses a transport has another machine to
+     * name, and the caller is the only side that knows which one it is doing.
+     */
+    transport: PaperclipWakePayloadTransport;
   },
 ): Promise<PaperclipWakePayloadDelivery> {
   const json = env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV];
@@ -184,7 +202,10 @@ export async function materializePaperclipWakePayloadEnv(
   const bytes = Buffer.byteLength(json);
   const pointer = readPaperclipWakePayloadPointer(json);
   if (pointer && bytes <= PAPERCLIP_WAKE_PAYLOAD_INLINE_MAX_BYTES) {
-    await assertExistingPointer(env, pointer);
+    await assertExistingPointer(env, pointer, options.transport);
+    // The marker records one hand-off to one target. A local start is not that
+    // hand-off, so it must not carry the claim down to the agent either.
+    if (options.transport === "local") delete env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV];
     return {
       delivery: "file",
       rewritten: false,
@@ -252,6 +273,7 @@ function emptyDelivery(): PaperclipWakePayloadDelivery {
 async function assertExistingPointer(
   env: Record<string, string>,
   pointer: PaperclipWakePayloadPointer,
+  transport: PaperclipWakePayloadTransport,
 ): Promise<void> {
   const direct = await readFileIfPresent(pointer.path);
   if (direct) {
@@ -271,8 +293,11 @@ async function assertExistingPointer(
     return;
   }
   // The pointer names a path on the machine that will run the agent, so this
-  // side has nothing to check. Only a published hand-off earns that pass.
-  if (env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV] === "1") return;
+  // side has nothing to check. That pass belongs to a start which actually
+  // crosses a transport and whose document was published there; the marker
+  // alone outlives the hand-off that set it, and a local start has to read the
+  // document here no matter what an earlier hand-off left behind.
+  if (transport === "remote" && env[PAPERCLIP_WAKE_PAYLOAD_REMOTE_ENV] === "1") return;
   throw new Error(
     `Wake payload file is missing (${pointer.bytes} bytes). Refusing to start without the full context.`,
   );
