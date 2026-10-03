@@ -1713,6 +1713,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
   });
 
+  it("does not escalate or broadcast a settled conversation on 40 scheduler sweeps", async () => {
+    const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress", runStatus: "failed", resultJson: {},
+    });
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+    }).where(eq(heartbeatRuns.id, runId));
+    const { settleUnrecoverableExecutions } = await import("../services/execution-recovery-resolution.js");
+    const { deliverExecutionStatuses } = await import("../services/execution-status-delivery.js");
+    const { subscribeCompanyLiveEvents } = await import("../services/live-events.js");
+    const statusEvents: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, event => {
+      if (event.type === "heartbeat.run.status") statusEvents.push(event);
+    });
+    const heartbeat = heartbeatService(db);
+    try {
+      const first = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(first.escalated).toBe(1);
+      await settleUnrecoverableExecutions(db);
+      await deliverExecutionStatuses(db);
+      expect(statusEvents).toHaveLength(1);
+      const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(settled.executionStatusDeliveryId).toBeNull();
+      for (let tick = 0; tick < 40; tick++) {
+        const result = await heartbeat.reconcileStrandedAssignedIssues();
+        expect(result.escalated).toBe(0);
+        expect(result.issueIds).not.toContain(issueId);
+        await settleUnrecoverableExecutions(db);
+        await deliverExecutionStatuses(db);
+      }
+      expect(statusEvents).toHaveLength(1);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(settled);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("in_progress");
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(1);
+    } finally {
+      unsubscribe();
+    }
+  }, 30_000);
+
   it("leaves hidden issues out of stranded-issue reconciliation", async () => {
     const { issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

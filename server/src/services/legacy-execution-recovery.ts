@@ -1,7 +1,7 @@
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
-import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
+import { conversationRecoveryActionPredicate, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -75,6 +75,33 @@ export async function terminalizeLegacyExecution(input: {
           )
           .for("update")
       : [];
+    // Check the durable settlement under the issue lock before changing the
+    // delivery marker. A repeated sweep must not enqueue another status event.
+    const [reconciled] = task ? await tx.select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId),
+        eq(issueRecoveryActions.sourceIssueId, task.id),
+        eq(issueRecoveryActions.status, "resolved"),
+        or(
+          sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+          and(
+            eq(issueRecoveryActions.outcome, "cancelled"),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+            conversationRecoveryActionPredicate(),
+          ),
+        ),
+      )).limit(1) : [];
+    if (reconciled && (!patch || Object.keys(patch).length === 0)
+      && task?.executionRunId !== run.id && task?.checkoutRunId !== run.id) {
+      const [current] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      )).for("update");
+      // Read persisted status: callers can carry a stale pre-terminal snapshot.
+      // Never suppress the first transition, a new patch, or a different outcome.
+      if (current?.status === status && ["failed", "timed_out", "interrupted", "cancelled"].includes(status)) {
+        return null;
+      }
+    }
     const [updated] = await tx
       .update(heartbeatRuns)
       .set({
@@ -115,15 +142,6 @@ export async function terminalizeLegacyExecution(input: {
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       !["done", "cancelled"].includes(task.status)
     ) {
-      // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Preserve the recorded decision.
-      const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
-        .from(issueRecoveryActions).where(and(
-          eq(issueRecoveryActions.companyId, run.companyId),
-          eq(issueRecoveryActions.sourceIssueId, task.id),
-          eq(issueRecoveryActions.status, "resolved"),
-          sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
-        )).limit(1);
       if (reconciled) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
