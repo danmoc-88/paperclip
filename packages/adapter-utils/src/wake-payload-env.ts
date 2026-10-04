@@ -129,9 +129,12 @@ export async function retargetPaperclipWakePayloadEnv(input: {
 }): Promise<boolean> {
   const localPath = input.env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
   if (!localPath) return false;
-  const body = await fs.readFile(localPath, "utf8");
+  const pointer = readPaperclipWakePayloadPointer(input.env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]);
+  if (!pointer) throw new Error("Wake payload pointer is missing.");
+  const body = await fs.readFile(localPath);
+  assertFileMatchesPointer(body, pointer);
   const remotePath = paperclipWakePayloadRemotePath(input.runId);
-  await input.publish(remotePath, body);
+  await input.publish(remotePath, body.toString("utf8"));
   rewritePaperclipWakePayloadPointerPath(input.env, remotePath);
   delete input.env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
   return true;

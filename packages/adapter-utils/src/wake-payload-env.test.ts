@@ -15,6 +15,7 @@ import {
   paperclipWakePayloadFileNote,
   paperclipWakePayloadRemoteInstallCommand,
   paperclipWakePayloadSandboxMounts,
+  retargetPaperclipWakePayloadEnv,
 } from "./wake-payload-env.js";
 
 const MARKER = "Zażółć gęślą jaźń";
@@ -351,5 +352,51 @@ describe("direct SSH wake retries", () => {
       vi.restoreAllMocks();
       await fs.rm(scratch, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe("wake payload retarget validation", () => {
+  it.each(["missing pointer", "changed bytes", "changed hash"])(
+    "refuses publication with %s and preserves the source env",
+    async (failure) => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-retarget-"));
+      try {
+        const env: Record<string, string> = { PAPERCLIP_WAKE_PAYLOAD_JSON: oversizedWakeJson() };
+        await materializePaperclipWakePayloadEnv(env, { runId: "retarget", scratchDir: dir });
+        if (failure === "missing pointer") delete env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+        else {
+          const body = await fs.readFile(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH!);
+          if (failure === "changed hash") body[body.length - 2] = 32;
+          await fs.writeFile(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH!,
+            failure === "changed bytes" ? Buffer.concat([body, Buffer.from(" ")]) : body);
+        }
+        const before = { ...env };
+        const publish = vi.fn(async () => {});
+        await expect(retargetPaperclipWakePayloadEnv({ env, runId: "retarget", publish }))
+          .rejects.toThrow(failure === "missing pointer" ? "pointer is missing" : "different document");
+        expect(publish).not.toHaveBeenCalled();
+        expect(env).toEqual(before);
+      } finally { await fs.rm(dir, { recursive: true, force: true }); }
+    },
+  );
+
+  it("publishes the exact verified UTF-8 document and changes only the destination", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-retarget-"));
+    try {
+      const payload = oversizedWakeJson();
+      const env: Record<string, string> = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload };
+      await materializePaperclipWakePayloadEnv(env, { runId: "retarget", scratchDir: dir });
+      const pointer = JSON.parse(env.PAPERCLIP_WAKE_PAYLOAD_JSON);
+      const publish = vi.fn(async () => {});
+      await expect(retargetPaperclipWakePayloadEnv({ env, runId: "retarget", publish })).resolves.toBe(true);
+      expect(publish).toHaveBeenCalledExactlyOnceWith("/tmp/paperclip-wake-retarget.json", payload);
+      expect(JSON.parse(env.PAPERCLIP_WAKE_PAYLOAD_JSON)).toEqual({
+        ...pointer, path: "/tmp/paperclip-wake-retarget.json",
+      });
+      expect(env.PAPERCLIP_WAKE_PAYLOAD_PATH).toBe("/tmp/paperclip-wake-retarget.json");
+      expect(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH).toBeUndefined();
+      expect(await fs.readFile(pointer.path, "utf8")).toBe(payload);
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });
 });
