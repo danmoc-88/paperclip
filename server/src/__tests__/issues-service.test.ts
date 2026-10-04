@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
@@ -7363,8 +7363,14 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
       originKind: "routine_execution", originId, originFingerprint: "same-dispatch",
     });
 
-    await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
-      .rejects.toMatchObject({ status: 409, details: { code: "routine_execution_conflict", issueId: seeded.issueId } });
+    const transactions = vi.spyOn(db, "transaction");
+    try {
+      await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+        .rejects.toMatchObject({ status: 409, details: { code: "routine_execution_conflict", issueId: seeded.issueId } });
+      expect(transactions).toHaveBeenCalledTimes(3);
+    } finally {
+      transactions.mockRestore();
+    }
     const [after] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
     expect(after).toMatchObject({ status: "in_progress", assigneeAgentId: seeded.actorAgentId,
       checkoutRunId: null, executionRunId: null });
@@ -7376,6 +7382,99 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
     expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
     expect(ownership.executionRunId).toBe(seeded.actorRunId);
+  });
+
+  // Run completion is deliberately placed between the cleanup transactions and
+  // adoption. All queries and rollbacks still execute on real PostgreSQL.
+  function finishRunAfterCheckoutCleanup(runId: string) {
+    const transaction = db.transaction.bind(db);
+    let calls = 0;
+    return vi.spyOn(db, "transaction").mockImplementation(async (...args) => {
+      const result = await transaction(...args);
+      if (++calls === 2) {
+        await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, runId));
+      }
+      return result;
+    });
+  }
+
+  it("rolls back a routine conflict in stale adoption after the previous run finishes", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running" });
+    const originId = randomUUID();
+    await db.update(issues).set({
+      originKind: "routine_execution", originId, originFingerprint: "same-dispatch",
+      executionRunId: null,
+    }).where(eq(issues.id, seeded.issueId));
+    const [target] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    await db.insert(issues).values({
+      id: randomUUID(), companyId: target.companyId, title: "Competing dispatch",
+      status: "in_progress", assigneeAgentId: seeded.actorAgentId,
+      checkoutRunId: seeded.actorRunId, executionRunId: seeded.actorRunId,
+      executionLockedAt: new Date(), executionAgentNameKey: "assignee",
+      originKind: "routine_execution", originId, originFingerprint: "same-dispatch",
+    });
+    const before = await db.select().from(issues).orderBy(issues.id);
+    const transactions = finishRunAfterCheckoutCleanup(seeded.staleRunId);
+    try {
+      await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+        .rejects.toMatchObject({ status: 409, details: { code: "routine_execution_conflict" } });
+      // Two cleanup transactions and exactly one failed adoption; no retry.
+      expect(transactions).toHaveBeenCalledTimes(3);
+      expect(await db.select().from(issues).orderBy(issues.id)).toEqual(before);
+    } finally {
+      transactions.mockRestore();
+    }
+  });
+
+  it.each(["unowned", "stale"])("propagates an unrelated database error and rolls back %s adoption", async (path) => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running" });
+    await db.update(issues).set({
+      executionRunId: null,
+      ...(path === "unowned" ? { checkoutRunId: null } : {}),
+    }).where(eq(issues.id, seeded.issueId));
+    const before = await db.select().from(issues).orderBy(issues.id);
+    // Inject a distinct database error at the actual adoption UPDATE, rather
+    // than mocking transaction rejection outside its rollback boundary.
+    await db.execute(sql`create function test_adoption_error() returns trigger language plpgsql as $$
+      begin
+        if NEW.execution_run_id is not null then
+          raise exception 'unrelated unique violation' using errcode = '23505', constraint = 'unrelated_unique_index';
+        end if;
+        return NEW;
+      end $$`);
+    await db.execute(sql`create trigger test_adoption_error before update on issues
+      for each row execute function test_adoption_error()`);
+    const transactions = path === "stale" ? finishRunAfterCheckoutCleanup(seeded.staleRunId) : null;
+    try {
+      await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+        .rejects.toMatchObject({ cause: { code: "23505", constraint_name: "unrelated_unique_index" } });
+      expect(await db.select().from(issues).orderBy(issues.id)).toEqual(before);
+      if (transactions) expect(transactions).toHaveBeenCalledTimes(3);
+    } finally {
+      transactions?.mockRestore();
+      await db.execute(sql`drop trigger test_adoption_error on issues`);
+      await db.execute(sql`drop function test_adoption_error()`);
+    }
+  });
+
+  it("allows the same routine fingerprint in two companies without sharing ownership", async () => {
+    const first = await seedOwnershipIssue({ checkoutStatus: "running" });
+    const second = await seedOwnershipIssue({ checkoutStatus: "running" });
+    const originId = randomUUID();
+    for (const seeded of [first, second]) {
+      await db.update(issues).set({
+        originKind: "routine_execution", originId, originFingerprint: "same-dispatch",
+        checkoutRunId: null, executionRunId: null,
+      }).where(eq(issues.id, seeded.issueId));
+    }
+    for (const seeded of [first, second]) {
+      await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+        .resolves.toMatchObject({
+          assigneeAgentId: seeded.actorAgentId,
+          checkoutRunId: seeded.actorRunId, executionRunId: seeded.actorRunId,
+        });
+    }
   });
 
   it("treats timed_out checkout owners as stale and recoverable", async () => {
