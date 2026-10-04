@@ -91,7 +91,7 @@ export function paperclipWakePayloadRemoteInstallCommand(remotePath: string): st
     throw new Error("Wake payload remote path must be an absolute path inside the target.");
   }
   const quoted = `'${remotePath.replace(/'/g, `'"'"'`)}'`;
-  return `cat > ${quoted} && chmod 600 ${quoted}`;
+  return `(umask 077 && tmp=$(mktemp ${quoted}.XXXXXX) && trap 'rm -f -- "$tmp"' EXIT && cat > "$tmp" && chmod 600 "$tmp" && mv -f -- "$tmp" ${quoted})`;
 }
 
 export function rewritePaperclipWakePayloadPointerPath(
@@ -256,8 +256,12 @@ async function assertExistingPointer(
       );
     }
     assertFileMatchesPointer(local, pointer);
+    env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV] = pointer.path;
     return;
   }
+  throw new Error(
+    `Wake payload file is missing (${pointer.bytes} bytes). Refusing to start without the full context.`,
+  );
 }
 
 function assertFileMatchesPointer(file: Buffer, pointer: PaperclipWakePayloadPointer): void {

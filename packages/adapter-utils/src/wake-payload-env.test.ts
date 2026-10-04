@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildLocalProcessSandboxSpawnTarget } from "./local-process-sandbox.js";
 import { buildInvocationEnvForLogs, runChildProcess } from "./server-utils.js";
 import {
@@ -264,4 +264,49 @@ process.stdout.write("full-context-ok");
       await fs.rm(root, { recursive: true, force: true });
     },
   );
+});
+
+
+describe("wake file review regressions", () => {
+  it("rejects a missing pointer file without LOCAL_PATH", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-missing-"));
+    try {
+      const env = { PAPERCLIP_WAKE_PAYLOAD_JSON: JSON.stringify({
+        schema: PAPERCLIP_WAKE_PAYLOAD_FILE_SCHEMA,
+        path: path.join(dir, "missing.json"), bytes: 0,
+        sha256: createHash("sha256").update("").digest("hex"),
+      }) };
+      await expect(materializePaperclipWakePayloadEnv(env, { runId: "missing" }))
+        .rejects.toThrow("Refusing to start without the full context");
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("keeps transfer bytes private before EOF and atomically replaces an existing file", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-transfer-"));
+    const target = path.join(dir, "wake 'quoted'.json");
+    await fs.writeFile(target, "old", { mode: 0o644 });
+    const child = spawn("sh", ["-c", `umask 022; ${paperclipWakePayloadRemoteInstallCommand(target)}`]);
+    const completion = new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject); child.on("close", resolve);
+    });
+    try {
+      child.stdin.write("private-partial");
+      await vi.waitFor(async () => {
+        const names = (await fs.readdir(dir)).filter((name) => name !== path.basename(target));
+        expect(names).toHaveLength(1);
+        const staging = path.join(dir, names[0]!);
+        expect(await fs.readFile(staging, "utf8")).toBe("private-partial");
+        expect((await fs.stat(staging)).mode & 0o777).toBe(0o600);
+      });
+      expect(await fs.readFile(target, "utf8")).toBe("old");
+      child.stdin.end("-complete");
+      expect(await completion).toBe(0);
+      expect(await fs.readFile(target, "utf8")).toBe("private-partial-complete");
+      expect((await fs.stat(target)).mode & 0o777).toBe(0o600);
+      expect(await fs.readdir(dir)).toEqual([path.basename(target)]);
+    } finally {
+      child.stdin.end(); child.kill(); await completion;
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });
