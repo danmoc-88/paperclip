@@ -1,3 +1,4 @@
+import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { Settings as ChatSettings } from "lucide-react";
@@ -7659,8 +7660,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   : undefined
               }
             >
-              {issue.executionBlocker && (
-                <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
+              {(issue.executionBlocker || (issue.activeRecoveryAction && requiresExecutionReconciliation(issue.activeRecoveryAction.cause))) && (
+                <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} recoveryAction={issue.activeRecoveryAction} onRetried={invalidateIssueDetail} />
               )}
               {resolvedDetailTab === "chat" ? (
                 <IssueDetailChatTab

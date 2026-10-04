@@ -1008,6 +1008,19 @@ recovers. The failed cleanup keeps the execution hold in place. Retry does not r
 the automatic limit or clean up another task's leases. Provider shutdown must
 still be confirmed before a new conversation is admitted.
 
+The stale-lock sweep also releases stranded local ephemeral leases for legacy
+`interrupted` / `orphaned_running_run` executions, including historical runs whose
+issue locks are already clear. It requires recorded process identities that are
+absent, an expired controller lease, no tracked execution or native coordinator,
+and exclusively local active leases with a matching local driver. It locks and
+rechecks the run and lease evidence, then uses the existing release orchestrator.
+Candidates are paged by immutable run ID within each sweep, advancing past skipped
+rows; a full page of unsafe leases cannot starve later eligible leases.
+Remote, retained, mixed, and uncertain resources remain blocked. Cleanup preserves
+the recorded operation outcome and task state; it neither records `not_performed`
+nor retries work. Reconciliation of installed or other external effects remains
+an explicit board action.
+
 ### Explicit Recovery Action
 
 Paperclip opens an explicit recovery action when the system can identify a problem but cannot safely complete the work itself.

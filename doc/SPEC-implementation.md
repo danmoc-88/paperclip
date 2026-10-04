@@ -1244,6 +1244,23 @@ Behavior:
 - `thin`: send IDs and pointers only; agent fetches context via API
 - `fat`: include current assignments, goal summary, budget snapshot, and recent comments
 
+### Orphaned legacy execution reconciliation
+
+An interrupted legacy run with `orphaned_running_run` remains held until its
+outcomes are reconciled. The task recovery notice exposes evidence entry and an
+explicit stopped-provider / no-actions confirmation, including while an environment
+cleanup hold takes precedence. The continuation control stays disabled during that
+hold. Pending or failed environment cleanup also blocks reconciliation in the API.
+A missing commit alone is
+not evidence that external actions did not occur.
+
+The assigned agent may resolve `legacy_execution_requires_reconciliation` to
+`todo` only with `not_performed` evidence for the exact source run. The server
+requires recorded process metadata, an expired controller lease, no live process,
+and released environment authority. Other execution outcomes retain board-only
+reconciliation. Resolution uses the existing audited, durable continuation marker;
+repeated requests do not queue another continuation.
+
 ## 11.5 Recovery Work Classes
 
 Status-only recovery coordination must include guard context that prevents deliverable work and document or plan updates (`allowDeliverableWork: false`, `allowDocumentUpdates: false`, `resumeRequiresNormalModel: true`). Recovery work classes do not select or change the agent model.
