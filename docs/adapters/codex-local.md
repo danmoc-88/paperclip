@@ -160,3 +160,48 @@ The environment test checks:
 - Working directory is absolute and available (auto-created if missing and permitted)
 - Authentication signal (`OPENAI_API_KEY` presence)
 - A live hello probe (`codex exec --json -` with prompt `Respond with hello.`) to verify the CLI can actually run
+
+
+## Subscription quota collection
+
+The host quota collector uses the documented
+[app-server rate-limit RPC](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt).
+It starts `codex -s read-only app-server`, inherits the configured approval
+policy, initializes the protocol, and sends only `account/rateLimits/read`.
+It does not start a thread or turn, run commands, approve requests, or refresh
+tokens itself. Codex owns its normal authentication behavior.
+
+Codex CLI 0.155.1 no longer accepts `-a untrusted`. Do not replace it with
+`-a never`. The collector does not override approval policy at all. An
+unsupported CLI option or RPC method returns `quotaStatus: version_error`.
+Auth refusal (including HTTP 401/403 carried by RPC) returns `auth_error`.
+An empty or unusable response returns `unavailable`. Each failure returns
+`ok: false`, empty current `windows`, and an explicit unknown reason.
+Monetary spend of zero does not indicate unused subscription quota.
+
+Concurrent polls share one attempt. Auth failures remain latched in memory
+until local auth/config file metadata changes. No credentials are read to
+check that metadata. The latch uses the metadata after a failed SDK refresh
+to prevent a refresh write from creating a retry loop. Keychain-only recovery
+requires restarting the collector process through the normal deployment gate.
+A process restart clears the latch and permits a new bounded attempt.
+
+`lastSuccessful` contains a timestamped historical observation for the same
+local auth context, or null. It is memory-only and resets after process or auth
+context changes. The error text also labels that observation as historical for
+existing UI consumers. Historical values never populate current `windows`.
+There is no automatic fallback to the undocumented ChatGPT WHAM endpoint.
+The legacy WHAM helper remains exported for compatibility, but polling and
+the diagnostic command do not call it.
+
+### Verification after deployment
+
+After the normal installation/restart approval, run
+`pnpm --filter @paperclipai/adapter-codex-local probe:quota` once on the host.
+The diagnostic prints only the quota result and timestamp, never local auth.
+Compare its windows with the host Costs quota endpoint and the provider's usage
+page. Confirm that a failed read displays unknown and no current percentage.
+Test auth/version/empty-response failures with the synthetic regression suite;
+do not damage or copy host credentials to simulate them. Do not run model
+inference to verify quota. Keep prepared, merged, deployed, and accepted states
+separate; local tests do not establish that the host has deployed this change.

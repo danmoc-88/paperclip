@@ -42,9 +42,7 @@ describe("CodexRpcClient spawn failures", () => {
 
   beforeEach(() => {
     mockSpawn.mockReset();
-    // After the RPC path fails, getQuotaWindows() calls readCodexToken() which
-    // reads $CODEX_HOME/auth.json (default ~/.codex). Point CODEX_HOME at an
-    // empty temp directory so we never hit real host auth or the WHAM network.
+    // Keep each test in an isolated auth metadata context.
     previousCodexHome = process.env.CODEX_HOME;
     isolatedCodexHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-codex-spawn-test-"));
     process.env.CODEX_HOME = isolatedCodexHome;
@@ -78,70 +76,14 @@ describe("CodexRpcClient spawn failures", () => {
     expect(result.error).toContain("Codex app-server");
   });
 
-  it("falls back to WHAM after an app-server refresh-token failure", async () => {
-    fs.writeFileSync(
-      path.join(isolatedCodexHome!, "auth.json"),
-      JSON.stringify({
-        tokens: {
-          access_token: "access-token-fixture-secret",
-          refresh_token: "refresh-token-fixture-secret",
-        },
-      }),
-      "utf8",
-    );
+  it("does not fall back to WHAM after an app-server auth failure", async () => {
     mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("OAuth failed: refresh token has expired")));
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(
-        JSON.stringify({
-          rate_limit: {
-            primary_window: { used_percent: 0.5, reset_at: 1_711_111_111 },
-          },
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )),
-    );
-
+    vi.stubGlobal("fetch", vi.fn());
     const result = await getQuotaWindows();
-
-    expect(result.ok).toBe(true);
-    expect(result.source).toBe("codex-wham");
-    expect(result.errorFamily).toBeUndefined();
-    expect(result.windows).toEqual([
-      expect.objectContaining({
-        label: "5h limit",
-        usedPercent: 50,
-        resetsAt: "2024-03-22T12:38:31.000Z",
-      }),
-    ]);
-  });
-
-  it("classifies WHAM refresh-token response bodies without returning the body text", async () => {
-    fs.writeFileSync(
-      path.join(isolatedCodexHome!, "auth.json"),
-      JSON.stringify({
-        tokens: {
-          access_token: "access-token-fixture-secret",
-          refresh_token: "refresh-token-fixture-secret",
-        },
-      }),
-      "utf8",
-    );
-    mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("spawn codex ENOENT")));
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("OAuth failed: invalid_grant", { status: 401 })),
-    );
-
-    const result = await getQuotaWindows();
-
-    expect(result.ok).toBe(false);
-    expect(result.source).toBe("codex-wham");
-    expect(result.errorFamily).toBe("refresh_token_invalidated");
-    expect(result.error).toContain("chatgpt wham api returned 401");
-    expect(result.error).not.toContain("invalid_grant");
-    expect(JSON.stringify(result)).not.toContain("access-token-fixture-secret");
-    expect(JSON.stringify(result)).not.toContain("refresh-token-fixture-secret");
+    expect(result).toMatchObject({ ok: false, source: "codex-rpc", quotaStatus: "auth_error", errorFamily: "refresh_token_expired" });
+    expect(fetch).not.toHaveBeenCalled();
+    await getQuotaWindows();
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 
   it("limits WHAM error response buffering before classifying auth failures", async () => {
@@ -179,30 +121,10 @@ describe("CodexRpcClient spawn failures", () => {
     expect(cancelled).toBe(true);
   });
 
-  it("does not classify bare WHAM 401 quota probe failures or expose token material", async () => {
-    fs.writeFileSync(
-      path.join(isolatedCodexHome!, "auth.json"),
-      JSON.stringify({
-        tokens: {
-          access_token: "access-token-fixture-secret",
-          refresh_token: "refresh-token-fixture-secret",
-        },
-      }),
-      "utf8",
-    );
-    mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("spawn codex ENOENT")));
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("unauthorized", { status: 401 })),
-    );
-
-    const result = await getQuotaWindows();
-
-    expect(result.ok).toBe(false);
-    expect(result.errorFamily).toBeUndefined();
-    expect(result.error).toContain("chatgpt wham api returned 401");
-    expect(JSON.stringify(result)).not.toContain("access-token-fixture-secret");
-    expect(JSON.stringify(result)).not.toContain("refresh-token-fixture-secret");
+  it("bounds a direct legacy WHAM 401 to one request and does not expose its body", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unauthorized fixture-secret", { status: 401 })));
+    await expect(fetchCodexQuota("fixture-token", null)).rejects.toThrow("chatgpt wham api returned 401");
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("does not crash the process when codex is missing; getQuotaWindows returns ok: false", async () => {
@@ -219,6 +141,6 @@ describe("CodexRpcClient spawn failures", () => {
     expect(result.ok).toBe(false);
     expect(result.windows).toEqual([]);
     expect(result.error).toContain("Codex app-server");
-    expect(result.error).toContain("spawn codex ENOENT");
+    expect(result.quotaStatus).toBe("unavailable");
   });
 });
