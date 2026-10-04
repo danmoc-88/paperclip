@@ -5,6 +5,8 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
+  issueThreadInteractions,
   agents,
   companies,
   createDb,
@@ -540,5 +542,104 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       checkoutRunId: currentRunId,
       executionRunId: currentRunId,
     });
+  });
+
+  async function seedRoutineConflict() {
+    const seeded = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const siblingId = randomUUID();
+    const originId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: issueId, companyId: seeded.companyId, title: "Idle routine execution",
+        status: "in_progress", assigneeAgentId: seeded.agentId,
+        originKind: "routine_execution", originId, originFingerprint: "dispatch",
+      },
+      {
+        id: siblingId, companyId: seeded.companyId, title: "Active routine execution",
+        status: "in_progress", assigneeAgentId: seeded.agentId,
+        checkoutRunId: seeded.currentRunId, executionRunId: seeded.currentRunId,
+        executionLockedAt: new Date(), executionAgentNameKey: "codexcoder",
+        originKind: "routine_execution", originId, originFingerprint: "dispatch",
+      },
+    ]);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, seeded.currentRunId));
+    return { ...seeded, issueId, siblingId };
+  }
+
+  async function routineSnapshot() {
+    return {
+      issues: await db.select().from(issues).orderBy(issues.id),
+      comments: await db.select().from(issueComments).orderBy(issueComments.id),
+      interactions: await db.select().from(issueThreadInteractions).orderBy(issueThreadInteractions.id),
+      wakes: await db.select().from(agentWakeupRequests).orderBy(agentWakeupRequests.id),
+      runs: await db.select().from(heartbeatRuns).orderBy(heartbeatRuns.id),
+    };
+  }
+
+  function writeRoutine(app: ReturnType<typeof createApp>, issueId: string, endpoint: string) {
+    return endpoint === "PATCH"
+      ? request(app).patch(`/api/issues/${issueId}`).send({ status: "todo", comment: "Must not persist" })
+      : request(app).post(`/api/issues/${issueId}/interactions`).send({
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Continue this routine execution?" },
+      });
+  }
+
+  it.each(["PATCH", "POST interactions"])("returns a routine 409 for %s without mutation or wake", async (endpoint) => {
+    const seeded = await seedRoutineConflict();
+    const before = await routineSnapshot();
+    const res = await writeRoutine(
+      createApp(agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId)),
+      seeded.issueId, endpoint,
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({
+      error: "Another routine execution already owns this dispatch",
+      code: "routine_execution_conflict",
+      details: { code: "routine_execution_conflict", issueId: seeded.issueId },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(seeded.siblingId);
+    expect(await routineSnapshot()).toEqual(before);
+    const activity = await db.select().from(activityLog);
+    expect(activity.filter((row) => [
+      "issue.updated", "issue.comment_added", "issue.checkout_lock_adopted",
+      "issue.thread_interaction_created",
+    ].includes(row.action))).toEqual([]);
+  });
+
+  it.each(["PATCH", "POST interactions"])("conceals another company's routine from %s", async (endpoint) => {
+    const seeded = await seedRoutineConflict();
+    const outsider = await seedCompanyAgentAndRuns();
+    const before = await routineSnapshot();
+    const res = await writeRoutine(
+      createApp(agentActor(outsider.companyId, outsider.agentId, outsider.currentRunId)),
+      seeded.issueId, endpoint,
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(JSON.stringify(res.body)).not.toContain(seeded.siblingId);
+    expect(await routineSnapshot()).toEqual(before);
+  });
+
+  it.each(["PATCH", "POST interactions"])("rejects a peer's %s while the routine has a live owner", async (endpoint) => {
+    const seeded = await seedRoutineConflict();
+    const peerId = randomUUID();
+    const peerRunId = randomUUID();
+    await db.insert(agents).values({
+      id: peerId, companyId: seeded.companyId, name: "Peer", role: "engineer",
+      status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: peerRunId, companyId: seeded.companyId, agentId: peerId, status: "running",
+      contextSnapshot: { issueId: seeded.issueId },
+    });
+    const before = await routineSnapshot();
+    const res = await writeRoutine(
+      createApp(agentActor(seeded.companyId, peerId, peerRunId)), seeded.siblingId, endpoint,
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(await routineSnapshot()).toEqual(before);
   });
 });

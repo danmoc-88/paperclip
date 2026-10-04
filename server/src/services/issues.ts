@@ -1,3 +1,4 @@
+import { isUniqueViolation } from "../db-errors.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
@@ -7525,6 +7526,17 @@ export function issueService(db: Db) {
         .where(eq(issues.id, input.issueId))
         .then((rows) => rows[0] ?? null);
       return { adopted: null, latest };
+    }).catch((error: unknown) => {
+      // A routine sibling can own this dispatch while an old execution has no
+      // run. Adoption must not turn that expected contention into HTTP 500.
+      // Catch after rollback: no locks or partial adoption escape the failure.
+      if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+        throw conflict("Another routine execution already owns this dispatch", {
+          code: "routine_execution_conflict",
+          issueId: input.issueId,
+        });
+      }
+      throw error;
     });
   }
 
@@ -7576,6 +7588,17 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       return adopted;
+    }).catch((error: unknown) => {
+      // A routine sibling can own this dispatch while an old execution has no
+      // run. Adoption must not turn that expected contention into HTTP 500.
+      // Catch after rollback: no locks or partial adoption escape the failure.
+      if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+        throw conflict("Another routine execution already owns this dispatch", {
+          code: "routine_execution_conflict",
+          issueId: input.issueId,
+        });
+      }
+      throw error;
     });
   }
 

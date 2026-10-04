@@ -1584,3 +1584,16 @@ disconnected, visible active queries refresh every 15 seconds. This fallback
 stops when the socket opens, the tab is hidden, or the provider unmounts. A
 reconnected socket also refreshes visible queries to recover missed events.
 Run log views retain their existing HTTP polling fallback.
+
+### Routine dispatch conflicts during checkout recovery
+
+An idle routine execution can share a dispatch fingerprint with a newer execution.
+Adopting its checkout must still respect `issues_open_routine_execution_uq`.
+If another execution holds that dispatch, checkout adoption returns HTTP 409 with
+`details.code: routine_execution_conflict`, rather than an internal server error.
+The failed adoption rolls back. It does not transfer either issue's run or change
+its assignee. Do not retry the same recovery while the conflict remains; inspect
+the routine's existing execution and route the outstanding work through its owner.
+The same guard applies when status writes or interaction creation first assert
+checkout ownership. Self-authored comments do not implicitly wake the assignee;
+use the documented explicit continuation path when authorized.
