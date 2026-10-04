@@ -874,9 +874,11 @@ export async function runAdapterExecutionTargetProcess(
   }
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
-    if (options.env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH) {
+    // Retarget only this attempt: retries still need the host pointer and source.
+    const targetEnv = { ...options.env };
+    if (targetEnv.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH) {
       await retargetPaperclipWakePayloadEnv({
-        env: options.env,
+        env: targetEnv,
         runId,
         publish: async (remotePath, body) => {
           const published = await runner.execute({
@@ -894,7 +896,7 @@ export async function runAdapterExecutionTargetProcess(
         },
       });
     }
-    const env = sanitizeRemoteExecutionEnv(options.env);
+    const env = sanitizeRemoteExecutionEnv(targetEnv);
     await options.onRuntimeProgress?.({
       phase: "adapter_startup",
       message: "Starting adapter in environment",

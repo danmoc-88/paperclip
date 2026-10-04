@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ssh from "./ssh.js";
 import * as serverUtils from "./server-utils.js";
@@ -436,4 +438,55 @@ describe("GitHub launcher lifecycle", () => {
     await expect(cleanupGitHubOperationLaunchers({ runId: "../other", target })).rejects.toThrow("Invalid GitHub launcher run ID");
     expect(runner.execute).toHaveBeenCalledTimes(1);
   });
+});
+
+
+describe("sandbox wake payload retries", () => {
+  it.each(["none", "transfer", "adapter"])(
+    "preserves the host source across two attempts after %s failure",
+    async (failure) => {
+      const scratch = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-sandbox-retry-"));
+      const payload = JSON.stringify({ marker: "pełny kontekst", history: "x".repeat(600 * 1024) });
+      const env: Record<string, string> = {
+        PAPERCLIP_WAKE_PAYLOAD_JSON: payload,
+        PAPERCLIP_RUN_SCRATCH_DIR: scratch,
+      };
+      const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+      const execute = vi.fn().mockResolvedValue(ok);
+      if (failure === "transfer") execute.mockResolvedValueOnce({ ...ok, exitCode: 1 });
+      if (failure === "adapter") {
+        execute.mockResolvedValueOnce(ok).mockResolvedValueOnce({ ...ok, exitCode: 1 });
+      }
+      const target = { kind: "remote" as const, transport: "sandbox" as const,
+        providerKey: "test", remoteCwd: "/remote/workspace", runner: { execute } };
+      const options = { cwd: scratch, env, timeoutSec: 30, graceSec: 1, onLog: vi.fn() };
+      const runId = randomUUID();
+      try {
+        const first = runAdapterExecutionTargetProcess(runId, target, "claude", ["--resume", "session"], options);
+        if (failure === "transfer") await expect(first).rejects.toThrow("Failed to publish");
+        else expect((await first).exitCode).toBe(failure === "adapter" ? 1 : 0);
+
+        const second = await runAdapterExecutionTargetProcess(runId, target, "claude", [], options);
+        expect(second.exitCode).toBe(0);
+        const transfers = execute.mock.calls.map(([input]) => input).filter((input) => input.command === "sh");
+        const adapters = execute.mock.calls.map(([input]) => input).filter((input) => input.command === "claude");
+        expect(transfers).toHaveLength(2);
+        expect(adapters).toHaveLength(failure === "transfer" ? 1 : 2);
+        for (const transfer of transfers) expect(transfer.stdin).toBe(payload);
+        for (const adapter of adapters) {
+          const pointer = JSON.parse(adapter.env.PAPERCLIP_WAKE_PAYLOAD_JSON);
+          expect(pointer.path).toBe(adapter.env.PAPERCLIP_WAKE_PAYLOAD_PATH);
+          expect(pointer.path).not.toBe(env.PAPERCLIP_WAKE_PAYLOAD_PATH);
+          expect(pointer.bytes).toBe(Buffer.byteLength(payload));
+          expect(adapter.env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH).toBeUndefined();
+          expect(adapter.env.PAPERCLIP_WAKE_PAYLOAD_JSON).not.toContain("pełny kontekst");
+        }
+        expect(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH).toBe(env.PAPERCLIP_WAKE_PAYLOAD_PATH);
+        expect(JSON.parse(env.PAPERCLIP_WAKE_PAYLOAD_JSON).path).toBe(env.PAPERCLIP_WAKE_PAYLOAD_PATH);
+        expect(await readFile(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH!, "utf8")).toBe(payload);
+      } finally {
+        await rm(scratch, { recursive: true, force: true });
+      }
+    },
+  );
 });
