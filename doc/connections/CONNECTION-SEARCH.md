@@ -28,6 +28,22 @@ It should clarify only when the task remains ambiguous. A search match does not
 prove that an account is authorized, that a tool is installed, or that a provider
 can perform every requested action.
 
+## Managed GitHub shell identity
+
+The catalog reports GitHub MCP tool readiness per agent: installed, permitted
+tools, health, and identity. Shell `git` and `gh` receive the run's managed
+GitHub identity from the same grant without per-tool permissions
+(`doc/execution-github-identity.md`). When the identity selection resolves a
+grant for the requesting run, a `needs_user_action` GitHub result discloses the
+connected shell channel in its `reason`, and the single-result instruction
+points shell-only work at `git`/`gh` directly instead of
+`connection_request`. Only a resolved grant discloses it: without an install
+for the agent the credential path has no identity, and the host fallback is a
+separate compatibility mode that discovery does not describe. A
+health-attention result keeps its attention reason, because a card can still
+repair the connection. `connection_request` remains the path to the GitHub MCP
+tools.
+
 ## Aggregator discovery
 
 The local support index combines reviewed Arcade/Zapier claims with the public
@@ -60,12 +76,16 @@ agent searches the selected `aggregator.targetService` to get its provider quest
 ## Regression coverage
 
 ```sh
-pnpm exec vitest run packages/shared/src/connection-search.test.ts packages/shared/src/connection-routing.test.ts packages/shared/src/validators/connection-intent.test.ts server/src/__tests__/connection-aggregator-fallback.test.ts server/src/__tests__/connection-intents-service.test.ts
+pnpm exec vitest run packages/shared/src/connection-search.test.ts packages/shared/src/connection-routing.test.ts packages/shared/src/validators/connection-intent.test.ts server/src/__tests__/connection-aggregator-fallback.test.ts server/src/__tests__/connection-intents-service.test.ts server/src/__tests__/github-operation-credentials.test.ts
 ```
 
 The database suite covers the original AgentMail sentence, split names, typos,
 capability overlap, multiple services, AI discovery, experimental gating,
-Circleback/Attio/ClickUp, indexed Executor tools, and provider consent. The native
+Circleback/Attio/ClickUp, indexed Executor tools, and provider consent. The
+GitHub credential suite covers the managed shell disclosure: a resolved grant
+reports the connected shell channel while tool access stays `needs_user_action`,
+and without an install for the agent the result keeps the generic request
+instruction. The native
 tool authority test searches a paragraph longer than the old 200-character limit
 and then creates a real connection interaction. Existing tests retain checks for
 private metadata, administrative denials, stale identities, and saved declines.
