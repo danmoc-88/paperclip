@@ -451,7 +451,7 @@ describe("sandbox wake payload retries", () => {
         PAPERCLIP_WAKE_PAYLOAD_JSON: payload,
         PAPERCLIP_RUN_SCRATCH_DIR: scratch,
       };
-      const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+      const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() };
       const execute = vi.fn().mockResolvedValue(ok);
       if (failure === "transfer") execute.mockResolvedValueOnce({ ...ok, exitCode: 1 });
       if (failure === "adapter") {
@@ -485,6 +485,58 @@ describe("sandbox wake payload retries", () => {
         expect(JSON.parse(env.PAPERCLIP_WAKE_PAYLOAD_JSON).path).toBe(env.PAPERCLIP_WAKE_PAYLOAD_PATH);
         expect(await readFile(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH!, "utf8")).toBe(payload);
       } finally {
+        await rm(scratch, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("wake pointer transport boundary", () => {
+  it.each(["local", "sandbox", "ssh"])(
+    "%s start validates the agent path or publishes the retained host source",
+    async (transport) => {
+      const { materializePaperclipWakePayloadEnv, rewritePaperclipWakePayloadPointerPath } =
+        await import("./wake-payload-env.js");
+      const scratch = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-transport-"));
+      const payload = JSON.stringify({ history: "context".repeat(100_000) });
+      const env: Record<string, string> = { PAPERCLIP_WAKE_PAYLOAD_JSON: payload };
+      const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() };
+      const execute = vi.fn().mockResolvedValue(ok);
+      const child = vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue(ok);
+      const options = { cwd: scratch, env, timeoutSec: 30, graceSec: 1, onLog: vi.fn() };
+      const target = transport === "local" ? null : transport === "sandbox"
+        ? { kind: "remote" as const, transport: "sandbox" as const,
+            providerKey: "test", remoteCwd: "/remote/workspace", runner: { execute } }
+        : { kind: "remote" as const, transport: "ssh" as const, remoteCwd: "/remote/workspace",
+            spec: { host: "ssh.example.test", port: 22, username: "test", remoteCwd: "/remote/workspace",
+              remoteWorkspacePath: "/remote/workspace", privateKey: null, knownHosts: null, strictHostKeyChecking: true } };
+      try {
+        await materializePaperclipWakePayloadEnv(env, { runId: "transport", scratchDir: scratch });
+        rewritePaperclipWakePayloadPointerPath(env, path.join(scratch, "absent-agent-copy.json"));
+        // A stale marker from an earlier hand-off must never authorize a local start.
+        env.PAPERCLIP_WAKE_PAYLOAD_REMOTE = "1";
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const start = runAdapterExecutionTargetProcess("transport", target, "claude", [], options);
+          if (transport === "local") await expect(start).rejects.toThrow("Refusing to start");
+          else expect((await start).exitCode).toBe(0);
+        }
+        expect(await readFile(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH!, "utf8")).toBe(payload);
+        if (transport === "local") {
+          expect(child).not.toHaveBeenCalled();
+          expect(execute).not.toHaveBeenCalled();
+        } else if (transport === "sandbox") {
+          expect(execute.mock.calls.filter(([input]) => input.command === "sh").map(([input]) => input.stdin))
+            .toEqual([payload, payload]);
+        } else {
+          expect(child).toHaveBeenCalledTimes(2);
+          expect(child.mock.calls[0]?.[3]).toMatchObject({ remoteExecution: expect.objectContaining({ host: "ssh.example.test" }),
+            env: { PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH: env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH } });
+        }
+        delete env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH;
+        await expect(runAdapterExecutionTargetProcess("transport", target, "claude", [], options))
+          .rejects.toThrow("Refusing to start");
+      } finally {
+        vi.restoreAllMocks();
         await rm(scratch, { recursive: true, force: true });
       }
     },

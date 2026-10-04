@@ -19,6 +19,8 @@ export const PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV = "PAPERCLIP_WAKE_PAYLOAD_LOC
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const RUN_DIR_PREFIXES = ["paperclip-run-", "paperclip-wake-"];
 
+export type PaperclipWakePayloadTransport = "local" | "remote";
+
 export interface PaperclipWakePayloadDelivery {
   delivery: "absent" | "inline" | "file";
   /** True when this call replaced an oversized environment value with a file. */
@@ -166,6 +168,7 @@ export async function materializePaperclipWakePayloadEnv(
     runId: string;
     scratchDir?: string | null;
     directory?: string | null;
+    transport?: PaperclipWakePayloadTransport;
   },
 ): Promise<PaperclipWakePayloadDelivery> {
   const json = env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV];
@@ -175,7 +178,7 @@ export async function materializePaperclipWakePayloadEnv(
   const bytes = Buffer.byteLength(json);
   const pointer = readPaperclipWakePayloadPointer(json);
   if (pointer && bytes <= PAPERCLIP_WAKE_PAYLOAD_INLINE_MAX_BYTES) {
-    await assertExistingPointer(env, pointer);
+    await assertExistingPointer(env, pointer, options.transport ?? "local");
     return {
       delivery: "file",
       rewritten: false,
@@ -240,6 +243,7 @@ function emptyDelivery(): PaperclipWakePayloadDelivery {
 async function assertExistingPointer(
   env: Record<string, string>,
   pointer: PaperclipWakePayloadPointer,
+  transport: PaperclipWakePayloadTransport,
 ): Promise<void> {
   const direct = await readFileIfPresent(pointer.path);
   if (direct) {
@@ -248,7 +252,9 @@ async function assertExistingPointer(
     return;
   }
   const localPath = env[PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH_ENV];
-  if (localPath) {
+  // Only a remote start can publish a host source to a different pointer path.
+  // A local start must be able to read the path the agent will receive.
+  if (transport === "remote" && localPath) {
     const local = await readFileIfPresent(localPath);
     if (!local) {
       throw new Error(

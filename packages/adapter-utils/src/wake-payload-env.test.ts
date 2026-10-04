@@ -1,3 +1,4 @@
+import * as ssh from "./ssh.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -307,6 +308,48 @@ describe("wake file review regressions", () => {
     } finally {
       child.stdin.end(); child.kill(); await completion;
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe("direct SSH wake retries", () => {
+  it("publishes each attempt from the retained source and passes only the remote pointer", async () => {
+    const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-ssh-wake-"));
+    const payload = oversizedWakeJson();
+    const env: Record<string, string> = {
+      PATH: `${scratch}:${process.env.PATH ?? ""}`,
+      PAPERCLIP_WAKE_PAYLOAD_JSON: payload,
+      PAPERCLIP_RUN_SCRATCH_DIR: scratch,
+    };
+    const publish = vi.spyOn(ssh, "runSshCommand").mockResolvedValue({ stdout: "", stderr: "" });
+    const build = vi.spyOn(ssh, "buildSshSpawnTarget").mockResolvedValue({
+      command: "ssh", args: [], cleanup: async () => {},
+    });
+    try {
+      // An inert local executable replaces only SSH transport, never the wake pipeline.
+      await fs.writeFile(path.join(scratch, "ssh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect((await runChildProcess("ssh-wake", "claude", [], {
+          cwd: scratch, env, timeoutSec: 30, graceSec: 1, onLog: async () => {},
+          remoteExecution: { host: "unused.example.test", port: 22, username: "test",
+            remoteCwd: "/remote/workspace", remoteWorkspacePath: "/remote/workspace",
+            privateKey: null, knownHosts: null, strictHostKeyChecking: true },
+        })).exitCode).toBe(0);
+        expect(await fs.readFile(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH!, "utf8")).toBe(payload);
+        expect(JSON.parse(env.PAPERCLIP_WAKE_PAYLOAD_JSON).path).toBe(env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH);
+      }
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(build).toHaveBeenCalledTimes(2);
+      for (const call of publish.mock.calls) expect(call[2]?.stdin).toBe(payload);
+      for (const [input] of build.mock.calls) {
+        expect(input.env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH).toBeUndefined();
+        expect(input.env.PAPERCLIP_WAKE_PAYLOAD_PATH).toBe("/tmp/paperclip-wake-ssh-wake.json");
+        expect(JSON.parse(input.env.PAPERCLIP_WAKE_PAYLOAD_JSON).path).toBe(input.env.PAPERCLIP_WAKE_PAYLOAD_PATH);
+      }
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(scratch, { recursive: true, force: true });
     }
   });
 });

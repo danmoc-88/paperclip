@@ -868,6 +868,7 @@ export async function runAdapterExecutionTargetProcess(
   const wakeDelivery = await materializePaperclipWakePayloadEnv(options.env, {
     runId,
     scratchDir: options.env.PAPERCLIP_RUN_SCRATCH_DIR ?? null,
+    transport: target?.kind === "remote" ? "remote" : "local",
   });
   if (wakeDelivery.rewritten) {
     await options.onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));

@@ -4706,14 +4706,17 @@ export async function runChildProcess(
   const wakeDelivery = await materializePaperclipWakePayloadEnv(opts.env, {
     runId,
     scratchDir: opts.env.PAPERCLIP_RUN_SCRATCH_DIR ?? null,
+    transport: opts.remoteExecution ? "remote" : "local",
   });
   if (wakeDelivery.rewritten) {
     await opts.onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));
   }
-  if (opts.remoteExecution && opts.env.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH) {
+  // Keep the host source intact when this direct SSH caller retries.
+  const targetEnv = { ...opts.env };
+  if (opts.remoteExecution && targetEnv.PAPERCLIP_WAKE_PAYLOAD_LOCAL_PATH) {
     const remote = opts.remoteExecution;
     await retargetPaperclipWakePayloadEnv({
-      env: opts.env,
+      env: targetEnv,
       runId,
       publish: async (remotePath, body) => {
         try {
@@ -4733,7 +4736,7 @@ export async function runChildProcess(
   return new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
+      ...targetEnv,
     };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -4757,7 +4760,7 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution ? targetEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
