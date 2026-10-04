@@ -39,11 +39,6 @@ import {
   type SandboxAdditionalSource,
 } from "@paperclipai/adapter-utils/execution-target";
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
-import {
-  formatPaperclipWakePayloadDiagnostic,
-  materializePaperclipWakePayloadEnv,
-  paperclipWakePayloadFileNote,
-} from "../wake-payload-env.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import {
@@ -88,7 +83,6 @@ import {
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -1980,7 +1974,6 @@ async function buildRuntime(input: {
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
   if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
@@ -1988,10 +1981,6 @@ async function buildRuntime(input: {
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  // The wake document goes in whole here. `materializePaperclipWakePayloadEnv`
-  // below spills it to the run file and leaves a pointer when it is too large
-  // for one environment string.
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,
@@ -2040,29 +2029,6 @@ async function buildRuntime(input: {
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
-  // acpx spawns the agent process itself, so this env never passes through
-  // `runChildProcess` / `runAdapterExecutionTargetProcess` — the two seams that
-  // already spill an oversized wake document to a run file. Without the spill
-  // here, Linux rejects a single `PAPERCLIP_WAKE_PAYLOAD_JSON` string above
-  // MAX_ARG_STRLEN (131072 bytes) and `AcpClient.spawnAgentProcess` fails with
-  // `spawn E2BIG` in the `ensure_session` phase, before the agent starts.
-  // Remote lanes keep the inline value: the spilled file lives on the host, and
-  // the agent runs on the far side of the transport, where that path resolves
-  // to nothing. Publishing it there needs the transport's own channel, which
-  // this seam does not own.
-  if (!executionTargetIsRemote) {
-    const wakeScratchDir =
-      env.PAPERCLIP_RUN_SCRATCH_DIR ??
-      (scratch.type === "heartbeat_run" && typeof scratch.dir === "string" ? scratch.dir : null);
-    const wakeDelivery = await materializePaperclipWakePayloadEnv(env, {
-      runId,
-      scratchDir: wakeScratchDir,
-      transport: "local",
-    });
-    if (wakeDelivery.rewritten) {
-      await input.ctx.onLog("stdout", formatPaperclipWakePayloadDiagnostic(wakeDelivery));
-    }
-  }
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
   // validates the value against its internal available-models list and rejects
@@ -3088,9 +3054,6 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const paperclipEnvNote = externalChatTurn ? "" : renderPaperclipEnvNote(env);
   const apiAccessNote = externalChatTurn ? "" : renderApiAccessNote(env);
   const prompt = joinPromptSections([
-    // Empty unless this run's wake document was spilled to a file. The agent
-    // otherwise reads only the small pointer and never sees the task.
-    paperclipWakePayloadFileNote(env),
     promptInstructionsPrefix,
     renderedBootstrapPrompt,
     selectInitialCommunicationGuidance(context, { resumedSession }),
@@ -4160,10 +4123,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let activeTurn: AcpRuntimeTurn | null = null;
       let terminalFailureClassification: AcpxTerminalFailureClassification | null = null;
       let terminalSessionFailure: AcpxTerminalSessionFailureDiagnostic | null = null;
-      // The agent's own closed-vocabulary failure category for this turn
-      // (connection, access, limit, service, request, unknown), recorded for
-      // every adapter whether or not it ships a classifier. Never provider text.
-      let terminalSessionFailureCategory: string | null = null;
       // How the settlement `endSession` step must release the runtime for the path
       // this run took. Each exit path that acquired the runtime records it before it
       // returns; a build or create-runtime failure never registers the runtime, so
@@ -4840,13 +4799,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // Diagnostics are retained even when an adapter has no recovery
           // classifier. Redact before bounding so partial secrets cannot leak.
           onTerminalSessionFailure: (failure: AcpxTerminalSessionFailure) => {
-            // The category is recorded for every adapter. An adapter without a
-            // classifier otherwise leaves a failed turn with no machine-readable
-            // reason in the acpx log at all.
-            terminalSessionFailureCategory =
-              typeof failure.category === "string" && failure.category.trim().length > 0
-                ? failure.category.trim()
-                : "unknown";
             terminalFailureClassification = classifyToolDefinitionFailure(failure)
               ?? deps.classifyTerminalSessionFailure?.(failure, new Date(now())) ?? null;
             terminalSessionFailure = sanitizeTerminalSessionFailure(
@@ -5091,15 +5043,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
           ? terminalFailureClassification
           : null;
-        const failureCategory = !timedOut && !channelLost && terminal.status === "failed"
-          ? terminalSessionFailureCategory
-          : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
-          ...(failureCategory ? { failureCategory } : {}),
         });
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status. A
@@ -5131,7 +5079,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             status: channelLost ? "failed" : terminal.status,
             ...activityDiagnostics,
             ...(failureDiagnostic ? { terminalSessionFailure: failureDiagnostic } : {}),
-            ...(failureCategory ? { terminalSessionFailureCategory: failureCategory } : {}),
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
               ? {
