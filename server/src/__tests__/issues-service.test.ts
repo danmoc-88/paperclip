@@ -7347,6 +7347,37 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     expect(ownership.adoptedFromRunId).toBeNull();
   });
 
+  it("returns a routine conflict without adopting a second execution, then recovers after release", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
+    const [target] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    const originId = randomUUID();
+    await db.update(issues).set({
+      originKind: "routine_execution", originId, originFingerprint: "same-dispatch",
+      checkoutRunId: null, executionRunId: null,
+    }).where(eq(issues.id, seeded.issueId));
+    const siblingId = randomUUID();
+    await db.insert(issues).values({
+      id: siblingId, companyId: target.companyId, title: "Current routine execution",
+      status: "in_progress", assigneeAgentId: seeded.actorAgentId,
+      checkoutRunId: seeded.actorRunId, executionRunId: seeded.actorRunId,
+      originKind: "routine_execution", originId, originFingerprint: "same-dispatch",
+    });
+
+    await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+      .rejects.toMatchObject({ status: 409, details: { code: "routine_execution_conflict", issueId: seeded.issueId } });
+    const [after] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(after).toMatchObject({ status: "in_progress", assigneeAgentId: seeded.actorAgentId,
+      checkoutRunId: null, executionRunId: null });
+    const [sibling] = await db.select().from(issues).where(eq(issues.id, siblingId));
+    expect(sibling).toMatchObject({ status: "in_progress", checkoutRunId: seeded.actorRunId,
+      executionRunId: seeded.actorRunId });
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, siblingId));
+    const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
+    expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
+    expect(ownership.executionRunId).toBe(seeded.actorRunId);
+  });
+
   it("treats timed_out checkout owners as stale and recoverable", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "timed_out" });
 
