@@ -129,6 +129,19 @@ describe("Costs embedded Audit surfaces", () => {
     expect(container.textContent).toContain("Update budget");
   });
 
+  it("keeps Save disabled until the delayed server read-back completes", async () => {
+    await renderBudgets();
+    enterBudget("1000");
+    let finishRead!: (value: unknown) => void;
+    upsertPolicyMock.mockResolvedValue({});
+    budgetOverviewMock.mockImplementation(() => new Promise((resolve) => { finishRead = resolve; }));
+    await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    await act(async () => { await vi.waitFor(() => expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true)); });
+    expect(upsertPolicyMock).toHaveBeenCalledTimes(1);
+    await act(async () => { finishRead({ policies: [], activeIncidents: [], pendingApprovalCount: 0, pausedAgentCount: 0, pausedProjectCount: 0 }); });
+    await act(async () => { await vi.waitFor(() => expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false)); });
+  });
+
   it.each(["", "-1", "no", "Infinity", "0", "999999999999999999999"])("does not submit invalid initial limit %s", async (value) => {
     await renderBudgets();
     enterBudget(value);

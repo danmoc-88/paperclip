@@ -226,9 +226,9 @@ export function Costs({
     staleTime: 5_000,
   });
 
-  const invalidateBudgetViews = () => {
+  const invalidateBudgetViews = async () => {
     if (!selectedCompanyId) return;
-    queryClient.invalidateQueries({ queryKey: queryKeys.budgets.overview(selectedCompanyId) });
+    await queryClient.invalidateQueries({ queryKey: queryKeys.budgets.overview(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     queryClient.invalidateQueries({ queryKey: ["costs", selectedCompanyId] });

@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { ToolProfileEffectiveSummary } from "@paperclipai/shared";
 import { Command } from "commander";
 import { createToolProfileEntryForProfileSchema, createToolProfileBindingForProfileSchema, unbindToolProfileBindingSchema, putToolConnectionInstallsSchema } from "@paperclipai/shared";
 import { addCommonClientOptions, apiPath, handleCommandError, printOutput, resolveCommandContext, type BaseClientOptions } from "./common.js";
@@ -31,15 +32,30 @@ export function registerToolAccessCommands(program: Command): void {
           // Do not export connection configuration, secrets, grants or tokens.
           if (connection.connectionPurpose === "ai") continue;
           const installs = await ctx.api.get(apiPath`/api/tool-connections/${connection.id}/installs`);
-          const catalog = await ctx.api.get(apiPath`/api/tool-connections/${connection.id}/catalog`);
+          const catalog = await ctx.api.get<{ catalog: unknown[]; readMode: string }>(apiPath`/api/tool-connections/${connection.id}/catalog/persisted`);
+          if (catalog?.readMode !== "persisted") throw new Error("Snapshot requires a server supporting persisted catalog reads; STOP without refreshing");
           if (!installs || !catalog) throw new Error(`Incomplete snapshot for connection ${connection.id}`);
           connectionRows.push({ id: connection.id, name: connection.name, installs, catalog });
         }
         const effectiveAccess = [];
         for (const agent of agents) {
-          const effective = await ctx.api.get(`${companyPath}/tools/profiles/effective/agents/${encodeURIComponent(agent.id)}`);
+          const effective = await ctx.api.get<ToolProfileEffectiveSummary>(`${companyPath}/tools/profiles/effective/agents/${encodeURIComponent(agent.id)}`);
           if (!effective) throw new Error(`Incomplete snapshot for agent ${agent.id}`);
-          effectiveAccess.push({ agentId: agent.id, name: agent.name, status: agent.status, effective });
+          effectiveAccess.push({ agentId: agent.id, name: agent.name, status: agent.status, effective: {
+            agentId: effective.agentId,
+            profiles: effective.profiles,
+            entries: effective.entries,
+            bindings: effective.bindings,
+            allowedTools: effective.allowedTools,
+            allowedToolNames: effective.allowedToolNames,
+            // Never spread ToolConnection: config/transportConfig and credential refs
+            // are runtime data, not evidence of installation or access semantics.
+            installedConnections: effective.installedConnections.map((connection) => ({
+              id: connection.id, applicationId: connection.applicationId,
+              name: connection.name, status: connection.status,
+              connectionPurpose: connection.connectionPurpose,
+            })),
+          } });
         }
         printOutput({ companyId: ctx.companyId, startedAt, completedAt: new Date().toISOString(), connections: connectionRows, profiles, policies, effectiveAccess }, { json: true });
       } catch (err) { handleCommandError(err); }

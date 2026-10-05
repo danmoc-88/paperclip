@@ -1185,9 +1185,15 @@ npx paperclipai tool-access installs:set <connection-id> --file desired-installs
 npx paperclipai tool-access snapshot --company-id <company-id> > after.json
 ```
 
-The snapshot includes full installation and catalog rows, profiles (including
+The snapshot includes full installation and persisted catalog rows, profiles (including
 entries and bindings), policies, and effective profiles for each agent. It omits
-connection configuration and agent adapter configuration. A failed read produces
+connection configuration (including nested effective installed connections), credential
+references and agent adapter configuration. Catalog reads use the board-only
+`GET /api/tool-connections/:id/catalog/persisted` route, which never refreshes
+the cache or changes profiles, bindings or managed policies. An older server
+rejects this route; do not fall back to the refreshing catalog route. An empty
+or stale persisted catalog requires STOP and separate preparation before B.
+A failed read produces
 an error and no snapshot. Reads are sequential, not a transaction: use a quiet
 configuration window and inspect the start/end timestamps.
 

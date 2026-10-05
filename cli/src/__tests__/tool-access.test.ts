@@ -32,8 +32,14 @@ describe("tool-access operator commands", () => {
       [`/api/companies/${companyId}/tools/profiles`]: { profiles: [{ id: "profile", entries: [{ effect: "exclude" }], bindings: [{ priority: 70, metadata: { source: "custom" } }] }] },
       [`/api/companies/${companyId}/tools/policies`]: { policies: [{ policyType: "require_approval" }] },
       [`/api/tool-connections/${connectionId}/installs`]: { installs: [{ targetType: "company", targetId: companyId }] },
-      [`/api/tool-connections/${connectionId}/catalog`]: { catalog: [{ id: "tool" }] },
-      [`/api/companies/${companyId}/tools/profiles/effective/agents/${agentId}`]: { profiles: [{ id: "profile" }] },
+      [`/api/tool-connections/${connectionId}/catalog/persisted`]: { readMode: "persisted", catalog: [{ id: "tool" }] },
+      [`/api/companies/${companyId}/tools/profiles/effective/agents/${agentId}`]: { profiles: [{ id: "profile" }],
+        allowedToolNames: ["read_item"], bindings: [{ priority: 70 }],
+        installedConnections: [{ id: connectionId, name: "Tools", status: "ready", connectionPurpose: "tools",
+          config: { marker: "excluded" }, transportConfig: { headers: { authorization: "excluded" } },
+          credentialSecretRefs: [{ secretId: "excluded" }], futureSensitiveField: "excluded" }],
+        futureSensitiveField: "excluded",
+      },
     };
     const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(rows[new URL(url).pathname])));
     vi.stubGlobal("fetch", fetchMock);
@@ -44,6 +50,11 @@ describe("tool-access operator commands", () => {
     expect(snapshot.profiles).toEqual(rows[`/api/companies/${companyId}/tools/profiles`]);
     expect(snapshot.policies).toEqual(rows[`/api/companies/${companyId}/tools/policies`]);
     expect(snapshot.effectiveAccess).toHaveLength(1);
+    expect(snapshot.effectiveAccess[0].effective.installedConnections).toEqual([
+      { id: connectionId, name: "Tools", status: "ready", connectionPurpose: "tools" },
+    ]);
+    expect(snapshot.effectiveAccess[0].effective.allowedToolNames).toEqual(["read_item"]);
+    expect(snapshot.effectiveAccess[0].effective.bindings).toEqual([{ priority: 70 }]);
     expect(snapshot.connections[0].installs.installs[0].targetId).toBe(companyId);
     expect(fetchMock).toHaveBeenCalledTimes(7);
   });
@@ -77,6 +88,34 @@ describe("tool-access operator commands", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(console.log).not.toHaveBeenCalled();
   });
+  it("emits no partial snapshot when the final effective-access request is denied", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const route = new URL(url).pathname;
+      if (route.endsWith("/connections")) return new Response(JSON.stringify({ connections: [] }));
+      if (route.endsWith("/agents")) return new Response(JSON.stringify([{ id: agentId }]));
+      if (route.includes("/effective/")) return new Response(JSON.stringify({ error: "Board access required" }), { status: 403 });
+      return new Response(JSON.stringify({ rows: [] }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(run(["snapshot"])).rejects.toThrow("command failed");
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(console.log).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on an old server without falling back to refreshing catalog GET", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const route = new URL(url).pathname;
+      if (route.endsWith("/connections")) return new Response(JSON.stringify({ connections: [{ id: connectionId }] }));
+      if (route.endsWith("/agents")) return new Response("[]");
+      if (route.endsWith("/catalog/persisted")) return new Response("{}", { status: 404 });
+      return new Response("{}");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(run(["snapshot"])).rejects.toThrow("command failed");
+    expect(fetchMock.mock.calls.some(([url]) => new URL(url).pathname.endsWith("/catalog"))).toBe(false);
+    expect(console.log).not.toHaveBeenCalled();
+  });
+
   it("restores legacy entries and custom binding metadata through the existing routes", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true })));
     vi.stubGlobal("fetch", fetchMock);
