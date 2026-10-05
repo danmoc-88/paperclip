@@ -1164,3 +1164,61 @@ Supported providers:
 
 - `local_disk` (default; local single-user installs)
 - `s3` (S3-compatible object storage)
+
+### Operator installation snapshots
+
+`tool-access` uses the current CLI authentication. It does not grant board access.
+Run it from an operator's existing board-authenticated context. An agent token
+will receive the same server denial as a direct API call. Do not copy credentials
+from another person's profile or change identity to work around a denial.
+
+```sh
+npx paperclipai tool-access snapshot --company-id <company-id> > before.json
+npx paperclipai tool-access installs:get <connection-id> > installs-before.json
+npx paperclipai tool-access installs:set <connection-id> --file desired-installs.json
+npx paperclipai tool-access snapshot --company-id <company-id> > after.json
+```
+
+The snapshot includes full installation and catalog rows, profiles (including
+entries and bindings), policies, and effective profiles for each agent. It omits
+connection configuration and agent adapter configuration. A failed read produces
+an error and no snapshot. Reads are sequential, not a transaction: use a quiet
+configuration window and inspect the start/end timestamps.
+
+The input file is `{"installs":[{"targetType":"agent","targetId":"<agent-id>"}]}`.
+It replaces the complete installation list, not one item. A company target means
+all agents; an empty list removes every installation for this connection.
+
+Before writing, inspect the snapshot. This operation can remove install-created
+profile bindings, create new bindings, and remove legacy connection include
+entries. It is **not** an autoload-only operation. Preserve policy and access
+semantics. Do not write if the snapshot is incomplete, the target agents do not
+already have the required access, or the restore procedure has not been reviewed.
+The commands do not calculate effective permission equivalence for the operator.
+
+For the simple reversible case (no legacy entries and only default install
+bindings), extract the `installs` array from `installs-before.json` into a file
+with only the top-level `installs` field. Restore it with `installs:set`, then
+repeat the full snapshot and compare access semantics. Restoring the list alone
+is insufficient for custom binding metadata or deleted legacy entries. Stop
+before writing these cases until their supported profile-restore operations are
+available and reviewed. Credentials and tool approval policies are not inputs to
+these commands.
+
+### First organization monthly budget
+
+In **Audit → Budgets** (or the Costs Budgets tab), use **Organization monthly
+budget → Monthly budget (USD) → Set organization budget**. This creates the
+company policy through the existing board-only policy endpoint. The read-back
+replaces the form with the existing budget card. That card updates the limit;
+zero disables protection. It does not restore cancelled work. The existing CLI
+alternative is:
+
+```sh
+npx paperclipai budget company:update --company-id <company-id> --payload-json '{"budgetMonthlyCents":100000}'
+npx paperclipai budget overview --company-id <company-id> --json
+```
+
+Check current UTC-month spend before setting the limit. The policy warns at 80%
+and pauses execution at the limit. Unsettled in-flight costs can exceed it;
+this is not a per-run reservation or provider quota.
