@@ -241,6 +241,12 @@ Four relation types between issues:
 
 - When a blocking issue is resolved, the relation becomes informational (flag
   turns green)
+- A PATCH that replaces `blockedByIssueIds` and changes a blocked issue's
+  status validates the proposed blocker set. Omitting the list retains the
+  stored set; an empty list removes it. Status and relations commit together.
+  Pause, actor authority, company boundaries, and workspace-finalize gates
+  still apply. Do not split this operation into two watchdog writes: the first
+  write can invalidate the watchdog's stop fingerprint.
 - Duplicate is one-directional (you mark the duplicate, not the canonical)
 - Blocking is **not transitive** at the system level (A blocks B, B blocks C
   does not auto-block A->C)

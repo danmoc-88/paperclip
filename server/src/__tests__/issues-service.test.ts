@@ -4531,6 +4531,12 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       unresolvedBlockerIssueIds: [blockerId],
     });
 
+    await expect(svc.getDependencyReadiness(dependentId, undefined, [blockerId])).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+    });
+
     // A failed finalize must keep the gate closed.
     await db.insert(workspaceOperations).values({
       companyId,
@@ -4671,6 +4677,29 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       isDependencyReady: false,
     });
 
+    // Preview the request's effective list without changing the stored relation.
+    await expect(svc.getDependencyReadiness(blockedId, undefined, [])).resolves.toMatchObject({
+      blockerIssueIds: [], unresolvedBlockerCount: 0, isDependencyReady: true,
+    });
+    await expect(svc.getDependencyReadiness(blockedId)).resolves.toMatchObject({
+      blockerIssueIds: [blockerId], unresolvedBlockerCount: 1,
+    });
+    await expect(svc.getDependencyReadiness(blockedId, undefined, [blockerId, blockerId])).resolves.toMatchObject({
+      blockerIssueIds: [blockerId], unresolvedBlockerCount: 1,
+    });
+    const foreignCompanyId = randomUUID();
+    const foreignBlockerId = randomUUID();
+    await db.insert(companies).values({
+      id: foreignCompanyId, name: "Other company",
+      issuePrefix: `T${foreignCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(issues).values({
+      id: foreignBlockerId, companyId: foreignCompanyId, title: "Foreign blocker", status: "done",
+    });
+    await expect(svc.getDependencyReadiness(blockedId, undefined, [foreignBlockerId])).rejects.toThrow("same company");
+    await expect(svc.getDependencyReadiness(blockedId, undefined, [randomUUID()])).rejects.toThrow("same company");
+    await expect(svc.getDependencyReadiness(blockedId, undefined, [blockedId])).rejects.toThrow("itself");
+
     await svc.update(blockerId, { status: "done" });
 
     await expect(svc.getDependencyReadiness(blockedId)).resolves.toMatchObject({
@@ -4681,6 +4710,16 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       allBlockersDone: true,
       isDependencyReady: true,
     });
+    // Removing an unfinished blocker and changing status commits together.
+    await svc.update(blockerId, { status: "todo" });
+    await svc.update(blockedId, { status: "blocked" });
+    await expect(svc.update(blockedId, { status: "backlog", blockedByIssueIds: [randomUUID()] })).rejects.toThrow("same company");
+    expect((await svc.getById(blockedId))?.status).toBe("blocked");
+    expect((await svc.getDependencyReadiness(blockedId)).blockerIssueIds).toEqual([blockerId]);
+    await svc.update(blockedId, { status: "backlog", blockedByIssueIds: [] });
+    expect((await svc.getById(blockedId))?.status).toBe("backlog");
+    expect((await svc.getDependencyReadiness(blockedId)).blockerIssueIds).toEqual([]);
+
   });
 
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {

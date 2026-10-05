@@ -316,7 +316,12 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
-  it("wakes the parent when all direct children become terminal", async () => {
+  it.each([false, true])("wakes the parent once when its last child completes (also a blocker: %s)", async (alsoBlocker) => {
+    if (alsoBlocker) {
+      mockIssueService.listWakeableBlockedDependents.mockResolvedValue([{
+        id: "parent-1", assigneeAgentId: "agent-9", blockerIssueIds: ["child-1"],
+      }]);
+    }
     mockIssueService.getById.mockResolvedValue({
       id: "child-1",
       companyId: "company-1",
@@ -404,6 +409,7 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+    expect(mockWakeup.mock.calls.filter(([agentId]) => agentId === "agent-9")).toHaveLength(1);
   });
 
   function issueRecord(overrides: Record<string, unknown> = {}) {

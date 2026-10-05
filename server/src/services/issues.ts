@@ -2532,6 +2532,7 @@ async function listIssueDependencyReadinessMap(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
   issueIds: string[],
+  requestedBlockers?: { issueId: string; blockerIssueIds: string[] },
 ) {
   const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
   const readinessMap = new Map<string, IssueDependencyReadiness>();
@@ -2540,22 +2541,44 @@ async function listIssueDependencyReadinessMap(
   }
   if (uniqueIssueIds.length === 0) return readinessMap;
 
-  const blockerRows = await dbOrTx
-    .select({
-      issueId: issueRelations.relatedIssueId,
-      blockerIssueId: issueRelations.issueId,
-      blockerStatus: issues.status,
-      blockerExecutionWorkspaceId: issues.executionWorkspaceId,
-    })
-    .from(issueRelations)
-    .innerJoin(issues, eq(issueRelations.issueId, issues.id))
-    .where(
-      and(
-        eq(issueRelations.companyId, companyId),
-        eq(issueRelations.type, "blocks"),
-        inArray(issueRelations.relatedIssueId, uniqueIssueIds),
-      ),
-    );
+  const requestedIds = requestedBlockers
+    ? [...new Set(requestedBlockers.blockerIssueIds)]
+    : undefined;
+  if (requestedIds?.includes(requestedBlockers!.issueId)) {
+    throw unprocessable("Issue cannot be blocked by itself");
+  }
+  const blockerRows = requestedIds !== undefined
+    ? requestedIds.length === 0
+      ? []
+      : (await dbOrTx
+          .select({
+            blockerIssueId: issues.id,
+            blockerStatus: issues.status,
+            blockerExecutionWorkspaceId: issues.executionWorkspaceId,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, requestedIds))))
+          .map((row) => ({ ...row, issueId: requestedBlockers!.issueId }))
+    : await dbOrTx
+        .select({
+          issueId: issueRelations.relatedIssueId,
+          blockerIssueId: issueRelations.issueId,
+          blockerStatus: issues.status,
+          blockerExecutionWorkspaceId: issues.executionWorkspaceId,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, uniqueIssueIds),
+          ),
+        );
+
+  if (requestedIds && blockerRows.length !== requestedIds.length) {
+    throw unprocessable("Blocked-by issues must belong to the same company");
+  }
 
   // Collect issue/workspace pairs of "done" blockers — these are the only ones
   // subject to the workspace-finalize barrier. Blockers that aren't done already
@@ -8920,7 +8943,11 @@ export function issueService(db: Db) {
       };
     },
 
-    getDependencyReadiness: async (issueId: string, dbOrTx: any = db) => {
+    getDependencyReadiness: async (
+      issueId: string,
+      dbOrTx: any = db,
+      requestedBlockerIssueIds?: string[],
+    ) => {
       const issue = await dbOrTx
         .select({ id: issues.id, companyId: issues.companyId })
         .from(issues)
@@ -8933,6 +8960,9 @@ export function issueService(db: Db) {
         dbOrTx,
         issue.companyId,
         [issueId],
+        requestedBlockerIssueIds === undefined
+          ? undefined
+          : { issueId, blockerIssueIds: requestedBlockerIssueIds },
       );
       return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
     },
