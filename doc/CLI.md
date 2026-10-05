@@ -1206,9 +1206,24 @@ For the simple reversible case (no legacy entries and only default install
 bindings), extract the `installs` array from `installs-before.json` into a file
 with only the top-level `installs` field. Restore it with `installs:set`, then
 repeat the full snapshot and compare access semantics. Restoring the list alone
-is insufficient for custom binding metadata or deleted legacy entries. Stop
-before writing these cases until their supported profile-restore operations are
-available and reviewed. Credentials and tool approval policies are not inputs to
+is insufficient for custom binding metadata or deleted legacy entries. Restore legacy entries with `entry:add`. Restore custom bindings with
+`binding:unbind` followed by `binding:bind`, using the exact saved priority and
+metadata. Remove only confirmed duplicate entries with `entry:remove`. These
+commands call the existing guarded APIs; they are not an automatic rollback.
+Stop if any restore operation fails or the final semantic diff is nonzero.
+
+```sh
+npx paperclipai tool-access entry:add <profile-id> --file saved-entry.json
+npx paperclipai tool-access binding:unbind <profile-id> --company-id <company-id> --file saved-target.json
+npx paperclipai tool-access binding:bind <profile-id> --company-id <company-id> --file saved-binding.json
+npx paperclipai tool-access entry:remove <confirmed-duplicate-entry-id>
+```
+
+Files contain API payload fields, not database IDs or timestamps. Entry fields:
+`selectorType`, `effect`, `applicationId`, `connectionId`, `catalogEntryId`,
+`toolName`, `riskLevel`, `conditions`. Binding fields: `targetType`, `targetId`,
+`priority`, `metadata`. Unbind uses only `targetType` and `targetId`.
+ Credentials and tool approval policies are not inputs to
 these commands.
 
 ### First organization monthly budget

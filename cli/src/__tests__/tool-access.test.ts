@@ -13,7 +13,7 @@ async function run(args: string[]) {
   const program = new Command();
   program.exitOverride();
   registerToolAccessCommands(program);
-  await program.parseAsync(["tool-access", ...args, "--api-base", "http://localhost:3100", "--api-key", "test-agent-token", ...(args[0] === "snapshot" ? ["--company-id", companyId] : [])], { from: "user" });
+  await program.parseAsync(["tool-access", ...args, "--api-base", "http://localhost:3100", "--api-key", "test-agent-token", ...(["snapshot", "binding:bind", "binding:unbind"].includes(args[0]) ? ["--company-id", companyId] : [])], { from: "user" });
 }
 
 describe("tool-access operator commands", () => {
@@ -77,4 +77,26 @@ describe("tool-access operator commands", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(console.log).not.toHaveBeenCalled();
   });
+  it("restores legacy entries and custom binding metadata through the existing routes", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true })));
+    vi.stubGlobal("fetch", fetchMock);
+    const entry = { selectorType: "connection", effect: "include", connectionId };
+    const binding = { targetType: "agent", targetId: agentId, priority: 70, metadata: { source: "tool_connection_install", connectionId, custom: true } };
+    const target = { targetType: "agent", targetId: agentId };
+    for (const [command, body] of [["entry:add", entry], ["binding:unbind", target], ["binding:bind", binding]] as const) {
+      const file = path.join(directory, "restore.json");
+      await writeFile(file, JSON.stringify(body));
+      await run([command, "profile-1", "--file", file]);
+    }
+    await run(["entry:remove", "duplicate-1"]);
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(calls.map(([url, init]) => [new URL(url).pathname, init.method])).toEqual([
+      ["/api/tool-profiles/profile-1/entries", "POST"],
+      [`/api/companies/${companyId}/tools/profiles/profile-1/unbind`, "POST"],
+      [`/api/companies/${companyId}/tools/profiles/profile-1/bind`, "POST"],
+      ["/api/tool-profile-entries/duplicate-1", "DELETE"],
+    ]);
+    expect(JSON.parse(String(calls[2][1].body))).toEqual(binding);
+  });
+
 });

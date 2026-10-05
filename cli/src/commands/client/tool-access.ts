@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
-import { putToolConnectionInstallsSchema } from "@paperclipai/shared";
+import { createToolProfileEntryForProfileSchema, createToolProfileBindingForProfileSchema, unbindToolProfileBindingSchema, putToolConnectionInstallsSchema } from "@paperclipai/shared";
 import { addCommonClientOptions, apiPath, handleCommandError, printOutput, resolveCommandContext, type BaseClientOptions } from "./common.js";
 
 interface Options extends BaseClientOptions {
@@ -65,6 +65,38 @@ export function registerToolAccessCommands(program: Command): void {
         const ctx = resolveCommandContext(opts);
         const result = await ctx.api.put(apiPath`/api/tool-connections/${connectionId}/installs`, payload);
         printOutput(result, { json: true });
+      } catch (err) { handleCommandError(err); }
+    }));
+
+  // These existing profile operations are needed to restore legacy entries and
+  // custom install bindings. They do not bypass the server's mutation guards.
+  for (const operation of ["entry:add", "binding:bind", "binding:unbind"] as const) {
+    addCommonClientOptions(access.command(operation)
+      .description("Restore reviewed profile data from a JSON file using the existing access API")
+      .argument("<profileId>")
+      .option("-C, --company-id <id>", "Company ID (required for bindings)")
+      .requiredOption("--file <path>", "Reviewed API payload JSON file")
+      .action(async (profileId: string, opts: Options) => {
+        try {
+          const input: unknown = JSON.parse(await readFile(opts.file!, "utf8"));
+          const schema = operation === "entry:add" ? createToolProfileEntryForProfileSchema
+            : operation === "binding:bind" ? createToolProfileBindingForProfileSchema : unbindToolProfileBindingSchema;
+          const payload = schema.parse(input);
+          const ctx = resolveCommandContext(opts, { requireCompany: operation !== "entry:add" });
+          const endpoint = operation === "entry:add" ? apiPath`/api/tool-profiles/${profileId}/entries`
+            : `${apiPath`/api/companies/${ctx.companyId}/tools/profiles/${profileId}`}/${operation === "binding:bind" ? "bind" : "unbind"}`;
+          printOutput(await ctx.api.post(endpoint, payload), { json: true });
+        } catch (err) { handleCommandError(err); }
+      }));
+  }
+
+  addCommonClientOptions(access.command("entry:remove")
+    .description("Remove a confirmed duplicate profile entry by ID during rollback")
+    .argument("<entryId>")
+    .action(async (entryId: string, opts: Options) => {
+      try {
+        const ctx = resolveCommandContext(opts);
+        printOutput(await ctx.api.delete(apiPath`/api/tool-profile-entries/${entryId}`), { json: true });
       } catch (err) { handleCommandError(err); }
     }));
 }
