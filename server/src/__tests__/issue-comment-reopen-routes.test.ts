@@ -2054,6 +2054,70 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it.each(["backlog", "todo"])("atomically clears blockers and changes blocked to %s for an agent", async (status) => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getDependencyReadiness.mockImplementation(async (_id, _tx, requestedIds) => ({
+      unresolvedBlockerCount: requestedIds?.length === 0 ? 0 : 1,
+      unresolvedBlockerIssueIds: requestedIds?.length === 0 ? [] : ["old-blocker"],
+    }));
+    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status, blockedByIssueIds: [] });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update.mock.calls[0][1]).toMatchObject({ status, blockedByIssueIds: [] });
+  });
+
+  it("honors explicit resume with a comment and cleared blockers in one PATCH", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getDependencyReadiness.mockImplementation(async (_id, _tx, requestedIds) => ({
+      unresolvedBlockerCount: requestedIds?.length === 0 ? 0 : 1,
+      unresolvedBlockerIssueIds: requestedIds?.length === 0 ? [] : ["old-blocker"],
+    }));
+    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ resume: true, comment: "Continue after removing the obsolete blocker.", blockedByIssueIds: [] });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update.mock.calls[0][1]).toMatchObject({ status: "todo", blockedByIssueIds: [] });
+  });
+
+  it.each([undefined, ["33333333-3333-4333-8333-333333333333"]])(
+    "rejects an agent status transition when the effective blocker set remains unresolved (%j)",
+    async (blockedByIssueIds) => {
+      const issue = makeIssue("blocked");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 1, unresolvedBlockerIssueIds: ["unresolved-blocker"],
+      });
+      const res = await request(await installActor(createApp(), agentActor()))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ status: "backlog", ...(blockedByIssueIds === undefined ? {} : { blockedByIssueIds }) });
+      expect(res.status).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not bypass a pause hold when clearing blockers with a status change", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue({ holdId: "pause-1", rootIssueId: issue.id, mode: "pause" } as any);
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "backlog", blockedByIssueIds: [] });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("pause hold");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("wakes the assignee when an assigned blocked issue moves back to todo", async () => {
     const issue = makeIssue("blocked");
     mockIssueService.getById.mockResolvedValue(issue);
