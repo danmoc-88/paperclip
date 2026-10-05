@@ -27,7 +27,7 @@ describe("tool-access operator commands", () => {
 
   it("exports complete access rows without connection configuration or credentials", async () => {
     const rows: Record<string, unknown> = {
-      [`/api/companies/${companyId}/tools/connections`]: { connections: [{ id: connectionId, name: "Tools", connectionPurpose: "tools", config: { private: "excluded" }, secret: "excluded" }] },
+      [`/api/companies/${companyId}/tools/connections`]: { connections: [{ id: connectionId, name: "Tools", connectionPurpose: "tools", transport: "mcp_remote", status: "ready", lastCatalogRefreshAt: "2026-10-05T17:00:00.000Z", config: { private: "excluded" }, secret: "excluded" }] },
       [`/api/companies/${companyId}/agents`]: [{ id: agentId, name: "Worker", status: "active", adapterConfig: { secret: "excluded" } }],
       [`/api/companies/${companyId}/tools/profiles`]: { profiles: [{ id: "profile", entries: [{ effect: "exclude" }], bindings: [{ priority: 70, metadata: { source: "custom" } }] }] },
       [`/api/companies/${companyId}/tools/policies`]: { policies: [{ policyType: "require_approval" }] },
@@ -55,6 +55,7 @@ describe("tool-access operator commands", () => {
     ]);
     expect(snapshot.effectiveAccess[0].effective.allowedToolNames).toEqual(["read_item"]);
     expect(snapshot.effectiveAccess[0].effective.bindings).toEqual([{ priority: 70 }]);
+    expect(snapshot.connections[0]).toMatchObject({ transport: "mcp_remote", status: "ready", lastCatalogRefreshAt: "2026-10-05T17:00:00.000Z" });
     expect(snapshot.connections[0].installs.installs[0].targetId).toBe(companyId);
     expect(fetchMock).toHaveBeenCalledTimes(7);
   });

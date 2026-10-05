@@ -21,7 +21,7 @@ export function registerToolAccessCommands(program: Command): void {
         const ctx = resolveCommandContext(opts, { requireCompany: true });
         const startedAt = new Date().toISOString();
         const companyPath = apiPath`/api/companies/${ctx.companyId}`;
-        const connections = await ctx.api.get<{ connections: Array<{ id: string; name: string; connectionPurpose: string }> }>(`${companyPath}/tools/connections`);
+        const connections = await ctx.api.get<{ connections: Array<{ id: string; name: string; connectionPurpose: string; transport: string; status: string; lastCatalogRefreshAt: string | null }> }>(`${companyPath}/tools/connections`);
         const agents = await ctx.api.get<Array<{ id: string; name: string; status: string }>>(`${companyPath}/agents`);
         if (!connections || !agents) throw new Error("Incomplete snapshot: missing connections or agents");
         const profiles = await ctx.api.get(`${companyPath}/tools/profiles`);
@@ -35,7 +35,13 @@ export function registerToolAccessCommands(program: Command): void {
           const catalog = await ctx.api.get<{ catalog: unknown[]; readMode: string }>(apiPath`/api/tool-connections/${connection.id}/catalog/persisted`);
           if (catalog?.readMode !== "persisted") throw new Error("Snapshot requires a server supporting persisted catalog reads; STOP without refreshing");
           if (!installs || !catalog) throw new Error(`Incomplete snapshot for connection ${connection.id}`);
-          connectionRows.push({ id: connection.id, name: connection.name, installs, catalog });
+          connectionRows.push({
+            id: connection.id, name: connection.name,
+            // Safe metadata for the operator freshness gate; never spread the connection.
+            transport: connection.transport, status: connection.status,
+            lastCatalogRefreshAt: connection.lastCatalogRefreshAt,
+            installs, catalog,
+          });
         }
         const effectiveAccess = [];
         for (const agent of agents) {
