@@ -9067,9 +9067,20 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    // Automatic settlement closes bookkeeping, but can retain a no-replay
+    // execution blocker. Expose that exact action for the supported board
+    // reconciliation API without pretending it is an active recovery worker.
+    const blocker = await getExecutionBlocker(db, issue.companyId, issue.id);
+    const [held] = blocker?.recoveryActionId && blocker.recoveryActionId !== active?.id
+      ? await db.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.id, blocker.recoveryActionId),
+          eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+        )).limit(1)
+      : [];
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: [...(active ? [active] : []), ...(held ? [issueRecoveryActionReadModel(held)] : [])],
     });
   });
 

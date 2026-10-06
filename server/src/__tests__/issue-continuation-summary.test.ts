@@ -86,6 +86,31 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
 
+  it("does not carry a generated review wait into a resumed implementation run", () => {
+    const input = {
+      issue: { id: "issue-1", identifier: "TEST-1", title: "Resume approved work",
+        description: null, status: "in_review", priority: "high" },
+      run: { id: "review-run", status: "succeeded", error: null },
+      agent: { id: "agent-1", name: "Owner", adapterType: "codex_local" },
+    };
+    const waiting = buildContinuationSummaryMarkdown(input);
+    expect(continuationSummaryParksExecutor(waiting)).toBe(true);
+    const resumed = buildContinuationSummaryMarkdown({ ...input,
+      issue: { ...input.issue, status: "in_progress" },
+      run: { ...input.run, id: "approved-run", resultJson: { summary: "Approved work needs an API bridge repair." } },
+      previousSummaryBody: waiting,
+    });
+    expect(continuationSummaryParksExecutor(resumed)).toBe(false);
+    expect(resumed).toContain("Approved work needs an API bridge repair.");
+    // A fresh review is still a wait, and custom operator instructions survive.
+    expect(continuationSummaryParksExecutor(buildContinuationSummaryMarkdown({ ...input,
+      previousSummaryBody: resumed }))).toBe(true);
+    expect(buildContinuationSummaryMarkdown({ ...input,
+      issue: { ...input.issue, status: "in_progress" },
+      previousSummaryBody: "## Next Action\n- Wait for operator to repair the bridge.",
+    })).toContain("Wait for operator to repair the bridge.");
+  });
+
   it("detects continuation summaries that explicitly park executor work for review", () => {
     const body = [
       "# Continuation Summary",

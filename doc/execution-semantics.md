@@ -683,6 +683,14 @@ Recovery rule for a parked-for-review continuation:
 
 An accepted interaction supersedes a continuation park recorded before that acceptance. A queued continuation carrying a parseable `interactionResolvedAt` must not be cancelled solely because an older continuation summary says to wait for review or approval. Interaction-continuation recovery is bounded: after three consecutive continuation wakes are cancelled without a run starting, recovery converts a real dependency wait when one exists or escalates the missing execution path visibly instead of requeueing forever.
 
+The summary generator must not carry its generic status-derived review wait into
+an `in_progress` summary. It keeps custom next actions and preserves waits when
+the current issue is `in_review`. The queued-run gate reads the current durable
+summary before its queued snapshot, so either a resumed next action or a new wait
+supersedes old queue context. These rules do not bypass typed approval, ownership,
+dependency, or execution gates.
+
+
 This keeps the post-decomposition umbrella (§7) on a real waiting path instead of relying on `parentId` rollup, which §6 does not treat as a dependency.
 
 ### 9.3 Recovery work classes
@@ -969,6 +977,22 @@ future execution until Resume, and missing stop proof still blocks continuation.
 ### Provider continuity and bounded finalization
 
 A permanently unusable native runner session may be replaced only with evidence that its predecessor is stopped and fenced, completed results and workspace state are preserved, required task history is available, and pending effects have been reconciled. A provider-native shell command or external write without a reliable outcome receipt is unknown. Unknown effects, integrity failures, and unverified process ownership never authorize speculative replay. Once automatic recovery is ruled out, Paperclip selects a conservative default: preserve recorded work, stop the affected task, and retain a durable no-replay hold. Unknown action outcomes remain unknown. No reconciliation form or user diagnosis is required.
+
+A resolved automatic recovery action can still carry `automaticRecovery.replay:
+"blocked"`. The recovery-actions GET includes that exact effective blocker in
+`actions`, even when `active` is null. This is a diagnostic and reconciliation
+access path, not an active worker or permission to replay.
+
+For a historical no-replay hold, a board operator can use the existing
+`POST /api/issues/:id/recovery-actions/resolve` endpoint with the returned
+`actionId`, `outcome: "restored"`, `sourceIssueStatus: "todo"`, and
+`executionReconciliation` (`runId`, `providerStopped`, `actionOutcome`, and
+`outcomeEvidence`). The operator must first verify process, lease, coordinator,
+and recorded action outcomes. A null `startedAt` alone is insufficient. A queued
+review cancellation must also have the gate receipt and no contradictory dispatch
+or cleanup evidence. The server checks the reconciliation record, process/lease state, and task ownership;
+unknown outcomes and live authority retain the hold. Resolving can schedule a
+continuation, so inspecting this endpoint does not authorize executing it.
 
 Local Codex crash replacement can use a complete interrupted-turn inventory,
 authenticated process-stop evidence, and unchanged retained-state fingerprints.
