@@ -1791,6 +1791,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
     }).returning();
     const app = createApp();
+    // A resolved bookkeeping row can still block execution. Keep its id and
+    // evidence discoverable for the existing board reconciliation endpoint.
+    const listed = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
+    expect(listed.body.active).toBeNull();
+    expect(listed.body.actions).toEqual([expect.objectContaining({ id: action!.id, status: "resolved" })]);
     const body = { actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
       executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
         outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects." } };

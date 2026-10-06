@@ -555,10 +555,10 @@ export function createPostgresRunDispatchAdapter(
       const queuedContinuationSummary =
         readNonEmptyString(parseObject(context.paperclipContinuationSummary).body) ??
         readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
-      const currentContinuationSummary = queuedContinuationSummary
-        ? null
-        : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
-      continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
+      // Queue snapshots can predate an accepted decision or a new review wait.
+      // Revalidate against the durable document while holding the issue lock.
+      const currentContinuationSummary = await getIssueContinuationSummaryDocument(dbOrTx, issueId);
+      continuationSummaryBody = currentContinuationSummary?.body ?? queuedContinuationSummary ?? null;
       continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
     }
 
