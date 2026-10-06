@@ -14807,20 +14807,31 @@ export function issueRoutes(
           const readiness = await dependencyReadinessSvc.getDependencyReadiness(
             issue.id,
           );
-          const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
-          if (
-            resolvedBlockerIssueId &&
-            readiness.isDependencyReady &&
-            readiness.blockerIssueIds.length > 0
-          ) {
+          // An empty ready set is actionable only when this PATCH removed a
+          // dependency from blocked work. Otherwise an unrelated empty-list
+          // update could wake an issue blocked for a different reason.
+          const removedBlockerIssueId =
+            existing.status === "blocked" &&
+            Array.isArray(req.body.blockedByIssueIds)
+              ? existingRelations?.blockedBy.find(
+                  (blocker) => !req.body.blockedByIssueIds.includes(blocker.id),
+                )?.id
+              : undefined;
+          const resolvedBlockerIssueId =
+            readiness.blockerIssueIds[0] ?? removedBlockerIssueId;
+          if (resolvedBlockerIssueId && readiness.isDependencyReady) {
             await addDependencyResolvedWakeup({
               agentId: issue.assigneeAgentId!,
               dependentIssueId: issue.id,
               resolvedBlockerIssueId,
               blockerIssueIds: readiness.blockerIssueIds,
               blockedTransitionAt: issue.blockedTransitionAt,
-              source: "issue.blockers_restored",
-              mutation: "blocked_dependency_restored",
+              source: removedBlockerIssueId
+                ? "issue.blockers_removed"
+                : "issue.blockers_restored",
+              mutation: removedBlockerIssueId
+                ? "blocked_dependency_removed"
+                : "blocked_dependency_restored",
             });
           }
         }

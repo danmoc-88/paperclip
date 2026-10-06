@@ -30,6 +30,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -644,7 +645,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(noActiveRuns).toBe(true);
   });
 
-  it("defers issue_blockers_resolved as a follow-up when the same issue is already running", async () => {
+  it.each(["running", "queued"] as const)("does not duplicate a %s run after the last blocker was removed", async (runStatus) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockerId = randomUUID();
@@ -677,7 +678,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       id: activeRunId,
       companyId,
       agentId,
-      status: "running",
+      status: runStatus,
       invocationSource: "on_demand",
       contextSnapshot: {
         issueId: blockedIssueId,
@@ -703,20 +704,17 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         executionLockedAt: new Date(),
       },
     ]);
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: blockedIssueId,
-      type: "blocks",
-    });
-    runningProcesses.set(activeRunId, {
+    // PATCH removed the final edge; readiness now has an empty blocker set.
+    if (runStatus === "running") runningProcesses.set(activeRunId, {
       child: {} as import("node:child_process").ChildProcess,
       graceSec: 1,
       processGroupId: null,
     });
 
-    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerId}`;
-    const wake = await heartbeat.wakeup(agentId, {
+    const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId, blockerIssueIds: [],
+    });
+    const wakeOptions = {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_blockers_resolved",
@@ -730,7 +728,9 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         wakeReason: "issue_blockers_resolved",
         resolvedBlockerIssueId: blockerId,
       },
-    });
+    } as const;
+    const wake = await heartbeat.wakeup(agentId, wakeOptions);
+    await heartbeat.wakeup(agentId, wakeOptions);
 
     expect(wake).toBeNull();
 
@@ -752,6 +752,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         runId: null,
       }),
     ]);
+
+    const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+    expect(runs).toEqual([{ id: activeRunId }]);
 
     runningProcesses.delete(activeRunId);
     await db
