@@ -331,6 +331,41 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("accepts a cancelled-before-start settlement only with blocked evidence and no replay", () => {
+    const evidence = {
+      runId: "7d8c2a4e-1b3f-4a6d-9c8e-2f5b6a7c8d9e",
+      providerStopped: true as const,
+      actionOutcome: "not_performed" as const,
+      outcomeEvidence: "The queued run was cancelled before a provider started.",
+    };
+    expect(resolveIssueRecoveryActionSchema.parse({
+      actionId: "6c7b1a3d-0a2e-495c-8b7d-1e4a596b7c8d",
+      outcome: "blocked",
+      sourceIssueStatus: "in_review",
+      preserveWithoutReplay: true,
+      executionReconciliation: evidence,
+    })).toMatchObject({ preserveWithoutReplay: true, sourceIssueStatus: "in_review" });
+    expect(resolveIssueRecoveryActionSchema.safeParse({
+      outcome: "blocked",
+      sourceIssueStatus: "in_review",
+      preserveWithoutReplay: true,
+      executionReconciliation: evidence,
+    }).success).toBe(false);
+    expect(resolveIssueRecoveryActionSchema.safeParse({
+      actionId: "6c7b1a3d-0a2e-495c-8b7d-1e4a596b7c8d",
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+      preserveWithoutReplay: true,
+      executionReconciliation: evidence,
+    }).success).toBe(false);
+    expect(resolveIssueRecoveryActionSchema.safeParse({
+      actionId: "6c7b1a3d-0a2e-495c-8b7d-1e4a596b7c8d",
+      outcome: "blocked",
+      sourceIssueStatus: "blocked",
+      preserveWithoutReplay: true,
+    }).success).toBe(false);
+  });
+
   it("rejects recovery outcomes that are not supported by the source-scoped resolution endpoint", () => {
     expect(
       resolveIssueRecoveryActionSchema.safeParse({

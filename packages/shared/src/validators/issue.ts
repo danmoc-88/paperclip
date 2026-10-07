@@ -578,9 +578,40 @@ export const resolveIssueRecoveryActionSchema = z
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
     sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
     resolutionNote: multilineTextSchema.optional().nullable(),
+    preserveWithoutReplay: z.literal(true).optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.preserveWithoutReplay) {
+      if (!value.actionId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A cancelled-before-start settlement must name the current recovery action.",
+          path: ["actionId"],
+        });
+      }
+      if (!value.executionReconciliation) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A cancelled-before-start settlement requires outcome evidence.",
+          path: ["executionReconciliation"],
+        });
+      } else if (value.executionReconciliation.actionOutcome !== "not_performed") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A cancelled-before-start settlement can record only that the provider did not perform the action.",
+          path: ["executionReconciliation", "actionOutcome"],
+        });
+      }
+      if (value.outcome !== "blocked") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A cancelled-before-start settlement keeps the recovery outcome blocked and does not restore or cancel the task.",
+          path: ["outcome"],
+        });
+      }
+      return;
+    }
     if (value.outcome === "restored") {
       if (
         value.sourceIssueStatus !== "todo" &&

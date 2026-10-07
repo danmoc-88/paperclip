@@ -33,6 +33,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -1777,6 +1778,219 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       nextAction: "Repair the worktree, then return the issue to the coder.",
       routingFallbackReason: null,
     });
+  });
+
+  async function seedCancelledBeforeStart(issueStatus: "in_review" | "blocked" = "in_review") {
+    const fixture = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssueId } = fixture;
+    await db.update(issues).set({ status: issueStatus, assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "cancelled",
+      startedAt: null,
+      finishedAt: new Date("2026-10-02T15:11:55.847Z"),
+      errorCode: "issue_continuation_waiting_on_review",
+      runtimeMode: "legacy",
+      contextSnapshot: { issueId: sourceIssueId },
+      resultJson: {
+        stopReason: "issue_continuation_waiting_on_review",
+        timeoutSource: "stale_queued_run_gate",
+        timeoutFired: false,
+      },
+    });
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId,
+      kind: "active_run_watchdog",
+      status: "resolved",
+      outcome: "blocked",
+      ownerType: "board",
+      returnOwnerAgentId: coderId,
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Automatic recovery stopped.",
+      resolvedAt: new Date("2026-10-02T15:12:35.731Z"),
+      evidence: {
+        runId,
+        sourceRunId: runId,
+        automaticRecovery: {
+          policy: "preserve_without_replay_v1",
+          replay: "blocked",
+          actionOutcome: "unknown",
+          recordedAt: "2026-10-02T15:12:35.731Z",
+        },
+      },
+    }).returning();
+    const outcomeEvidence = "The queued run was cancelled before a provider started. Recorded source work stays in place.";
+    const body = {
+      actionId: action!.id,
+      outcome: "blocked" as const,
+      sourceIssueStatus: issueStatus,
+      preserveWithoutReplay: true as const,
+      executionReconciliation: {
+        runId,
+        providerStopped: true as const,
+        actionOutcome: "not_performed" as const,
+        outcomeEvidence,
+      },
+    };
+    return { ...fixture, runId, action: action!, body, outcomeEvidence };
+  }
+
+  async function expectCancelledHoldRemains(
+    seeded: Awaited<ReturnType<typeof seedCancelledBeforeStart>>,
+    send: Record<string, unknown> = seeded.body,
+    status = 409,
+  ) {
+    const response = await request(createApp()).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send(send).expect(status);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+    expect(issue).toMatchObject({ status: seeded.body.sourceIssueStatus, assigneeAgentId: seeded.managerId });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id));
+    expect(action!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+    expect(action!.evidence).not.toHaveProperty("executionReconciliation");
+    return response;
+  }
+
+  it.each(["in_review", "blocked"] as const)("settles a verified cancelled-before-start hold without replay or a status change: %s", async (issueStatus) => {
+    const seeded = await seedCancelledBeforeStart(issueStatus);
+    const app = createApp();
+    const resolved = await request(app).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send(seeded.body).expect(200);
+    expect(resolved.body.issue.status).toBe(issueStatus);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+    expect(issue).toMatchObject({ status: issueStatus, assigneeAgentId: seeded.managerId });
+    expect(issue!.assigneeAgentId).not.toBe(seeded.coderId);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id));
+    expect(action).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(action!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(action!.evidence).toMatchObject({
+      continuationDelivery: "preserved",
+      executionReconciliation: {
+        runId: seeded.runId,
+        actionOutcome: "not_performed",
+        outcomeEvidence: seeded.outcomeEvidence,
+      },
+      cancelledBeforeStartSettlement: { preservedStatus: issueStatus, preservedAssigneeAgentId: seeded.managerId },
+    });
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.sourceIssueId)).toBeNull();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
+    await deliverReconciledExecutions(db, async () => { throw new Error("replay"); });
+    const repeated = await request(app).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send(seeded.body).expect(200);
+    expect(repeated.body.issue.status).toBe(issueStatus);
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id));
+    expect(after).toEqual(action);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.sourceIssueId));
+    expect(activity.filter((row) => row.action === "issue.recovery_action_resolved")).toHaveLength(1);
+    expect(activity.filter((row) => row.action === "issue.updated")).toHaveLength(0);
+    const changed = await request(app).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send({
+      ...seeded.body,
+      executionReconciliation: { ...seeded.body.executionReconciliation, outcomeEvidence: "A different account of the same cancelled run cannot replace the recorded evidence." },
+    }).expect(409);
+    expect(changed.body.error).toMatch(/already settled/);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id)))[0]).toEqual(action);
+  });
+
+  it("refuses to settle when the provider started, a live run exists, or the recorded owner or action changed", async () => {
+    const providerWorked = await seedCancelledBeforeStart();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-10-02T15:11:56.000Z") }).where(eq(heartbeatRuns.id, providerWorked.runId));
+    const providerResponse = await expectCancelledHoldRemains(providerWorked);
+    expect(providerResponse.body.error).toMatch(/not a verified cancelled-before-start/);
+
+    const live = await seedCancelledBeforeStart();
+    await seedHeartbeatRun({ companyId: live.companyId, agentId: live.coderId, runId: randomUUID(), issueId: live.sourceIssueId, status: "running" });
+    const liveResponse = await expectCancelledHoldRemains(live);
+    expect(liveResponse.body.error).toMatch(/live run/);
+
+    const checkedOut = await seedCancelledBeforeStart();
+    await db.update(issues).set({ checkoutRunId: checkedOut.runId }).where(eq(issues.id, checkedOut.sourceIssueId));
+    const checkoutResponse = await expectCancelledHoldRemains(checkedOut);
+    expect(checkoutResponse.body.error).toMatch(/live run/);
+
+    const changedOwner = await seedCancelledBeforeStart();
+    await db.update(issueRecoveryActions).set({ returnOwnerAgentId: changedOwner.managerId }).where(eq(issueRecoveryActions.id, changedOwner.action.id));
+    const ownerResponse = await expectCancelledHoldRemains(changedOwner);
+    expect(ownerResponse.body.error).toMatch(/owner changed/);
+
+    const changedAction = await seedCancelledBeforeStart();
+    await db.update(issueRecoveryActions).set({ fingerprint: `legacy-execution:${randomUUID()}` }).where(eq(issueRecoveryActions.id, changedAction.action.id));
+    const actionResponse = await expectCancelledHoldRemains(changedAction);
+    expect(actionResponse.body.error).toMatch(/recovery action changed/);
+
+    const home = await seedCancelledBeforeStart();
+    const other = await seedCompany();
+    const foreignRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: foreignRunId,
+      companyId: other.companyId,
+      agentId: other.coderId,
+      invocationSource: "automation",
+      status: "cancelled",
+      startedAt: null,
+      finishedAt: new Date("2026-10-04T22:01:20.111Z"),
+      errorCode: "issue_continuation_waiting_on_review",
+      runtimeMode: "legacy",
+      contextSnapshot: { issueId: other.sourceIssueId },
+      resultJson: {
+        stopReason: "issue_continuation_waiting_on_review",
+        timeoutSource: "stale_queued_run_gate",
+        timeoutFired: false,
+      },
+    });
+    await db.update(issueRecoveryActions).set({
+      fingerprint: `legacy-execution:${foreignRunId}`,
+      evidence: {
+        runId: foreignRunId,
+        automaticRecovery: { replay: "blocked", actionOutcome: "unknown" },
+      },
+    }).where(eq(issueRecoveryActions.id, home.action.id));
+    const foreignResponse = await expectCancelledHoldRemains(home, {
+      ...home.body,
+      executionReconciliation: { ...home.body.executionReconciliation, runId: foreignRunId },
+    });
+    expect(foreignResponse.body.error).toMatch(/owner changed|action changed/);
+  });
+
+  it("refuses a cancelled-before-start settlement without evidence, from an agent, or through the replay path", async () => {
+    const missing = await seedCancelledBeforeStart();
+    const withoutEvidence = { ...missing.body, executionReconciliation: undefined };
+    await expectCancelledHoldRemains(missing, withoutEvidence, 400);
+
+    const agent = await seedCancelledBeforeStart();
+    const agentRunId = randomUUID();
+    await seedHeartbeatRun({
+      companyId: agent.companyId,
+      agentId: agent.managerId,
+      runId: agentRunId,
+      issueId: agent.sourceIssueId,
+      status: "running",
+    });
+    const agentApp = createApp({
+      type: "agent",
+      agentId: agent.managerId,
+      companyId: agent.companyId,
+      runId: agentRunId,
+      source: "agent_jwt",
+    });
+    const agentResponse = await request(agentApp).post(`/api/issues/${agent.sourceIssueId}/recovery-actions/resolve`).send(agent.body).expect(403);
+    expect(agentResponse.body.error).toMatch(/Board access required/);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, agent.action.id)))[0]!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+
+    const replay = await seedCancelledBeforeStart();
+    const replayResponse = await request(createApp()).post(`/api/issues/${replay.sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: replay.action.id,
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+      executionReconciliation: replay.body.executionReconciliation,
+    }).expect(409);
+    expect(replayResponse.body.error).toMatch(/cannot be replayed/);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, replay.sourceIssueId));
+    expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: replay.managerId });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, replay.action.id)))[0]!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+    await deliverReconciledExecutions(db, async () => { throw new Error("replay"); });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, replay.companyId))).toHaveLength(0);
   });
 
   it("accepts new verified evidence after an automatic no-replay disposition without reopening on duplicate requests", async () => {

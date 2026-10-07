@@ -4,7 +4,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -570,4 +571,108 @@ export async function settleUnrecoverableExecutions(
       );
     }
   }
+}
+
+const TERMINAL_RUN_STATUSES = ["succeeded", "completed", "failed", "timed_out", "interrupted", "cancelled"];
+
+/** Board evidence for one verified review-wait cancellation. This does not wake or replay. */
+export async function verifiedCancelledBeforeStartRun(db: Db, companyId: string, runId: string) {
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
+  ));
+  return Boolean(run && await isPreDispatchReviewWaitVerified(db, run));
+}
+
+function recordedSettlement(evidence: Record<string, unknown>, decision: ExecutionReconciliation) {
+  const current = evidence.executionReconciliation;
+  if (!current || typeof current !== "object") return "absent" as const;
+  const value = current as Record<string, unknown>;
+  const same = value.runId === decision.runId && value.providerStopped === true
+    && value.actionOutcome === decision.actionOutcome && value.outcomeEvidence === decision.outcomeEvidence;
+  return same ? "same" as const : "different" as const;
+}
+
+export async function settleCancelledBeforeStartHold(input: {
+  db: Db;
+  issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; executionRunId: string | null; checkoutRunId: string | null };
+  actionId: string;
+  decision: ExecutionReconciliation;
+  actorId: string;
+  resolutionNote?: string | null;
+}) {
+  const { db, issue, decision } = input;
+  const [action] = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.id, input.actionId),
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.sourceIssueId, issue.id),
+  )).for("update");
+  if (!action) throw conflict("Active recovery action not found");
+  if (action.fingerprint !== `legacy-execution:${decision.runId}`
+    || (action.evidence.runId ?? action.evidence.sourceRunId) !== decision.runId) {
+    throw conflict("The recovery action changed. Inspect the current hold before continuing.");
+  }
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, decision.runId),
+  )).for("update");
+  if (!run || run.agentId !== action.returnOwnerAgentId
+    || (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issue.id) {
+    throw conflict("The recovery source or task owner changed. Inspect the current execution before continuing.");
+  }
+  const evidence = action.evidence as Record<string, unknown>;
+  const recorded = recordedSettlement(evidence, decision);
+  if (recorded === "same" && evidence.continuationDelivery === "preserved") {
+    return { action, idempotent: true as const };
+  }
+  if (recorded !== "absent") {
+    throw conflict("This recovery event was already settled. A repeated event cannot change the recorded outcome.");
+  }
+  if (issue.executionRunId || issue.checkoutRunId) {
+    throw conflict("A live run still holds this task. Stop it before settling the cancelled run.");
+  }
+  const [live] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId),
+    notInArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
+    or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+  )).limit(1);
+  if (live) throw conflict("A live run still holds this task. Stop it before settling the cancelled run.");
+  if (!(await isPreDispatchReviewWaitVerified(db, run))) {
+    throw conflict("This run is not a verified cancelled-before-start review wait. Provider work or missing proof keeps the hold.");
+  }
+  const automatic = evidence.automaticRecovery as { replay?: string } | undefined;
+  if (automatic?.replay !== "blocked") {
+    throw conflict("Verified outcomes must settle the current no-replay hold.");
+  }
+  const [otherActive] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.sourceIssueId, issue.id),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+  )).limit(1);
+  if (otherActive) throw conflict("Another active recovery action still holds this task.");
+  const retained = { ...evidence };
+  delete retained.automaticRecovery;
+  const recordedAt = new Date().toISOString();
+  const [updated] = await db.update(issueRecoveryActions).set({
+    evidence: {
+      ...retained,
+      executionReconciliation: { ...decision, actorId: input.actorId, recordedAt },
+      continuationDelivery: "preserved",
+      cancelledBeforeStartSettlement: {
+        runId: decision.runId,
+        fingerprint: action.fingerprint,
+        preservedStatus: issue.status,
+        preservedAssigneeAgentId: issue.assigneeAgentId,
+        recordedAt,
+      },
+    },
+    nextAction: "Verified cancelled-before-start. Recorded work stays in place and this run was not replayed.",
+    resolutionNote: input.resolutionNote ?? action.resolutionNote,
+    updatedAt: new Date(),
+  }).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.id, action.id),
+    sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+    sql`${issueRecoveryActions.evidence}->'executionReconciliation' is null`,
+  )).returning();
+  if (!updated) throw conflict("This recovery event was already settled. A repeated event cannot change the recorded outcome.");
+  return { action: updated, idempotent: false as const };
 }
