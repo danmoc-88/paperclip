@@ -3,6 +3,10 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  chatActions,
+  chatEndpoints,
+  toolApplications,
+  toolConnections,
   agents,
   authUsers,
   companyMemberships,
@@ -34,6 +38,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { slackDecisionResolutionService, type SlackDecisionAction } from "../services/slack-decision-resolution.js";
+import { loadSlackDecisionDisclosure, slackDecisionDisclosureService } from "../services/slack-decision-disclosures.js";
 import { slackDecisionSourceDigest } from "../services/slack-decision-policy.js";
 import { agentService } from "../services/agents.js";
 
@@ -72,6 +77,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(goals);
+    await db.delete(chatActions);
+    await db.delete(chatEndpoints);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(agents);
     await db.delete(instanceSettings);
     await db.delete(companyMemberships);
@@ -310,7 +319,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         } : { version: 1, prompt: "Use this direction?" },
       } as Parameters<typeof interactionsSvc.create>[1], { userId: "local-board" });
       const action: SlackDecisionAction = {
-        id: randomUUID(), companyId, issueId, interactionId: interaction.id,
+        id: randomUUID(), companyId, endpointId: randomUUID(), issueId, interactionId: interaction.id,
         sourceDigest: slackDecisionSourceDigest(interaction), userId: "local-board",
         workspaceId: "T-test", slackUserId: "U-test", channelId: "C-test", appId: "A-test",
         messageTimestamp: "123.456", operation, receivedAt: new Date(),
@@ -365,6 +374,52 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect(await db.select().from(activityLog).where(eq(activityLog.entityId, action.id))).toHaveLength(1);
     },
   );
+
+  it("loads durable Slack classification, denies stale sources and revocation, and resolves using the protected source", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue();
+    const agentId = randomUUID();
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const endpointId = randomUUID();
+    await db.insert(agents).values({ id: agentId, companyId, name: "Test", role: "operator", adapterType: "process" });
+    await db.insert(toolApplications).values({ id: applicationId, companyId, applicationKey: `test-${applicationId}`, name: "Test", type: "chat" });
+    await db.insert(toolConnections).values({ id: connectionId, companyId, applicationId, name: "Test", uid: connectionId,
+      connectionPurpose: "channel", transport: "chat_sdk" });
+    await db.insert(chatEndpoints).values({ id: endpointId, companyId, connectionId, provider: "slack",
+      publicId: randomUUID(), assignedAgentId: agentId });
+    const interaction = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation", resolverPolicy: "human_only", continuationPolicy: "none",
+      payload: { version: 1, prompt: "Use this direction?" },
+    }, { userId: "local-board" });
+    const scope = { companyId, endpointId, interactionId: interaction.id };
+    const disclosure = { sourceDigest: slackDecisionSourceDigest(interaction), topic: "product_direction",
+      expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    const service = slackDecisionDisclosureService(db);
+    expect(await loadSlackDecisionDisclosure(db, scope)).toBeNull();
+    await expect(service.update(endpointId, interaction.id, { disclosure: { ...disclosure, sourceDigest: "0".repeat(64) } }, "local-board")).rejects.toThrow("card changed");
+    expect(await db.select().from(chatActions)).toHaveLength(0);
+    await service.update(endpointId, interaction.id, { disclosure }, "local-board");
+    expect(await loadSlackDecisionDisclosure(db, scope)).toMatchObject(disclosure);
+    expect(await loadSlackDecisionDisclosure(db, { ...scope, companyId: randomUUID() })).toBeNull();
+    expect(await loadSlackDecisionDisclosure(db, { ...scope, endpointId: randomUUID() })).toBeNull();
+    const action: SlackDecisionAction = { id: randomUUID(), ...scope, issueId, userId: "local-board",
+      workspaceId: "T-test", slackUserId: "U-test", channelId: "C-test", appId: "A-test",
+      sourceDigest: disclosure.sourceDigest, messageTimestamp: "123.456", operation: "accept", receivedAt: new Date() };
+    const authorizeAndConsume = vi.fn(async () => {});
+    const resolver = slackDecisionResolutionService(db, { enabled: true, authorizeAndConsume });
+    await service.update(endpointId, interaction.id, { disclosure: null }, "local-board");
+    expect(await loadSlackDecisionDisclosure(db, scope)).toBeNull();
+    await expect(resolver.resolve(action, {})).rejects.toThrow("requires a response in MyDay");
+    expect(authorizeAndConsume).not.toHaveBeenCalled();
+    await service.update(endpointId, interaction.id, { disclosure }, "local-board");
+    expect(await db.select().from(chatActions)).toHaveLength(1);
+    await resolver.resolve(action, {});
+    expect((await interactionsSvc.getById(interaction.id))?.status).toBe("accepted");
+    expect(authorizeAndConsume).toHaveBeenCalledOnce();
+    const audit = await db.select().from(activityLog).where(eq(activityLog.action, "slack.decision_disclosure_updated"));
+    expect(audit).toHaveLength(3);
+    expect(JSON.stringify(audit)).not.toContain("Use this direction?");
+  });
 
   it("persists and answers a canonical-only mixed question form", async () => {
     const { companyId, issueId } = await seedSourceQuestionFixture({});

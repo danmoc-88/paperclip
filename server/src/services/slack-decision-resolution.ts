@@ -1,3 +1,4 @@
+import { loadSlackDecisionDisclosure } from "./slack-decision-disclosures.js";
 import { activityLog, type Db } from "@paperclipai/db";
 import type { IssueThreadInteraction } from "@paperclipai/shared";
 import { issueThreadInteractionService, type InteractionResolutionMutationOptions } from "./issue-thread-interactions.js";
@@ -14,6 +15,7 @@ type Transaction = Parameters<NonNullable<InteractionResolutionMutationOptions["
 export interface SlackDecisionAction {
   id: string;
   companyId: string;
+  endpointId: string;
   issueId: string;
   interactionId: string;
   sourceDigest: string;
@@ -30,7 +32,7 @@ export interface SlackDecisionAction {
 export interface SlackDecisionResolutionDependencies {
   enabled: boolean;
   /** Protected disclosure policy; must not read classification from card payloads. */
-  loadDisclosure: (db: Db | Transaction, action: SlackDecisionAction) => Promise<SlackDecisionDisclosure | null>;
+  loadDisclosure?: (db: Db | Transaction, action: SlackDecisionAction) => Promise<SlackDecisionDisclosure | null>;
   /** Recheck current membership, configured identity/route and expiry, then claim
    * the opaque action exactly once in this transaction. Throw on any mismatch.
    * The transport implementing this contract is supplied in the adapter PR. */
@@ -42,6 +44,8 @@ export interface SlackDecisionResolutionDependencies {
 export function slackDecisionResolutionService(db: Db, dependencies: SlackDecisionResolutionDependencies) {
   const interactions = issueThreadInteractionService(db);
   const now = dependencies.now ?? (() => new Date());
+  const loadDisclosure = dependencies.loadDisclosure ?? ((reader, action) =>
+    loadSlackDecisionDisclosure(reader, action, reader !== db));
   return {
     async resolve(action: SlackDecisionAction, input: unknown) {
       if (dependencies.enabled !== true || !Number.isFinite(action.receivedAt.getTime())) {
@@ -53,7 +57,7 @@ export function slackDecisionResolutionService(db: Db, dependencies: SlackDecisi
       }
       const context = {
         companyId: action.companyId, userId: action.userId, now: now(),
-        disclosure: await dependencies.loadDisclosure(db, action),
+        disclosure: await loadDisclosure(db, action),
       };
       const mapped = mapSlackDecisionResolution(current, context, action.operation, input);
       let checked: IssueThreadInteraction | null = null;
@@ -61,7 +65,7 @@ export function slackDecisionResolutionService(db: Db, dependencies: SlackDecisi
         validateLockedInteraction: async (tx, locked) => {
           if (slackDecisionSourceDigest(locked) !== action.sourceDigest) throw new SlackDecisionPolicyError();
           const lockedMapping = mapSlackDecisionResolution(locked, {
-            ...context, now: now(), disclosure: await dependencies.loadDisclosure(tx, action),
+            ...context, now: now(), disclosure: await loadDisclosure(tx, action),
           }, action.operation, input);
           if (JSON.stringify(lockedMapping) !== JSON.stringify(mapped)) throw new SlackDecisionPolicyError();
           await dependencies.authorizeAndConsume(tx, action);
