@@ -197,3 +197,40 @@ apps without that scope require reinstalling with the updated manifest. Other
 people's bot DMs remain inaccessible. Scheduling uses ordinary Paperclip routines,
 not a Slack-specific timer. Routine results are sent explicitly through the tool;
 ordinary task finals are not automatically broadcast to Slack.
+
+## Decision publication policy foundation
+
+The separate company decision publication helper currently prepares copy only.
+It does not enqueue messages, create callback actions, or enable a company route.
+The existing agent/conversation publication ownership checks still apply.
+
+Before source content can appear in a decision publication, a signed-in Board
+user with company access and `tools:manage_connections` must classify the exact
+card through
+`PUT /api/chat-endpoints/:endpointId/slack/decision-disclosures/:interactionId`.
+The body contains `disclosure` with `sourceDigest`, `topic` (`product_direction`
+or `implementation_plan`), and `expiresAt`. The digest comes from the server's
+`slackDecisionSourceDigest` helper. Classification requires reviewing every
+source field for disclosure; it cannot be inferred from keywords. Sending
+`{"disclosure": null}` revokes the classification. Both operations are audited.
+There is no classification UI or automatic classifier in this foundation.
+
+Classification records use a separate kind in the existing `chat_actions`
+ledger. An absent, expired, revoked, or outdated classification produces neutral
+copy with a canonical card link. Forbidden targets and unknown card kinds also
+use that fallback. Long cards fall back to the link instead of truncating a
+consequence while retaining a decision action. No document is fetched from a
+source link, and no free-text answer is copied into the publication.
+
+The decision resolver is disabled unless its caller explicitly enables it and
+supplies a transactional authorization/action-consumption hook. It calls the
+canonical interaction service and rechecks classification under its transaction
+lock. Resolution and the Slack audit commit together. The audit retains provider
+IDs, the operation, and the plan revision, but excludes answer text and rejection
+reasons. The canonical service expires stale plan targets and permits only one
+terminal resolution when the panel and callbacks race.
+
+Provider identity/signature checks, one-use action issuance, modals, company
+routing, historical delivery deduplication, and transport retry are not wired to
+this helper yet. The policy tests and isolated database tests establish these
+internal contracts; they do not establish a live Slack integration.
