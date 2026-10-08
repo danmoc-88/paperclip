@@ -378,3 +378,18 @@ resolver defaults to this protected source and retains a shared record lock
 through the canonical decision transaction. Revoked, missing, malformed,
 expired or source-mismatched classifications fail closed to the MyDay card.
 No new database schema or production migration is introduced.
+
+The company publication helper prepares copy without enqueueing messages or
+issuing actions. Long cards use a neutral canonical link instead of truncating
+consequences. It does not fetch documents behind source links.
+
+Resolution and the Slack audit commit together through the canonical interaction
+service. The audit retains provider IDs, operation, and plan revision, but excludes
+answer text and rejection reasons. Stale plan targets expire; panel/callback races
+permit one terminal resolution. The transport must supply a transactional
+authorization/action-consumption hook before enabling the resolver.
+
+Provider identity/signature checks, one-use action issuance, modals, company
+routing, historical delivery deduplication, and transport retry are not wired to
+this helper yet. The policy tests and isolated database tests establish these
+internal contracts; they do not establish a live Slack integration.
