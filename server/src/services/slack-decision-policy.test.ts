@@ -5,6 +5,7 @@ import {
   isSlackDecisionAllowed,
   mapSlackDecisionResolution,
   projectSlackDecision,
+  projectSlackDecisionPublication,
   slackDecisionSourceDigest,
   type SlackDecisionPolicyContext,
 } from "./slack-decision-policy.js";
@@ -272,5 +273,41 @@ describe("Slack question disclosure surfaces", () => {
     const source = card();
     source.payload.detailsMarkdown = "TAK: <internal>important effect</internal> visible effect";
     expect(projectSlackDecision(source, context(source), origin)?.mode).toBe("link_only");
+  });
+});
+
+
+describe("Slack provider publication boundary", () => {
+  it("preserves source consequences and the canonical link in every transport surface", () => {
+    const source = card();
+    const prepared = projectSlackDecisionPublication(source, context(source), origin)!;
+    expect(prepared.mode).toBe("decision");
+    expect(prepared.payload.text).toContain(source.payload.detailsMarkdown);
+    expect(prepared.payload.card!.body).toContain(source.payload.detailsMarkdown);
+    const url = `${origin}/issues/${source.issueId}#interaction-${source.id}`;
+    expect(prepared.payload.text).toContain(url);
+    expect(prepared.payload.card!.actions).toEqual([{ type: "link", label: "Otwórz kartę", url }]);
+    expect(prepared.payload.attachmentIds).toBeUndefined();
+  });
+
+  it.each(["missing", "stale", "restricted", "oversize"])("uses neutral link-only copy for %s policy", (reason) => {
+    const source = card();
+    const policy = context(source);
+    if (reason === "missing") policy.disclosure = null;
+    if (reason === "stale") source.payload.prompt = "Zmienione pytanie";
+    if (reason === "restricted") source.payload.detailsMarkdown = "Budżet: 100 PLN";
+    if (reason === "oversize") source.payload.detailsMarkdown = "A".repeat(2801);
+    if (reason === "restricted" || reason === "oversize") policy.disclosure!.sourceDigest = slackDecisionSourceDigest(source);
+    const prepared = projectSlackDecisionPublication(source, policy, origin)!;
+    expect(prepared.mode).toBe("link_only");
+    expect(prepared.payload.card!.kind).toBe("status");
+    expect(JSON.stringify(prepared.payload)).not.toContain(source.payload.prompt);
+    expect(JSON.stringify(prepared.payload)).not.toContain(source.payload.detailsMarkdown);
+    expect(prepared.payload.card!.actions!.every((action) => action.type === "link")).toBe(true);
+  });
+
+  it("does not prepare a publication without a public canonical link", () => {
+    const source = card();
+    expect(projectSlackDecisionPublication(source, context(source), "http://localhost:3100")).toBeNull();
   });
 });

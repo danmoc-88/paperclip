@@ -39,6 +39,7 @@ import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { slackDecisionResolutionService, type SlackDecisionAction } from "../services/slack-decision-resolution.js";
 import { loadSlackDecisionDisclosure, slackDecisionDisclosureService } from "../services/slack-decision-disclosures.js";
+import { prepareSlackDecisionPublication } from "../services/chat-interaction-publications.js";
 import { slackDecisionSourceDigest } from "../services/slack-decision-policy.js";
 import { agentService } from "../services/agents.js";
 
@@ -395,11 +396,20 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const disclosure = { sourceDigest: slackDecisionSourceDigest(interaction), topic: "product_direction",
       expiresAt: new Date(Date.now() + 60_000).toISOString() };
     const service = slackDecisionDisclosureService(db);
+    const route = { companyId, endpointId, userId: "local-board", publicBaseUrl: "https://myday.example.com" };
+    expect((await prepareSlackDecisionPublication(db, interaction, route))?.mode).toBe("link_only");
+    expect(await prepareSlackDecisionPublication(db, interaction, { ...route, companyId: randomUUID() })).toBeNull();
     expect(await loadSlackDecisionDisclosure(db, scope)).toBeNull();
     await expect(service.update(endpointId, interaction.id, { disclosure: { ...disclosure, sourceDigest: "0".repeat(64) } }, "local-board")).rejects.toThrow("card changed");
     expect(await db.select().from(chatActions)).toHaveLength(0);
     await service.update(endpointId, interaction.id, { disclosure }, "local-board");
     expect(await loadSlackDecisionDisclosure(db, scope)).toMatchObject(disclosure);
+    const publication = await prepareSlackDecisionPublication(db, interaction, route);
+    expect(publication?.mode).toBe("decision");
+    expect(publication?.payload.text).toContain("Use this direction?");
+    expect(publication?.payload.card?.actions).toEqual([{ type: "link", label: "Otwórz kartę",
+      url: `https://myday.example.com/issues/${issueId}#interaction-${interaction.id}` }]);
+    expect((await prepareSlackDecisionPublication(db, interaction, { ...route, endpointId: randomUUID() }))?.mode).toBe("link_only");
     expect(await loadSlackDecisionDisclosure(db, { ...scope, companyId: randomUUID() })).toBeNull();
     expect(await loadSlackDecisionDisclosure(db, { ...scope, endpointId: randomUUID() })).toBeNull();
     const action: SlackDecisionAction = { id: randomUUID(), ...scope, issueId, userId: "local-board",
@@ -408,6 +418,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const authorizeAndConsume = vi.fn(async () => {});
     const resolver = slackDecisionResolutionService(db, { enabled: true, authorizeAndConsume });
     await service.update(endpointId, interaction.id, { disclosure: null }, "local-board");
+    expect((await prepareSlackDecisionPublication(db, interaction, route))?.mode).toBe("link_only");
     expect(await loadSlackDecisionDisclosure(db, scope)).toBeNull();
     await expect(resolver.resolve(action, {})).rejects.toThrow("requires a response in MyDay");
     expect(authorizeAndConsume).not.toHaveBeenCalled();
@@ -415,6 +426,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(await db.select().from(chatActions)).toHaveLength(1);
     await resolver.resolve(action, {});
     expect((await interactionsSvc.getById(interaction.id))?.status).toBe("accepted");
+    expect(await prepareSlackDecisionPublication(db, (await interactionsSvc.getById(interaction.id))!, route)).toBeNull();
     expect(authorizeAndConsume).toHaveBeenCalledOnce();
     const audit = await db.select().from(activityLog).where(eq(activityLog.action, "slack.decision_disclosure_updated"));
     expect(audit).toHaveLength(3);

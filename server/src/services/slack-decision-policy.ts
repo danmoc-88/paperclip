@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { IssueThreadInteraction } from "@paperclipai/shared";
 import { rejectIssueThreadInteractionSchema, respondIssueThreadInteractionSchema } from "@paperclipai/shared";
-import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
+import { projectSafeChatPublication, projectSafeChatPublicationText } from "./chat-publication-projection.js";
 import { safeChatTaskUrl } from "./chat-task-url.js";
 
 /**
@@ -180,6 +180,37 @@ export function projectSlackDecision(
   // oversize cards are link-only. Never truncate and leave executable buttons.
   if (title.length > 150 || sections.some((section) => section.length > 2800) || text.length > 6000) return fallback;
   return { mode: "decision", title, sections, text, cardUrl };
+}
+
+/** Provider-bound copy for the separate company decision route. This does not
+ * issue callback actions: authenticated, one-use actions belong to the adapter.
+ * Keep the generic redaction boundary, then restore only the locally generated
+ * card anchor (generic URL sanitization deliberately removes arbitrary hashes).
+ */
+export function projectSlackDecisionPublication(
+  interaction: IssueThreadInteraction,
+  context: SlackDecisionPolicyContext,
+  publicBaseUrl: string,
+) {
+  const projection = projectSlackDecision(interaction, context, publicBaseUrl);
+  if (!projection) return null;
+  const payload = projectSafeChatPublication({
+    classification: "external", source: "issue_interaction",
+    text: [projection.title, ...projection.sections].join("\n\n"),
+    progressState: "waiting_for_input",
+    interaction: {
+      id: interaction.id,
+      card: {
+        kind: projection.mode === "link_only" ? "status"
+          : interaction.kind === "ask_user_questions" ? "question" : "confirmation",
+        title: projection.title,
+        body: projection.sections.join("\n\n"),
+      },
+    },
+  });
+  payload.text += `\n\nOtwórz kartę: ${projection.cardUrl}`;
+  payload.card!.actions = [{ type: "link", label: "Otwórz kartę", url: projection.cardUrl }];
+  return { mode: projection.mode, payload };
 }
 
 export type SlackDecisionResolution =
