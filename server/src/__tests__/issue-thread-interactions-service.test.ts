@@ -446,6 +446,73 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     },
   );
 
+  it.each(["accept", "reject"] as const)(
+    "binds Slack plan %s to the current revision and refuses a revision published during the callback",
+    async (operation) => {
+      const { companyId, issueId } = await seedConfirmationIssue("Slack plan revision");
+      const target = await attachPlanDocument(companyId, issueId);
+      const actor = { userId: "local-board" };
+      const interaction = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation", resolverPolicy: "human_only", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Use this plan?", target },
+      }, actor);
+      const action: SlackDecisionAction = {
+        id: randomUUID(), companyId, endpointId: randomUUID(), issueId, interactionId: interaction.id,
+        sourceDigest: slackDecisionSourceDigest(interaction), userId: actor.userId,
+        workspaceId: "T-test", slackUserId: "U-test", channelId: "C-test", appId: "A-test",
+        messageTimestamp: "123.456", operation, receivedAt: new Date(),
+      };
+      const disclosure = { companyId, interactionId: interaction.id, sourceDigest: action.sourceDigest,
+        topic: "implementation_plan" as const, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+      const authorizeAndConsume = vi.fn(async () => {});
+      const resolver = slackDecisionResolutionService(db, {
+        enabled: true, authorizeAndConsume,
+        loadDisclosure: async (reader) => {
+          if (reader === db) {
+            // The callback already read the pending card. Publish a new revision
+            // before it enters the transaction, without relying on a sweeper to
+            // expire the card. The canonical resolution gate must catch this.
+            const nextRevisionId = randomUUID();
+            await db.insert(documentRevisions).values({
+              id: nextRevisionId, companyId, documentId: target.documentId,
+              revisionNumber: 2, title: "Plan", format: "markdown", body: "# Revised plan",
+            });
+            await db.update(documents).set({ latestRevisionId: nextRevisionId,
+              latestRevisionNumber: 2, latestBody: "# Revised plan" }).where(eq(documents.id, target.documentId));
+          }
+          return disclosure;
+        },
+      });
+      await expect(resolver.resolve(action, {})).rejects.toThrow();
+      expect(authorizeAndConsume).not.toHaveBeenCalled();
+      expect(await interactionsSvc.getById(interaction.id)).toMatchObject({
+        status: "expired", result: { outcome: "stale_target" },
+      });
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, interaction.id))).toEqual([]);
+
+      const [latest] = await db.select().from(documents).where(eq(documents.id, target.documentId));
+      const fresh = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation", resolverPolicy: "human_only", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Use this plan?", target: {
+          ...target, revisionId: latest.latestRevisionId!, revisionNumber: 2,
+        } },
+      }, actor);
+      const freshAction = { ...action, id: randomUUID(), interactionId: fresh.id,
+        sourceDigest: slackDecisionSourceDigest(fresh) };
+      const currentResolver = slackDecisionResolutionService(db, {
+        enabled: true, authorizeAndConsume,
+        loadDisclosure: async () => ({ ...disclosure, interactionId: fresh.id,
+          sourceDigest: freshAction.sourceDigest }),
+      });
+      await currentResolver.resolve(freshAction, {});
+      expect(authorizeAndConsume).toHaveBeenCalledTimes(1);
+      const [audit] = await db.select().from(activityLog).where(eq(activityLog.entityId, fresh.id));
+      expect(audit).toMatchObject({ action: "slack.decision_resolved", actorId: actor.userId,
+        details: { revisionId: latest.latestRevisionId, operation } });
+      expect((await interactionsSvc.getById(fresh.id))?.status).toBe(operation === "accept" ? "accepted" : "rejected");
+    },
+  );
+
   it("loads durable Slack classification, denies stale sources and revocation, and resolves using the protected source", async () => {
     const { companyId, issueId } = await seedConfirmationIssue();
     const agentId = randomUUID();
