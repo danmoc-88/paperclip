@@ -376,6 +376,76 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     },
   );
 
+  it.each(["accept", "reject", "answer"] as const)(
+    "commits Slack %s only once when callbacks race, and refuses a callback overtaken by the panel",
+    async (operation) => {
+      const { companyId, issueId, goalId } = await seedConfirmationIssue("Concurrent Slack decisions");
+      const issue = { id: issueId, companyId, goalId };
+      const actor = { userId: "local-board" };
+      for (const competitor of ["slack", "panel"] as const) {
+        const interaction = await interactionsSvc.create(issue, operation === "answer" ? {
+          kind: "ask_user_questions", resolverPolicy: "human_only", continuationPolicy: "none",
+          payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single",
+            options: [{ id: "small", label: "Small" }] }] },
+        } : {
+          kind: "request_confirmation", resolverPolicy: "human_only", continuationPolicy: "none",
+          payload: { version: 1, prompt: "Use this direction?" },
+        }, actor);
+        const action: SlackDecisionAction = {
+          id: randomUUID(), companyId, endpointId: randomUUID(), issueId, interactionId: interaction.id,
+          sourceDigest: slackDecisionSourceDigest(interaction), userId: actor.userId,
+          workspaceId: "T-test", slackUserId: "U-test", channelId: "C-test", appId: "A-test",
+          messageTimestamp: "123.456", operation, receivedAt: new Date(),
+        };
+        const disclosure = { companyId, interactionId: interaction.id, sourceDigest: action.sourceDigest,
+          topic: "product_direction" as const, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+        // Hold both initial reads at pending. No timing sleeps: the losing
+        // request must then encounter the winning write inside the real DB gate.
+        const readReady = Promise.withResolvers<void>();
+        const releaseReads = Promise.withResolvers<void>();
+        let reads = 0;
+        const authorizeAndConsume = vi.fn(async () => {});
+        const resolver = slackDecisionResolutionService(db, {
+          enabled: true, authorizeAndConsume,
+          loadDisclosure: async (reader) => {
+            if (reader === db) {
+              if (++reads === (competitor === "slack" ? 2 : 1)) readReady.resolve();
+              await releaseReads.promise;
+            }
+            return disclosure;
+          },
+        });
+        const answers = { answers: [{ questionId: "scope", optionIds: ["small"] }] };
+        const attempts = [resolver.resolve(action, operation === "answer" ? answers : {})];
+        if (competitor === "slack") attempts.push(resolver.resolve(action, operation === "answer" ? answers : {}));
+        // Attach rejection handlers before allowing either transaction to finish.
+        const settled = Promise.allSettled(attempts);
+        await readReady.promise;
+        try {
+          if (competitor === "panel") {
+            if (operation === "answer") await interactionsSvc.answerQuestions(issue, interaction.id, answers, actor);
+            else if (operation === "accept") await interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor);
+            else await interactionsSvc.rejectInteraction(issue, interaction.id, {}, actor);
+          }
+        } finally {
+          releaseReads.resolve();
+        }
+        const results = await settled;
+        const slackWrites = competitor === "slack" ? 1 : 0;
+        expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(slackWrites);
+        expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+        expect(authorizeAndConsume).toHaveBeenCalledTimes(slackWrites);
+        const audits = await db.select().from(activityLog).where(eq(activityLog.entityId, interaction.id));
+        expect(audits.filter((row) => row.action === "slack.decision_resolved")).toHaveLength(slackWrites);
+        expect((await interactionsSvc.getById(interaction.id))?.status)
+          .toBe({ accept: "accepted", reject: "rejected", answer: "answered" }[operation]);
+        const deliveries = await db.select().from(issueQuestionResponseDeliveries)
+          .where(eq(issueQuestionResponseDeliveries.interactionId, interaction.id));
+        expect(deliveries).toHaveLength(operation === "answer" ? 1 : 0);
+      }
+    },
+  );
+
   it("loads durable Slack classification, denies stale sources and revocation, and resolves using the protected source", async () => {
     const { companyId, issueId } = await seedConfirmationIssue();
     const agentId = randomUUID();
