@@ -192,11 +192,16 @@ export type IssueThreadInteractionServiceOptions = {
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type InteractionResolutionMutationOptions = {
+export type InteractionResolutionMutationOptions = {
   /** Confirmation accept/reject nested in an outer transaction must defer these
    * effects and flush them with the root database only after its commit. */
   deferConfirmationCommitEffects?: (effect: (committedDb: Db) => Promise<void>) => void;
   beforeResolveInTransaction?: (tx: DbTransaction) => Promise<void>;
+  /** Provider policy gate after the issue and current interaction are locked. */
+  validateLockedInteraction?: (
+    tx: DbTransaction,
+    interaction: IssueThreadInteraction,
+  ) => Promise<void>;
   afterResolveInTransaction?: (
     tx: DbTransaction,
     interaction: IssueThreadInteraction,
@@ -2219,6 +2224,7 @@ export function issueThreadInteractionService(
       );
 
       const interaction = hydrateInteraction(lockedCurrent);
+      await args.mutationOptions?.validateLockedInteraction?.(tx, interaction);
       const selectedOptionIds =
         interaction.kind === "request_checkbox_confirmation"
           ? resolveSelectedCheckboxConfirmationOptions({
@@ -2496,6 +2502,8 @@ export function issueThreadInteractionService(
         lockedCurrent,
         args.actor,
       );
+
+      await args.mutationOptions?.validateLockedInteraction?.(tx, hydrateInteraction(lockedCurrent));
 
       await resolveLinkedSecretProposal(tx as unknown as Db, lockedCurrent, {
         status: "rejected",
@@ -4962,6 +4970,21 @@ export function issueThreadInteractionService(
       const updated = await db.transaction(async (tx) => {
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await mutationOptions.beforeResolveInTransaction?.(tx);
+        if (mutationOptions.validateLockedInteraction) {
+          // Match confirmation/issue lifecycle lock order for provider actions.
+          const [lockedIssue] = await tx.select().from(issues)
+            .where(eq(issues.id, issue.id)).for("update");
+          if (!lockedIssue || lockedIssue.companyId !== issue.companyId) throw interactionNotFoundError();
+          assertIssueOpenForInteractionResolution(lockedIssue);
+          const [lockedCurrent] = await tx.select().from(issueThreadInteractions)
+            .where(eq(issueThreadInteractions.id, interactionId)).for("update");
+          if (!lockedCurrent || lockedCurrent.companyId !== issue.companyId || lockedCurrent.issueId !== issue.id) {
+            throw interactionNotFoundError();
+          }
+          if (lockedCurrent.status !== "pending") throw interactionTerminalError(lockedCurrent);
+          assertInteractionResolutionAllowed(lockedCurrent, actor);
+          await mutationOptions.validateLockedInteraction(tx, hydrateInteraction(lockedCurrent));
+        }
         const resolvedAt = new Date();
         const [row] = await tx
           .update(issueThreadInteractions)

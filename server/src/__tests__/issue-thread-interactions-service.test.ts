@@ -33,6 +33,8 @@ import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { slackDecisionResolutionService, type SlackDecisionAction } from "../services/slack-decision-resolution.js";
+import { slackDecisionSourceDigest } from "../services/slack-decision-policy.js";
 import { agentService } from "../services/agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -291,6 +293,76 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect(await readInteraction()).toEqual(committed);
       expect(await readAudit()).toHaveLength(1);
       expect(auditAttempts).toBe(2);
+    },
+  );
+
+  it.each(["accept", "reject", "answer"] as const)(
+    "resolves Slack %s with locked policy, atomic action claim and sanitized audit",
+    async (operation) => {
+      const { companyId, issueId, goalId } = await seedConfirmationIssue("Slack resolver");
+      const interaction = await interactionsSvc.create({ id: issueId, companyId, goalId }, {
+        kind: operation === "answer" ? "ask_user_questions" : "request_confirmation",
+        resolverPolicy: "human_only",
+        continuationPolicy: "none",
+        payload: operation === "answer" ? {
+          version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single",
+            allowOther: true, options: [{ id: "small", label: "Small" }] }],
+        } : { version: 1, prompt: "Use this direction?" },
+      } as Parameters<typeof interactionsSvc.create>[1], { userId: "local-board" });
+      const action: SlackDecisionAction = {
+        id: randomUUID(), companyId, issueId, interactionId: interaction.id,
+        sourceDigest: slackDecisionSourceDigest(interaction), userId: "local-board",
+        workspaceId: "T-test", slackUserId: "U-test", channelId: "C-test", appId: "A-test",
+        messageTimestamp: "123.456", operation, receivedAt: new Date(),
+      };
+      const disclosure = {
+        companyId, interactionId: interaction.id, sourceDigest: action.sourceDigest,
+        topic: "product_direction" as const, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      };
+      let authorized = false;
+      let failAfterClaim = true;
+      let lockedReads = 0;
+      let revokeUnderLock = false;
+      const loadDisclosure = async (reader: unknown) => {
+        if (reader !== db) {
+          lockedReads++;
+          if (revokeUnderLock) return null;
+        }
+        return disclosure;
+      };
+      const authorizeAndConsume = async (tx: Parameters<Parameters<typeof slackDecisionResolutionService>[1]["authorizeAndConsume"]>[0]) => {
+        if (!authorized) throw new Error("identity denied");
+        await tx.insert(activityLog).values({ companyId, actorType: "system", actorId: "test",
+          action: "test.action_claim", entityType: "action", entityId: action.id });
+        if (failAfterClaim) throw new Error("claim failed");
+      };
+      const svc = slackDecisionResolutionService(db, { enabled: true, loadDisclosure, authorizeAndConsume });
+      const input = operation === "answer" ? { answers: [{ questionId: "scope", optionIds: [], otherText: "PRIVATE ANSWER" }] }
+        : operation === "reject" ? { reason: "PRIVATE REASON" } : {};
+      await expect(slackDecisionResolutionService(db, { enabled: false, loadDisclosure, authorizeAndConsume })
+        .resolve(action, input)).rejects.toThrow("requires a response in MyDay");
+      await expect(svc.resolve({ ...action, companyId: randomUUID() }, input)).rejects.toThrow();
+      await expect(svc.resolve({ ...action, sourceDigest: "stale" }, input)).rejects.toThrow();
+      await expect(svc.resolve(action, input)).rejects.toThrow("identity denied");
+      authorized = true;
+      revokeUnderLock = true;
+      await expect(svc.resolve(action, input)).rejects.toThrow("requires a response in MyDay");
+      revokeUnderLock = false;
+      await expect(svc.resolve(action, input)).rejects.toThrow("claim failed");
+      expect((await interactionsSvc.getById(interaction.id))?.status).toBe("pending");
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, action.id))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, interaction.id))).toHaveLength(0);
+      failAfterClaim = false;
+      await svc.resolve(action, input);
+      expect((await interactionsSvc.getById(interaction.id))?.status).toBe({ accept: "accepted", reject: "rejected", answer: "answered" }[operation]);
+      const audit = await db.select().from(activityLog).where(eq(activityLog.entityId, interaction.id));
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({ actorId: "local-board", action: "slack.decision_resolved",
+        details: { workspaceId: "T-test", slackUserId: "U-test", actionId: action.id, operation } });
+      expect(JSON.stringify(audit)).not.toContain("PRIVATE");
+      expect(lockedReads).toBe(4);
+      await expect(svc.resolve(action, input)).rejects.toThrow();
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, action.id))).toHaveLength(1);
     },
   );
 
