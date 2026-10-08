@@ -37,6 +37,9 @@ import { agentService } from "../services/agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+if (!embeddedPostgresSupport.supported) {
+  console.warn(`Skipping interaction service database tests: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`);
+}
 
 describeEmbeddedPostgres("issueThreadInteractionService", () => {
   let db!: ReturnType<typeof createDb>;
@@ -212,6 +215,84 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     };
   }
+
+  // Slack decision callbacks must use these real transaction hooks: a provider
+  // receipt must never survive a rolled-back answer, or vice versa. This tests
+  // the canonical service against PostgreSQL, without a model of its writes.
+  it.each(["accept", "reject", "answer"] as const)(
+    "rolls back %s and its audit together, then permits exactly one committed retry",
+    async (operation) => {
+      const { companyId, issueId, goalId } = await seedConfirmationIssue("External decision atomicity");
+      const issue = { id: issueId, companyId, projectId: null, goalId };
+      const actor = { userId: "local-board" };
+      const interaction = await interactionsSvc.create(issue, operation === "answer" ? {
+        kind: "ask_user_questions",
+        continuationPolicy: "none",
+        payload: {
+          version: 1,
+          questions: [{
+            id: "scope", prompt: "Which test scope?", selectionMode: "single",
+            options: [{ id: "targeted", label: "Targeted tests" }],
+          }],
+        },
+      } : {
+        kind: "request_confirmation",
+        continuationPolicy: "none",
+        payload: { version: 1, prompt: "Run the targeted tests?" },
+      }, actor);
+      let failAudit = true;
+      let auditAttempts = 0;
+      const mutationOptions: NonNullable<Parameters<typeof interactionsSvc.answerQuestions>[4]> = {
+        afterResolveInTransaction: async (tx, resolved) => {
+          auditAttempts += 1;
+          await tx.insert(activityLog).values({
+            companyId,
+            actorType: "user",
+            actorId: actor.userId,
+            action: "test.external_decision_receipt",
+            entityType: "issue_thread_interaction",
+            entityId: resolved.id,
+            details: { interactionStatus: resolved.status, operation },
+          });
+          if (failAudit) throw new Error("injected receipt failure");
+        },
+      };
+      const resolve = () => operation === "answer"
+        ? interactionsSvc.answerQuestions(issue, interaction.id, {
+          answers: [{ questionId: "scope", optionIds: ["targeted"] }],
+        }, actor, mutationOptions)
+        : operation === "accept"
+          ? interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor, mutationOptions)
+          : interactionsSvc.rejectInteraction(issue, interaction.id, {}, actor, mutationOptions);
+      const readInteraction = async () => (await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interaction.id)))[0];
+      const readAudit = () => db.select().from(activityLog)
+        .where(eq(activityLog.entityId, interaction.id));
+      const readDelivery = () => db.select().from(issueQuestionResponseDeliveries)
+        .where(eq(issueQuestionResponseDeliveries.interactionId, interaction.id));
+
+      await expect(resolve()).rejects.toThrow("injected receipt failure");
+      expect(await readInteraction()).toMatchObject({
+        status: "pending", resolvedAt: null, resolvedByUserId: null,
+      });
+      expect(await readAudit()).toHaveLength(0);
+      expect(await readDelivery()).toHaveLength(0);
+
+      failAudit = false;
+      const expectedStatus = { accept: "accepted", reject: "rejected", answer: "answered" }[operation];
+      await resolve();
+      const committed = await readInteraction();
+      expect(committed).toMatchObject({ status: expectedStatus, resolvedByUserId: actor.userId });
+      expect(committed.resolvedAt).toBeInstanceOf(Date);
+      expect(await readAudit()).toHaveLength(1);
+      expect(await readDelivery()).toHaveLength(operation === "answer" ? 1 : 0);
+
+      await expect(resolve()).rejects.toThrow();
+      expect(await readInteraction()).toEqual(committed);
+      expect(await readAudit()).toHaveLength(1);
+      expect(auditAttempts).toBe(2);
+    },
+  );
 
   it("persists and answers a canonical-only mixed question form", async () => {
     const { companyId, issueId } = await seedSourceQuestionFixture({});
