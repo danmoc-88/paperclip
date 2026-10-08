@@ -177,7 +177,7 @@ describe("Slack decision policy boundary", () => {
 
 function question(): AskUserQuestionsInteraction {
   return {
-    ...card(), kind: "ask_user_questions",
+    ...card(), kind: "ask_user_questions", result: null,
     payload: { version: 1, questions: [{
       id: "layout", prompt: "Jaki układ?", selectionMode: "single", required: true,
       options: [{ id: "a", label: "A", description: "Zachowamy widok A" }, { id: "b", label: "B" }],
@@ -215,7 +215,7 @@ describe("Slack canonical answer mapping", () => {
     [{ questionId: "layout", optionIds: ["a", "a"] }],
     [{ questionId: "layout", optionIds: ["a"] }, { questionId: "layout", optionIds: ["b"] }],
     [{ questionId: "layout", optionIds: [], otherText: "unsolicited" }],
-  ])("rejects incomplete, forged, duplicate or disallowed answers: %j", (answers) => {
+  ].map((answers) => ({ answers })))("rejects incomplete, forged, duplicate or disallowed answers: $answers", ({ answers }) => {
     const source = question();
     expect(() => mapSlackDecisionResolution(source, context(source), "answer", { answers })).toThrow();
   });
