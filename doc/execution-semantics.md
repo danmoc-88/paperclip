@@ -490,6 +490,8 @@ The task thread exposes the guarded Retry action for failed or timed-out convers
 
 A continuation cancelled by the queued-run gate while waiting for review did not start a provider. Its matching dispatch-gate receipt and unclaimed execution fields keep this deliberate wait out of unknown-action reconciliation. Pending review and decision gates still apply. If an older server already created a recovery hold for this exact state, Retry or a new user message can request one fresh turn after the server verifies there is no provider, coordinator, or unfinished cleanup. Saved user input is reconsidered through the same admission path; the cancelled turn is not replayed.
 
+A board operator can also settle that verified hold without a successor run. The operator records that the provider did not perform the action and supplies outcome evidence on the existing recovery resolution route. The server checks the run, the recorded recovery owner, the action fingerprint, the company, and the absence of provider execution. The task status, assignee, and work already received stay unchanged. The settlement does not wake an agent and does not replay the cancelled turn. The same evidence settles once. A different repeated event, a live run, a changed owner, a changed action, another company, provider work, or missing evidence keeps the hold.
+
 A valid recovery action must name:
 
 - the source issue and company

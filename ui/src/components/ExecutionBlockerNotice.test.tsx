@@ -6,11 +6,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ExecutionBlockerNotice } from "./ExecutionBlockerNotice";
 import { agentsApi } from "../api/agents";
 import { activityApi } from "../api/activity";
+import { issuesApi } from "../api/issues";
 vi.mock("../lib/router", () => ({
   Link: ({ to, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string }) => <a href={to} {...props} />,
 }));
 vi.mock("../api/agents", () => ({ agentsApi: { retryFailedRun: vi.fn() } }));
 vi.mock("../api/activity", () => ({ activityApi: { runsForIssue: vi.fn() } }));
+vi.mock("../api/issues", () => ({ issuesApi: { resolveRecoveryAction: vi.fn() } }));
 
 describe("stopped task recovery notice", () => {
   let root: Root;
@@ -121,6 +123,74 @@ describe("stopped task recovery notice", () => {
     await act(async () => button!.click());
     expect(agentsApi.retryFailedRun).toHaveBeenCalledWith("agent", "failed-run", "company");
   });
+  it("settles a cancelled-before-start run without Retry or replay", async () => {
+    vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
+      runId: "cancelled-run",
+      agentId: "agent",
+      status: "cancelled",
+      startedAt: null,
+      errorCode: "issue_continuation_waiting_on_review",
+      runtimeMode: "legacy",
+      resultJson: {
+        stopReason: "issue_continuation_waiting_on_review",
+        timeoutSource: "stale_queued_run_gate",
+      },
+    }] as never);
+    vi.mocked(issuesApi.resolveRecoveryAction).mockResolvedValue({} as never);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="cancelled-task" sourceStatus="in_review" canSettle onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: "cancelled-run", agentId: "agent",
+        cause: "legacy_execution_requires_reconciliation", runStatus: "cancelled", canContinue: true,
+        nextAction: "Automatic recovery stopped. Recorded work is preserved.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent).not.toContain("Retry");
+    expect(container.textContent).not.toContain("Continue");
+    const button = [...container.querySelectorAll("button")].find(item => item.textContent === "Settle without replay");
+    expect(button?.disabled).toBe(true);
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    const evidence = "The queued run was cancelled before a provider started.";
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, evidence);
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(button?.disabled).toBe(false);
+    await act(async () => button!.click());
+    expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("cancelled-task", {
+      actionId: "recovery",
+      outcome: "blocked",
+      sourceIssueStatus: "in_review",
+      preserveWithoutReplay: true,
+      executionReconciliation: {
+        runId: "cancelled-run",
+        providerStopped: true,
+        actionOutcome: "not_performed",
+        outcomeEvidence: evidence,
+      },
+    });
+  });
+
+  it("tells a non-board viewer that a board operator settles the cancelled run", async () => {
+    vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
+      runId: "cancelled-run", agentId: "agent", status: "cancelled", startedAt: null,
+      errorCode: "issue_continuation_waiting_on_review", runtimeMode: "legacy",
+      resultJson: { stopReason: "issue_continuation_waiting_on_review", timeoutSource: "stale_queued_run_gate" },
+    }] as never);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="blocked-task" sourceStatus="blocked" canSettle={false} onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: "cancelled-run", agentId: "agent",
+        cause: "legacy_execution_requires_reconciliation",
+        nextAction: "Automatic recovery stopped.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent).toContain("A board operator can settle this cancelled run without replay.");
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.textContent).not.toContain("Retry");
+  });
+
   it("shows a failed Retry in the same container and allows another attempt", async () => {
     vi.mocked(agentsApi.retryFailedRun).mockRejectedValue(new Error("Environment cleanup is still running."));
     await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());

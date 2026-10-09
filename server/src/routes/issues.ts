@@ -12,6 +12,8 @@ import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  settleCancelledBeforeStartHold,
+  verifiedCancelledBeforeStartRun,
 } from "../services/execution-recovery-resolution.js";
 import {
   storedSteeringAcknowledgement,
@@ -9141,7 +9143,7 @@ export function issueRoutes(
         resolutionNote,
         executionReconciliation,
       } = req.body;
-      if (outcome === "false_positive" || outcome === "cancelled") {
+      if (outcome === "false_positive" || outcome === "cancelled" || req.body.preserveWithoutReplay) {
         assertBoard(req);
       }
 
@@ -9162,6 +9164,43 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+
+        if (req.body.preserveWithoutReplay) {
+          assertBoard(req);
+          if (
+            lockedIssue.assigneeAgentId !== existing.assigneeAgentId ||
+            lockedIssue.status !== existing.status
+          ) {
+            throw conflict("The task owner or status changed. Refresh the task before settling the cancelled run.");
+          }
+          if (sourceIssueStatus !== lockedIssue.status) {
+            throw conflict("Settlement must keep the current task status.");
+          }
+          if (!actionId || !executionReconciliation) {
+            throw conflict("A cancelled-before-start settlement must name the current recovery action and its evidence.");
+          }
+          const settled = await settleCancelledBeforeStartHold({
+            db: tx as unknown as Db,
+            issue: {
+              id: lockedIssue.id,
+              companyId: lockedIssue.companyId,
+              status: lockedIssue.status,
+              assigneeAgentId: lockedIssue.assigneeAgentId,
+              executionRunId: lockedIssue.executionRunId,
+              checkoutRunId: lockedIssue.checkoutRunId,
+            },
+            actionId,
+            decision: executionReconciliation,
+            actorId: actor.actorId,
+            resolutionNote,
+          });
+          return {
+            issue: lockedIssue,
+            recoveryAction: settled.action,
+            preserved: true as const,
+            idempotent: settled.idempotent,
+          };
+        }
 
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
@@ -9196,6 +9235,13 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
+              if (await verifiedCancelledBeforeStartRun(
+                tx as unknown as Db,
+                lockedIssue.companyId,
+                executionReconciliation.runId,
+              )) {
+                throw conflict("A cancelled-before-start review wait cannot be replayed. Settle the verified hold without starting another run.");
+              }
               if (
                 activeRecoveryAction ||
                 sourceIssueStatus !== "todo" ||
@@ -9540,6 +9586,38 @@ export function issueRoutes(
 
         return { issue, recoveryAction, chatRetry };
       });
+      if ("preserved" in result && result.preserved) {
+        if (!result.idempotent) {
+          await logActivity(db, {
+            companyId: result.issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.recovery_action_resolved",
+            entityType: "issue",
+            entityId: result.issue.id,
+            details: {
+              identifier: result.issue.identifier,
+              recoveryActionId: result.recoveryAction.id,
+              recoveryActionStatus: result.recoveryAction.status,
+              outcome: result.recoveryAction.outcome,
+              sourceIssueStatus: result.issue.status,
+              preserveWithoutReplay: true,
+              resolutionNote: result.recoveryAction.resolutionNote,
+            },
+          });
+        }
+        res.json({
+          issue: {
+            ...result.issue,
+            activeRecoveryAction: null,
+          },
+          recoveryAction: result.recoveryAction,
+        });
+        return;
+      }
       if (result.replayed) {
         res.json({
           issue: result.issue,
