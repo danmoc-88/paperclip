@@ -24,6 +24,29 @@ import {
   createChatQuestionFormDraft,
 } from "./chat-question-forms.js";
 
+import { loadSlackDecisionDisclosure } from "./slack-decision-disclosures.js";
+import { projectSlackDecisionPublication } from "./slack-decision-policy.js";
+
+/** Separate preparation boundary for company-wide decision publications.
+ * Caller must establish the company route and delivery owner before enqueueing;
+ * this must never relax agent/conversation ownership in the existing publisher.
+ * Classification is read from the protected ledger, never caller-supplied copy.
+ */
+export async function prepareSlackDecisionPublication(
+  db: Pick<Db, "select">,
+  interaction: IssueThreadInteraction,
+  route: { companyId: string; endpointId: string; userId: string; publicBaseUrl: string },
+  now = new Date(),
+) {
+  if (interaction.companyId !== route.companyId || interaction.status !== "pending") return null;
+  const disclosure = await loadSlackDecisionDisclosure(db, {
+    companyId: route.companyId, endpointId: route.endpointId, interactionId: interaction.id,
+  });
+  return projectSlackDecisionPublication(interaction, {
+    companyId: route.companyId, userId: route.userId, now, disclosure,
+  }, route.publicBaseUrl);
+}
+
 const MAX_NATIVE_QUESTION_OPTIONS = 12;
 const QUESTION_ACTION_PREFIX = "pcq:";
 const QUESTION_ACTION_TOKEN_BYTES = 16;

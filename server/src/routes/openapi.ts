@@ -302,6 +302,7 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  updateSlackDecisionDisclosureSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1541,6 +1542,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/chat-endpoints/{endpointId}/github/app",
   "POST /api/chat-endpoints/{endpointId}/github/repositories/refresh",
   "PATCH /api/chat-endpoints/{endpointId}",
+  "PUT /api/chat-endpoints/{endpointId}/slack/decision-disclosures/{interactionId}",
   "POST /api/chat-endpoints/{endpointId}/setup",
   "POST /api/chat-endpoints/{endpointId}/setup-secret",
   "POST /api/chat-endpoints/{endpointId}/test",
@@ -2368,6 +2370,27 @@ registry.registerPath({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/chat-endpoints/{endpointId}/slack/decision-disclosures/{interactionId}",
+  tags: ["chat-channels"],
+  summary: "Grant or revoke disclosure of an exact decision card to Slack",
+  description:
+    "Requires a signed-in board user, company access and tools:manage_connections. Classifies the current source digest; a null disclosure revokes it. Unknown or forbidden cards cannot be granted. This does not publish a message or enable Slack actions.",
+  request: {
+    params: z.object({ endpointId: z.string().uuid(), interactionId: z.string().uuid() }),
+    body: jsonBody(updateSlackDecisionDisclosureSchema),
+  },
+  responses: {
+    200: r.ok(z.object({
+      interactionId: z.string().uuid(), endpointId: z.string().uuid(),
+      status: z.enum(["granted", "revoked"]),
+    })),
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden,
+    404: r.notFound, 409: r.conflict, 422: r.unprocessable,
   },
 });
 
