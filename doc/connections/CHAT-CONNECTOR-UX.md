@@ -398,7 +398,14 @@ preflight is not a durable receipt or authorization to resolve: the company rout
 must still load its binding from protected state and recheck current authority
 while consuming the action in the canonical resolution transaction.
 
-Decision callback dispatch, one-use action issuance, modals, company
+The decision modal renderer retains classified questions and consequences without
+truncation, uses a rejection-only confirmation form, and falls back to the card
+when provider limits cannot preserve the source. Its decoder accepts only the
+expected input fields, maps source option IDs and private text through the
+canonical answer validator, and rejects incomplete or extra fields. These
+helpers do not open views or consume actions.
+
+Decision callback dispatch, one-use action issuance, modal transport, company
 routing, historical delivery deduplication, and transport retry are not wired to
 this helper yet. The policy tests and isolated database tests establish these
 internal contracts; they do not establish a live Slack integration.
