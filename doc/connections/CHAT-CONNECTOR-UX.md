@@ -389,7 +389,16 @@ answer text and rejection reasons. Stale plan targets expire; panel/callback rac
 permit one terminal resolution. The transport must supply a transactional
 authorization/action-consumption hook before enabling the resolver.
 
-Provider identity/signature checks, one-use action issuance, modals, company
+The shared Slack signature preflight checks the captured bytes with HMAC-SHA256,
+constant-time digest comparison, and a five-minute timestamp window. The decision
+callback preflight additionally binds workspace, app, user, channel, message and
+opaque action IDs; modal submissions require the recorded view ID and matching
+opaque metadata. A modal close is a distinct event, never a rejection. This
+preflight is not a durable receipt or authorization to resolve: the company route
+must still load its binding from protected state and recheck current authority
+while consuming the action in the canonical resolution transaction.
+
+Decision callback dispatch, one-use action issuance, modals, company
 routing, historical delivery deduplication, and transport retry are not wired to
 this helper yet. The policy tests and isolated database tests establish these
 internal contracts; they do not establish a live Slack integration.
