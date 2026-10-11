@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1890,6 +1890,69 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       executionReconciliation: { ...seeded.body.executionReconciliation, outcomeEvidence: "A different account of the same cancelled run cannot replace the recorded evidence." },
     }).expect(409);
     expect(changed.body.error).toMatch(/already settled/);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id)))[0]).toEqual(action);
+  });
+
+  it("keeps the cancelled-before-start hold when the audit write fails, then records one event on retry", async () => {
+    const seeded = await seedCancelledBeforeStart();
+    await db.execute(sql.raw(`
+      CREATE OR REPLACE FUNCTION sak1070_fail_recovery_audit() RETURNS trigger
+      LANGUAGE plpgsql AS $fn$
+      BEGIN
+        IF NEW.action = 'issue.recovery_action_resolved' THEN
+          RAISE EXCEPTION 'injected recovery audit failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$
+    `));
+    await db.execute(sql.raw(`
+      CREATE TRIGGER sak1070_fail_recovery_audit
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW EXECUTE FUNCTION sak1070_fail_recovery_audit()
+    `));
+    try {
+      const failed = await request(createApp())
+        .post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`)
+        .send(seeded.body);
+      expect(failed.status).toBe(500);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+      expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: seeded.managerId });
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(action!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+      expect(action!.evidence).not.toHaveProperty("executionReconciliation");
+      expect(action!.evidence).not.toHaveProperty("continuationDelivery");
+      expect(await getExecutionBlocker(db, seeded.companyId, seeded.sourceIssueId)).not.toBeNull();
+      const failedActivity = await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.sourceIssueId));
+      expect(failedActivity.filter((row) => row.action === "issue.recovery_action_resolved")).toHaveLength(0);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER IF EXISTS sak1070_fail_recovery_audit ON activity_log`));
+      await db.execute(sql.raw(`DROP FUNCTION IF EXISTS sak1070_fail_recovery_audit()`));
+    }
+
+    const app = createApp();
+    const resolved = await request(app)
+      .post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`)
+      .send(seeded.body)
+      .expect(200);
+    expect(resolved.body.issue.status).toBe("in_review");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+    expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: seeded.managerId });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id));
+    expect(action!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(action!.evidence).toMatchObject({ continuationDelivery: "preserved" });
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.sourceIssueId)).toBeNull();
+    await deliverReconciledExecutions(db, async () => { throw new Error("replay"); });
+    const repeated = await request(app)
+      .post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`)
+      .send(seeded.body)
+      .expect(200);
+    expect(repeated.body.issue.status).toBe("in_review");
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.sourceIssueId));
+    expect(activity.filter((row) => row.action === "issue.recovery_action_resolved")).toHaveLength(1);
+    expect(activity.filter((row) => row.action === "issue.updated")).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id)))[0]).toEqual(action);
   });
 

@@ -9194,6 +9194,35 @@ export function issueRoutes(
             actorId: actor.actorId,
             resolutionNote,
           });
+          // The audit row commits with the hold release. A failed insert rolls
+          // the settlement back, so a retry still has exactly one chance to
+          // record it. Live publication waits until this transaction commits.
+          if (!settled.idempotent) {
+            await logActivity(
+              tx as unknown as Db,
+              {
+                companyId: lockedIssue.companyId,
+                actorType: actor.actorType,
+                actorId: actor.actorId,
+                agentId: actor.agentId,
+                runId: actor.runId,
+                agentApiKeyId: actor.agentApiKeyId,
+                action: "issue.recovery_action_resolved",
+                entityType: "issue",
+                entityId: lockedIssue.id,
+                details: {
+                  identifier: lockedIssue.identifier,
+                  recoveryActionId: settled.action.id,
+                  recoveryActionStatus: settled.action.status,
+                  outcome: settled.action.outcome,
+                  sourceIssueStatus: lockedIssue.status,
+                  preserveWithoutReplay: true,
+                  resolutionNote: settled.action.resolutionNote,
+                },
+              },
+              postCommitActivityPublications,
+            );
+          }
           return {
             issue: lockedIssue,
             recoveryAction: settled.action,
@@ -9587,28 +9616,8 @@ export function issueRoutes(
         return { issue, recoveryAction, chatRetry };
       });
       if ("preserved" in result && result.preserved) {
-        if (!result.idempotent) {
-          await logActivity(db, {
-            companyId: result.issue.companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "issue.recovery_action_resolved",
-            entityType: "issue",
-            entityId: result.issue.id,
-            details: {
-              identifier: result.issue.identifier,
-              recoveryActionId: result.recoveryAction.id,
-              recoveryActionStatus: result.recoveryAction.status,
-              outcome: result.recoveryAction.outcome,
-              sourceIssueStatus: result.issue.status,
-              preserveWithoutReplay: true,
-              resolutionNote: result.recoveryAction.resolutionNote,
-            },
-          });
-        }
+        for (const publication of postCommitActivityPublications)
+          publishActivity(publication);
         res.json({
           issue: {
             ...result.issue,
