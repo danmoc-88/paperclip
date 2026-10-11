@@ -4,7 +4,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -130,6 +130,86 @@ export async function validateExecutionReconciliation(input: {
     exposeLowTrustRaw: false,
   });
   return run;
+}
+
+/** Availability losses, not uncertain external effects. A fresh session may continue. */
+const INTERRUPTION_RESUME_ERROR_CODES = new Set([
+  "orphaned_running_run",
+  "process_lost",
+  "server_shutdown_interrupted",
+]);
+
+/** Parked and closed tasks stay where an operator or an earlier disposition left them. */
+const INTERRUPTION_RESUME_STATUSES = new Set(["todo", "in_progress", "in_review"]);
+
+/**
+ * The fresh-session gate accepts only a complete reconciliation record.
+ * `mixed` records that this sweep did not verify earlier tool calls, so the
+ * new session must not replay them.
+ */
+function interruptionReconciliation(runId: string): ExecutionReconciliation {
+  return {
+    runId,
+    providerStopped: true,
+    actionOutcome: "mixed",
+    outcomeEvidence:
+      "The server lost this running session before it could finish. Earlier tool calls are not replayed. One fresh session continues the open task.",
+  };
+}
+
+/**
+ * Stamp the stopped run on every conversation fold so the stranded-work sweep
+ * does not insert another action for it. Queue one fresh session only while
+ * this hold is still the task's current execution.
+ */
+async function conversationInterruptionResume(
+  db: Db,
+  action: typeof issueRecoveryActions.$inferSelect,
+): Promise<{ runId: string; resume: boolean } | null> {
+  const runId = action.evidence.runId;
+  if (typeof runId !== "string") return null;
+  const [task] = await db
+    .select()
+    .from(issues)
+    .where(and(eq(issues.companyId, action.companyId), eq(issues.id, action.sourceIssueId)));
+  const [run] = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, runId)));
+  if (!task || !run) return { runId, resume: false };
+  const [newer] = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, action.companyId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${task.id}::text`,
+        ne(heartbeatRuns.id, run.id),
+        or(
+          gt(heartbeatRuns.createdAt, run.createdAt),
+          and(eq(heartbeatRuns.createdAt, run.createdAt), gt(heartbeatRuns.id, run.id)),
+        ),
+      ),
+    )
+    .limit(1);
+  const sameOwner =
+    action.returnOwnerAgentId !== null && task.assigneeAgentId === action.returnOwnerAgentId;
+  const currentExecution =
+    (!task.executionRunId || task.executionRunId === run.id) &&
+    (!task.checkoutRunId || task.checkoutRunId === run.id);
+  const liveHold = action.status === "active" || action.status === "escalated";
+  return {
+    runId,
+    resume:
+      liveHold &&
+      INTERRUPTION_RESUME_ERROR_CODES.has(run.errorCode ?? "") &&
+      INTERRUPTION_RESUME_STATUSES.has(task.status) &&
+      sameOwner &&
+      currentExecution &&
+      !newer &&
+      !hasWorkspaceRestoreFailure(run.resultJson) &&
+      !isSupersededConversationRun(task, run),
+  };
 }
 
 /** Durable delivery marker lives on the existing source-scoped recovery action. */
@@ -312,8 +392,10 @@ export async function settleUnrecoverableExecutions(
   now = new Date(),
   options: { failpoint?: (phase: "persisted") => void } = {},
 ) {
-  // Fold obsolete conversation holds without waking historical work on upgrade.
-  // Keep their evidence and record the policy change in the task's activity log.
+  // Fold conversation holds. Historical blocked work stays unwoken. An open task
+  // whose run died with an availability error gets one fresh session, delivered
+  // later by deliverReconciledExecutions. The run id on the action stops the
+  // stranded-work sweep from inserting the same hold again.
   const obsoleteConversationHold = and(
     conversationRecoveryActionPredicate(),
     or(
@@ -326,18 +408,51 @@ export async function settleUnrecoverableExecutions(
       .limit(25).for("update", { skipLocked: true });
     for (const candidate of foldable) {
       if (await getConversationOwnershipBlocker(tx as unknown as Db, candidate.companyId, candidate.sourceIssueId)) continue;
+      const interruption = await conversationInterruptionResume(tx as unknown as Db, candidate);
+      const foldedEvidence = () => sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
+          else ${issueRecoveryActions.evidence} end`;
+      const reconciliationStamp = interruption
+        ? JSON.stringify({ executionReconciliation: interruptionReconciliation(interruption.runId) })
+        : null;
+      const resumeStamp = interruption?.resume
+        ? JSON.stringify({
+            executionReconciliation: interruptionReconciliation(interruption.runId),
+            continuationDelivery: "pending",
+          })
+        : null;
+      const heldWithoutResume = interruption && !interruption.resume
+        ? JSON.stringify({
+            executionReconciliation: interruptionReconciliation(interruption.runId),
+            automaticRecovery: {
+              policy: "preserve_without_replay_v1",
+              replay: "conversation_continuation",
+              runId: interruption.runId,
+              actionOutcome: "unknown",
+            },
+          })
+        : null;
+      const evidence = resumeStamp
+        ? sql`(${foldedEvidence()}) || ${resumeStamp}::jsonb`
+        : heldWithoutResume
+          ? sql`case when (${foldedEvidence()}) ? 'automaticRecovery'
+              then (${foldedEvidence()}) || ${reconciliationStamp!}::jsonb
+              else (${foldedEvidence()}) || ${heldWithoutResume}::jsonb end`
+          : foldedEvidence();
       const [action] = await tx.update(issueRecoveryActions).set({
         status: "resolved",
         outcome: "cancelled",
         resolvedAt: now,
         updatedAt: now,
-        nextAction: "Automatic attempts stopped. Send a new message to continue the conversation.",
-        resolutionNote: "Conversation continuation does not replay prior tool calls.",
+        nextAction: interruption?.resume
+          ? "The interrupted run is closed. A fresh session is queued for the same task."
+          : "Automatic attempts stopped. Send a new message to continue the conversation.",
+        resolutionNote: interruption?.resume
+          ? "Availability interruption queued one fresh session. Prior tool calls are not replayed."
+          : "Conversation continuation does not replay prior tool calls.",
         wakePolicy: null,
         monitorPolicy: null,
-        evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
-          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
-          else ${issueRecoveryActions.evidence} end`,
+        evidence,
       }).where(and(obsoleteConversationHold, eq(issueRecoveryActions.id, candidate.id))).returning();
       if (!action) continue;
       await persistActivity(tx as unknown as Db, {
@@ -347,7 +462,12 @@ export async function settleUnrecoverableExecutions(
         action: "issue.execution_recovery_settled",
         entityType: "issue",
         entityId: action.sourceIssueId,
-        details: { recoveryActionId: action.id, outcome: "cancelled", continuation: "conversation" },
+        details: {
+          recoveryActionId: action.id,
+          outcome: "cancelled",
+          continuation: "conversation",
+          ...(interruption?.resume ? { freshSessionQueued: true } : {}),
+        },
       });
     }
   });
