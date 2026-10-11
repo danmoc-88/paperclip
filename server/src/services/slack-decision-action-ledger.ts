@@ -59,6 +59,28 @@ export async function loadSlackDecisionAction(
   return { recordId: record.id, actionId: scope.actionId, ...parsed.data };
 }
 
+/** Bind the views.open receipt exactly once. The modal token has to exist
+ * before that provider call; submissions remain invalid until this commits.
+ * A timeout without a receipt must not guess a view ID or reuse the token for
+ * another modal. Replaying the same confirmed receipt is harmless.
+ */
+export async function bindSlackDecisionActionView(
+  db: Db,
+  scope: { companyId: string; endpointId: string; actionId: string },
+  viewId: string,
+  now = new Date(),
+) {
+  if (!id.safeParse(viewId).success) throw new SlackDecisionPolicyError();
+  await db.transaction(async (tx) => {
+    const stored = await loadSlackDecisionAction(tx, scope, now, true);
+    if (stored.operation === "accept" || (stored.viewId && stored.viewId !== viewId)) throw new SlackDecisionPolicyError();
+    if (stored.viewId === viewId) return;
+    const { recordId, actionId: _actionId, ...binding } = stored;
+    await tx.update(chatActions).set({ payload: { ...binding, viewId }, updatedAt: now })
+      .where(and(eq(chatActions.id, recordId), eq(chatActions.status, "pending")));
+  });
+}
+
 /** Called only inside the canonical interaction transaction, after checking
  * current route, endpoint and user authorization under locks in that same
  * transaction. A rollback restores pending; concurrent consumers cannot win.

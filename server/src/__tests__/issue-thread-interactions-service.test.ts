@@ -40,7 +40,7 @@ import { issueThreadInteractionService } from "../services/issue-thread-interact
 import { slackDecisionResolutionService, type SlackDecisionAction } from "../services/slack-decision-resolution.js";
 import { loadSlackDecisionDisclosure, slackDecisionDisclosureService } from "../services/slack-decision-disclosures.js";
 import { prepareSlackDecisionPublication } from "../services/chat-interaction-publications.js";
-import { issueSlackDecisionAction, loadSlackDecisionAction, consumeSlackDecisionAction } from "../services/slack-decision-action-ledger.js";
+import { issueSlackDecisionAction, loadSlackDecisionAction, consumeSlackDecisionAction, bindSlackDecisionActionView } from "../services/slack-decision-action-ledger.js";
 import { slackDecisionSourceDigest } from "../services/slack-decision-policy.js";
 import { agentService } from "../services/agents.js";
 
@@ -602,6 +602,15 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await expect(loadSlackDecisionAction(db, { ...scope, endpointId: randomUUID() })).rejects.toThrow("requires a response in MyDay");
     await expect(loadSlackDecisionAction(db, scope, new Date(binding.expiresAt))).rejects.toThrow("requires a response in MyDay");
     await expect(issueSlackDecisionAction(db, { ...binding, expiresAt: new Date(0).toISOString() })).rejects.toThrow();
+    await expect(bindSlackDecisionActionView(db, scope, "V1")).rejects.toThrow("requires a response in MyDay");
+    const modalId = await issueSlackDecisionAction(db, { ...binding, operation: "reject" });
+    const modalScope = { ...scope, actionId: modalId };
+    expect((await loadSlackDecisionAction(db, modalScope)).viewId).toBeUndefined();
+    await bindSlackDecisionActionView(db, modalScope, "V1");
+    await bindSlackDecisionActionView(db, modalScope, "V1");
+    await expect(bindSlackDecisionActionView(db, modalScope, "V2")).rejects.toThrow("requires a response in MyDay");
+    await expect(bindSlackDecisionActionView(db, modalScope, "")).rejects.toThrow("requires a response in MyDay");
+    expect((await loadSlackDecisionAction(db, modalScope)).viewId).toBe("V1");
     const action: SlackDecisionAction = { ...binding, id: actionId, receivedAt: new Date() };
     for (const key of ["issueId", "interactionId", "sourceDigest", "userId", "workspaceId", "slackUserId", "channelId", "appId", "messageTimestamp", "operation"] as const) {
       await expect(db.transaction((tx) => consumeSlackDecisionAction(tx, { ...action, [key]: "forged" }))).rejects.toThrow("requires a response in MyDay");

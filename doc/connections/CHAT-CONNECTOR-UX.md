@@ -412,6 +412,9 @@ locks the pending record inside the canonical resolution transaction, compares
 all bound fields and records only receive/consume times. Rollback restores the
 action; concurrent consumers cannot both succeed. The caller must still verify
 current route and user authorization in that transaction before consumption.
+A modal token exists before opening its view; a separate transaction binds the
+confirmed view receipt once and refuses replacement. Submissions have no valid
+view binding before that receipt commits.
 Issuance is internal and requires a publication receipt; no HTTP issuance API or
 transport is enabled by this helper.
 
