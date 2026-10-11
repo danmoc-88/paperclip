@@ -1,4 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
+import { evaluateAutomaticInterruptionResume } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -755,6 +756,42 @@ export function createPostgresRunDispatchAdapter(
       ) {
         return { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
       }
+      const resumeContext = parseObject(run.contextSnapshot);
+      if (resumeContext.automaticInterruptionResume === true) {
+        const resumeIssueId = readNonEmptyString(resumeContext.issueId);
+        const sourceRunId = run.retryOfRunId ?? readNonEmptyString(resumeContext.previousRunId);
+        const stillEligible = resumeIssueId && sourceRunId
+          ? await evaluateAutomaticInterruptionResume(tx, {
+              companyId: run.companyId,
+              issueId: resumeIssueId,
+              sourceRunId,
+              returnOwnerAgentId: run.agentId,
+              ignoreRunId: run.id,
+            })
+          : { resume: false as const };
+        if (!stillEligible.resume) {
+          const cancelled = await cancelSuppressedRetryInTx(tx as unknown as Db, {
+            runId: input.runId,
+            companyId: input.companyId,
+            now,
+            reason: "Automatic interruption resume is no longer eligible",
+            errorCode: "automatic_interruption_resume_stale",
+            issueId: resumeIssueId,
+            details: { issueId: resumeIssueId, sourceRunId },
+          });
+          return cancelled.applied
+            ? {
+                outcome: {
+                  outcome: "gate_suppressed" as const,
+                  reason: "Automatic interruption resume is no longer eligible",
+                  errorCode: "automatic_interruption_resume_stale" as const,
+                },
+                telemetryRun: cancelled.run,
+              }
+            : { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
+        }
+      }
+
       const factsResult = await loadGateFacts(
         {
           runId: run.id,

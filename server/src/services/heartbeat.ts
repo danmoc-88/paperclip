@@ -56,6 +56,7 @@ import {
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import { evaluateAutomaticInterruptionResume } from "./execution-recovery-resolution.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -27664,6 +27665,8 @@ export function heartbeatService(
 
           let reconciledSourceRunId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
+          let automaticResumeAttempt: number | null = null;
+          let automaticResumeDueAt: Date | null = null;
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
               enrichedContextSnapshot.recoveryActionId,
@@ -27767,10 +27770,39 @@ export function heartbeatService(
             }
             if (action.evidence.continuationDelivery !== "pending")
               return { kind: "skipped" as const };
+            if (action.evidence.automaticInterruptionResume === true) {
+              // The issue row is already locked. Recheck the automatic resume
+              // before creating a successor. An existing successor returned above.
+              const decision = await evaluateAutomaticInterruptionResume(tx as unknown as Db, {
+                companyId: issue.companyId,
+                issueId: issue.id,
+                sourceRunId,
+                returnOwnerAgentId: action.returnOwnerAgentId,
+              });
+              if (!decision.resume) {
+                await tx.update(issueRecoveryActions).set({
+                  evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+                }).where(and(
+                  eq(issueRecoveryActions.companyId, issue.companyId),
+                  eq(issueRecoveryActions.id, action.id),
+                  sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+                ));
+                return { kind: "skipped" as const };
+              }
+              automaticResumeAttempt = decision.nextAttempt;
+              automaticResumeDueAt = computeBoundedTransientHeartbeatRetrySchedule(decision.nextAttempt)?.dueAt ?? null;
+              enrichedContextSnapshot.automaticInterruptionResume = true;
+              enrichedContextSnapshot.executionRetryAccounting = decision.accounting;
+              enrichedContextSnapshot.scheduledRetryAttempt = decision.nextAttempt;
+              enrichedContextSnapshot.retryReason = "transient_failure";
+              if (automaticResumeDueAt) {
+                enrichedContextSnapshot.scheduledRetryAt = automaticResumeDueAt.toISOString();
+              }
+            }
             const [reconciledRun] = await tx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
             ));
-            if (hasWorkspaceRestoreFailure(reconciledRun?.resultJson)) {
+            if (automaticResumeAttempt === null && hasWorkspaceRestoreFailure(reconciledRun?.resultJson)) {
               if ((readNonEmptyString(decision.workspaceRepairEvidence)?.length ?? 0) < 20)
                 return { kind: "skipped" as const };
               // Repair does not reset the remaining automatic retry budget.
@@ -28728,7 +28760,15 @@ export function heartbeatService(
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
                 : {}),
-              ...(reconciledRestoreRetryCount !== null ? {
+              ...(automaticResumeAttempt !== null && automaticResumeDueAt ? {
+                status: "scheduled_retry",
+                scheduledRetryAt: automaticResumeDueAt,
+                scheduledRetryAttempt: automaticResumeAttempt,
+                scheduledRetryReason: "transient_failure",
+              } : automaticResumeAttempt !== null ? {
+                scheduledRetryAttempt: automaticResumeAttempt,
+                scheduledRetryReason: "transient_failure",
+              } : reconciledRestoreRetryCount !== null ? {
                 scheduledRetryAttempt: reconciledRestoreRetryCount,
                 scheduledRetryReason: "transient_failure",
               } : {}),

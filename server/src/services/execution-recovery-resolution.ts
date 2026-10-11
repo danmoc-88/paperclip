@@ -22,6 +22,11 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  accountingForScheduledRetry,
+  executionFailureRetryCount,
+  type ExecutionRetryAccounting,
+} from "./execution-recovery-attempt.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -142,6 +147,90 @@ const INTERRUPTION_RESUME_ERROR_CODES = new Set([
 /** Parked and closed tasks stay where an operator or an earlier disposition left them. */
 const INTERRUPTION_RESUME_STATUSES = new Set(["todo", "in_progress", "in_review"]);
 
+/** Same two-slot budget as the transient heartbeat retry schedule. */
+const AUTOMATIC_INTERRUPTION_RETRY_LIMIT = 2;
+
+export function isAutomaticInterruptionResumeEvidence(
+  evidence: Record<string, unknown> | null | undefined,
+): boolean {
+  return evidence?.automaticInterruptionResume === true;
+}
+
+/**
+ * Conditions that can change between settlement and the fresh-session wake.
+ * Operator reconciliation does not set `automaticInterruptionResume` and does
+ * not use this gate.
+ */
+export async function evaluateAutomaticInterruptionResume(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    sourceRunId: string;
+    returnOwnerAgentId: string | null;
+    /** The scheduled successor is newer than its source. Do not treat it as a competing run. */
+    ignoreRunId?: string | null;
+  },
+): Promise<
+  | { resume: false; runId: string }
+  | {
+      resume: true;
+      runId: string;
+      nextAttempt: number;
+      accounting: ExecutionRetryAccounting;
+    }
+> {
+  const runId = input.sourceRunId;
+  const [task] = await db
+    .select()
+    .from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  const [run] = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, runId)));
+  if (!task || !run) return { resume: false, runId };
+  const [newer] = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${task.id}::text`,
+        ne(heartbeatRuns.id, run.id),
+        input.ignoreRunId ? ne(heartbeatRuns.id, input.ignoreRunId) : undefined,
+        or(
+          gt(heartbeatRuns.createdAt, run.createdAt),
+          and(eq(heartbeatRuns.createdAt, run.createdAt), gt(heartbeatRuns.id, run.id)),
+        ),
+      ),
+    )
+    .limit(1);
+  const sameOwner =
+    input.returnOwnerAgentId !== null && task.assigneeAgentId === input.returnOwnerAgentId;
+  const currentExecution =
+    (!task.executionRunId || task.executionRunId === run.id) &&
+    (!task.checkoutRunId || task.checkoutRunId === run.id);
+  const consumed = executionFailureRetryCount(run);
+  const resume =
+    INTERRUPTION_RESUME_ERROR_CODES.has(run.errorCode ?? "") &&
+    INTERRUPTION_RESUME_STATUSES.has(task.status) &&
+    sameOwner &&
+    currentExecution &&
+    !newer &&
+    !hasWorkspaceRestoreFailure(run.resultJson) &&
+    !isSupersededConversationRun(task, run) &&
+    consumed < AUTOMATIC_INTERRUPTION_RETRY_LIMIT;
+  if (!resume) return { resume: false, runId };
+  const nextAttempt = consumed + 1;
+  return {
+    resume: true,
+    runId,
+    nextAttempt,
+    accounting: accountingForScheduledRetry(run, "transient_failure", nextAttempt),
+  };
+}
+
 /**
  * The fresh-session gate accepts only a complete reconciliation record.
  * `mixed` records that this sweep did not verify earlier tool calls, so the
@@ -168,48 +257,14 @@ async function conversationInterruptionResume(
 ): Promise<{ runId: string; resume: boolean } | null> {
   const runId = action.evidence.runId;
   if (typeof runId !== "string") return null;
-  const [task] = await db
-    .select()
-    .from(issues)
-    .where(and(eq(issues.companyId, action.companyId), eq(issues.id, action.sourceIssueId)));
-  const [run] = await db
-    .select()
-    .from(heartbeatRuns)
-    .where(and(eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, runId)));
-  if (!task || !run) return { runId, resume: false };
-  const [newer] = await db
-    .select({ id: heartbeatRuns.id })
-    .from(heartbeatRuns)
-    .where(
-      and(
-        eq(heartbeatRuns.companyId, action.companyId),
-        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${task.id}::text`,
-        ne(heartbeatRuns.id, run.id),
-        or(
-          gt(heartbeatRuns.createdAt, run.createdAt),
-          and(eq(heartbeatRuns.createdAt, run.createdAt), gt(heartbeatRuns.id, run.id)),
-        ),
-      ),
-    )
-    .limit(1);
-  const sameOwner =
-    action.returnOwnerAgentId !== null && task.assigneeAgentId === action.returnOwnerAgentId;
-  const currentExecution =
-    (!task.executionRunId || task.executionRunId === run.id) &&
-    (!task.checkoutRunId || task.checkoutRunId === run.id);
   const liveHold = action.status === "active" || action.status === "escalated";
-  return {
-    runId,
-    resume:
-      liveHold &&
-      INTERRUPTION_RESUME_ERROR_CODES.has(run.errorCode ?? "") &&
-      INTERRUPTION_RESUME_STATUSES.has(task.status) &&
-      sameOwner &&
-      currentExecution &&
-      !newer &&
-      !hasWorkspaceRestoreFailure(run.resultJson) &&
-      !isSupersededConversationRun(task, run),
-  };
+  const decision = await evaluateAutomaticInterruptionResume(db, {
+    companyId: action.companyId,
+    issueId: action.sourceIssueId,
+    sourceRunId: runId,
+    returnOwnerAgentId: action.returnOwnerAgentId,
+  });
+  return { runId, resume: liveHold && decision.resume };
 }
 
 /** Durable delivery marker lives on the existing source-scoped recovery action. */
@@ -327,6 +382,23 @@ export async function deliverReconciledExecutions(
           .where(pendingDecision);
         continue;
       }
+      const automaticResume = isAutomaticInterruptionResumeEvidence(action.evidence)
+        ? await evaluateAutomaticInterruptionResume(db, {
+            companyId: action.companyId,
+            issueId: task.id,
+            sourceRunId: decision.runId,
+            returnOwnerAgentId: action.returnOwnerAgentId,
+          })
+        : null;
+      if (automaticResume && !automaticResume.resume) {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+          })
+          .where(pendingDecision);
+        continue;
+      }
       const run = await wake(action.returnOwnerAgentId, {
         source: "automation",
         triggerDetail: "system",
@@ -344,6 +416,13 @@ export async function deliverReconciledExecutions(
           forceFreshSession: true,
           wakeReason: "issue_recovery_action_restored",
           source: "execution.reconciled",
+          ...(automaticResume?.resume
+            ? {
+                executionRetryAccounting: automaticResume.accounting,
+                scheduledRetryAttempt: automaticResume.nextAttempt,
+                retryReason: "transient_failure",
+              }
+            : {}),
         },
       });
       if (run)
@@ -419,6 +498,7 @@ export async function settleUnrecoverableExecutions(
         ? JSON.stringify({
             executionReconciliation: interruptionReconciliation(interruption.runId),
             continuationDelivery: "pending",
+            automaticInterruptionResume: true,
           })
         : null;
       const heldWithoutResume = interruption && !interruption.resume
