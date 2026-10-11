@@ -6151,6 +6151,38 @@ export function recoveryService(
       if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
     }
 
+    // A recovery terminal write can outlive normal heartbeat finalization.
+    // Settle the wake before clearing locks, and also repair older claims whose
+    // issue locks were already cleared. The joined update rechecks the terminal
+    // run and claimed wake together; it neither replays work nor changes a
+    // completed/cancelled wake or a claim belonging to another company/agent.
+    const settledWakes = await db
+      .update(agentWakeupRequests)
+      .set({
+        status: sql`case
+          when ${heartbeatRuns.status} = 'succeeded' then 'completed'
+          when ${heartbeatRuns.status} = 'cancelled' then 'cancelled'
+          else 'failed' end`,
+        finishedAt: sql`coalesce(${agentWakeupRequests.finishedAt}, ${heartbeatRuns.finishedAt}, now())`,
+        error: sql`coalesce(${agentWakeupRequests.error}, ${heartbeatRuns.error}, ${heartbeatRuns.errorCode})`,
+        updatedAt: new Date(),
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(agentWakeupRequests.status, "claimed"),
+        eq(agentWakeupRequests.runId, heartbeatRuns.id),
+        eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+        eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
+        inArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+      ))
+      .returning({ id: agentWakeupRequests.id });
+    if (settledWakes.length > 0) {
+      logger.warn(
+        { wakeupRequestIds: settledWakes.map((wake) => wake.id) },
+        "settled claimed wakes attached to terminal heartbeat runs",
+      );
+    }
+
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
       const status = runStatusById.get(runId);

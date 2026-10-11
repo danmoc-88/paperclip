@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   completionContracts,
@@ -54,6 +55,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
+    await db.delete(agentWakeupRequests);
     await db.delete(heartbeatRuns);
     await db.delete(completionContracts);
     await db.delete(issues);
@@ -295,6 +297,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       executionLockedAt: new Date(),
     });
 
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, runId: runningRunId, source: "automation",
+      status: "claimed", claimedAt: new Date(), payload: { issueId },
+    }).returning();
+
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.sweepStaleIssueLocks();
 
@@ -309,6 +316,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // Process died, outcome unknown, so the backstop uses "interrupted".
     expect(run?.status).toBe("interrupted");
     expect(run?.errorCode).toBe("orphaned_running_run");
+
+    const [settledWake] = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id));
+    expect(settledWake.status).toBe("failed");
+    expect(settledWake.finishedAt).toBeInstanceOf(Date);
+    expect(settledWake.error).toContain("process and sandbox gone");
 
     const lock = await db
       .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
@@ -335,6 +348,55 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       "agent.task_run",
       expect.objectContaining({ agent_id: agentId, state: "interrupted" }),
     );
+  });
+
+  it.each([
+    ["interrupted", "failed"], ["failed", "failed"], ["timed_out", "failed"],
+    ["succeeded", "completed"], ["cancelled", "cancelled"],
+  ])("settles an old claimed wake for a %s run without issue locks", async (status, wakeStatus) => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const finishedAt = new Date("2026-10-11T16:13:08Z");
+    await db.update(heartbeatRuns).set({ status, finishedAt,
+      errorCode: status === "interrupted" ? "orphaned_running_run" : null,
+    }).where(eq(heartbeatRuns.id, failedRunId));
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, runId: failedRunId, source: "automation", status: "claimed",
+    }).returning();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    await recovery.sweepStaleIssueLocks();
+    const [settled] = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id));
+    expect(settled.status).toBe(wakeStatus);
+    expect(settled.finishedAt).toEqual(finishedAt);
+    if (status === "interrupted") expect(settled.error).toBe("orphaned_running_run");
+    await recovery.sweepStaleIssueLocks();
+    expect(await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id))).toEqual([settled]);
+  });
+
+  it("preserves nonterminal runs, settled wakes, and mismatched company or agent claims", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const other = await seed();
+    const [peer] = await db.insert(agents).values({ companyId, name: "Peer", role: "engineer" }).returning();
+    for (const status of ["running", "queued", "scheduled_retry"]) {
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId, agentId, status, invocationSource: "manual",
+      }).returning();
+      await db.insert(agentWakeupRequests).values({ companyId, agentId,
+        runId: run.id, source: "automation", status: "claimed" });
+    }
+    for (const status of ["cancelled", "completed", "failed", "queued", "coalesced", "deferred_issue_execution"]) {
+      await db.insert(agentWakeupRequests).values({ companyId, agentId,
+        runId: failedRunId, source: "automation", status });
+    }
+    await db.insert(agentWakeupRequests).values([
+      { companyId: other.companyId, agentId: other.agentId, runId: failedRunId, source: "automation", status: "claimed" },
+      { companyId, agentId: peer.id, runId: failedRunId, source: "automation", status: "claimed" },
+      { companyId, agentId, runId: randomUUID(), source: "automation", status: "claimed" },
+    ]);
+    const before = await db.select().from(agentWakeupRequests);
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+    expect(await db.select().from(agentWakeupRequests)).toEqual(before);
   });
 
   it.each(["in_progress", "done"])("preserves a live legacy controller lease when the issue is %s", async (status) => {
