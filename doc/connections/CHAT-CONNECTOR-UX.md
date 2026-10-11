@@ -405,7 +405,17 @@ expected input fields, maps source option IDs and private text through the
 canonical answer validator, and rejects incomplete or extra fields. These
 helpers do not open views or consume actions.
 
-Decision callback dispatch, one-use action issuance, modal transport, company
+The internal decision action ledger stores opaque tokens separately from
+classification records. Each token binds company, endpoint, source digest,
+operation, user, workspace, app, channel, message receipt and expiry. Consumption
+locks the pending record inside the canonical resolution transaction, compares
+all bound fields and records only receive/consume times. Rollback restores the
+action; concurrent consumers cannot both succeed. The caller must still verify
+current route and user authorization in that transaction before consumption.
+Issuance is internal and requires a publication receipt; no HTTP issuance API or
+transport is enabled by this helper.
+
+Decision callback dispatch, action issuance by the publisher, modal transport, company
 routing, historical delivery deduplication, and transport retry are not wired to
 this helper yet. The policy tests and isolated database tests establish these
 internal contracts; they do not establish a live Slack integration.

@@ -40,6 +40,7 @@ import { issueThreadInteractionService } from "../services/issue-thread-interact
 import { slackDecisionResolutionService, type SlackDecisionAction } from "../services/slack-decision-resolution.js";
 import { loadSlackDecisionDisclosure, slackDecisionDisclosureService } from "../services/slack-decision-disclosures.js";
 import { prepareSlackDecisionPublication } from "../services/chat-interaction-publications.js";
+import { issueSlackDecisionAction, loadSlackDecisionAction, consumeSlackDecisionAction } from "../services/slack-decision-action-ledger.js";
 import { slackDecisionSourceDigest } from "../services/slack-decision-policy.js";
 import { agentService } from "../services/agents.js";
 
@@ -568,6 +569,66 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const audit = await db.select().from(activityLog).where(eq(activityLog.action, "slack.decision_disclosure_updated"));
     expect(audit).toHaveLength(3);
     expect(JSON.stringify(audit)).not.toContain("Use this direction?");
+  });
+
+  it("consumes a durable Slack action once and rolls it back with a failed resolution", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Action ledger");
+    const agentId = randomUUID();
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const endpointId = randomUUID();
+    await db.insert(agents).values({ id: agentId, companyId, name: "Test", role: "operator", adapterType: "process" });
+    await db.insert(toolApplications).values({ id: applicationId, companyId, applicationKey: `test-${applicationId}`, name: "Test", type: "chat" });
+    await db.insert(toolConnections).values({ id: connectionId, companyId, applicationId, name: "Test", uid: connectionId,
+      connectionPurpose: "channel", transport: "chat_sdk" });
+    await db.insert(chatEndpoints).values({ id: endpointId, companyId, connectionId, provider: "slack",
+      publicId: randomUUID(), assignedAgentId: agentId });
+    const interaction = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation", resolverPolicy: "human_only", continuationPolicy: "none",
+      payload: { version: 1, prompt: "Use this direction?" },
+    }, { userId: "local-board" });
+    const binding = { companyId, endpointId, issueId, interactionId: interaction.id,
+      sourceDigest: slackDecisionSourceDigest(interaction), userId: "local-board",
+      workspaceId: "T1", slackUserId: "U1", channelId: "C1", appId: "A1",
+      messageTimestamp: "123.456", operation: "accept" as const,
+      expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    const disclosure = { sourceDigest: binding.sourceDigest, topic: "product_direction", expiresAt: binding.expiresAt };
+    await slackDecisionDisclosureService(db).update(endpointId, interaction.id, { disclosure }, "local-board");
+    const actionId = await issueSlackDecisionAction(db, binding);
+    const scope = { companyId, endpointId, actionId };
+    expect(actionId).toMatch(/^pcsd:[A-Za-z0-9_-]{32}$/);
+    expect(await loadSlackDecisionAction(db, scope)).toMatchObject(binding);
+    await expect(loadSlackDecisionAction(db, { ...scope, companyId: randomUUID() })).rejects.toThrow("requires a response in MyDay");
+    await expect(loadSlackDecisionAction(db, { ...scope, endpointId: randomUUID() })).rejects.toThrow("requires a response in MyDay");
+    await expect(loadSlackDecisionAction(db, scope, new Date(binding.expiresAt))).rejects.toThrow("requires a response in MyDay");
+    await expect(issueSlackDecisionAction(db, { ...binding, expiresAt: new Date(0).toISOString() })).rejects.toThrow();
+    const action: SlackDecisionAction = { ...binding, id: actionId, receivedAt: new Date() };
+    for (const key of ["issueId", "interactionId", "sourceDigest", "userId", "workspaceId", "slackUserId", "channelId", "appId", "messageTimestamp", "operation"] as const) {
+      await expect(db.transaction((tx) => consumeSlackDecisionAction(tx, { ...action, [key]: "forged" }))).rejects.toThrow("requires a response in MyDay");
+    }
+    let fail = true;
+    const resolver = slackDecisionResolutionService(db, { enabled: true,
+      authorizeAndConsume: async (tx, candidate) => {
+        // Transport authorization is outside this ledger regression.
+        await consumeSlackDecisionAction(tx, candidate);
+        if (fail) throw new Error("injected failure after action consumption");
+      },
+    });
+    await expect(resolver.resolve(action, {})).rejects.toThrow("injected failure");
+    expect((await interactionsSvc.getById(interaction.id))?.status).toBe("pending");
+    expect(await loadSlackDecisionAction(db, scope)).toMatchObject(binding);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "slack.decision_resolved"))).toHaveLength(0);
+    fail = false;
+    const attempts = await Promise.allSettled([resolver.resolve(action, {}), resolver.resolve(action, {})]);
+    expect(attempts.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect((await interactionsSvc.getById(interaction.id))?.status).toBe("accepted");
+    await expect(loadSlackDecisionAction(db, scope)).rejects.toThrow("requires a response in MyDay");
+    await expect(db.transaction((tx) => consumeSlackDecisionAction(tx, action))).rejects.toThrow("requires a response in MyDay");
+    const [record] = await db.select().from(chatActions).where(eq(chatActions.providerActionId, actionId));
+    expect(record?.status).toBe("consumed");
+    expect(record?.result).toEqual({ receivedAt: action.receivedAt.toISOString(), consumedAt: expect.any(String) });
+    expect(JSON.stringify(record)).not.toContain("Use this direction?");
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "slack.decision_resolved"))).toHaveLength(1);
   });
 
   it("persists and answers a canonical-only mixed question form", async () => {
