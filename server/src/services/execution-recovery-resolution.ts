@@ -4,7 +4,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -22,6 +22,12 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  accountingForScheduledRetry,
+  executionFailureRetryCount,
+  type ExecutionRetryAccounting,
+} from "./execution-recovery-attempt.js";
+import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -130,6 +136,136 @@ export async function validateExecutionReconciliation(input: {
     exposeLowTrustRaw: false,
   });
   return run;
+}
+
+/** Availability losses, not uncertain external effects. A fresh session may continue. */
+const INTERRUPTION_RESUME_ERROR_CODES = new Set([
+  "orphaned_running_run",
+  "process_lost",
+  "server_shutdown_interrupted",
+]);
+
+/** Parked and closed tasks stay where an operator or an earlier disposition left them. */
+const INTERRUPTION_RESUME_STATUSES = new Set(["todo", "in_progress", "in_review"]);
+
+/** Same two-slot budget as the transient heartbeat retry schedule. */
+const AUTOMATIC_INTERRUPTION_RETRY_LIMIT = 2;
+
+export function isAutomaticInterruptionResumeEvidence(
+  evidence: Record<string, unknown> | null | undefined,
+): boolean {
+  return evidence?.automaticInterruptionResume === true;
+}
+
+/**
+ * Conditions that can change between settlement and the fresh-session wake.
+ * Operator reconciliation does not set `automaticInterruptionResume` and does
+ * not use this gate.
+ */
+export async function evaluateAutomaticInterruptionResume(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    sourceRunId: string;
+    returnOwnerAgentId: string | null;
+    /** The scheduled successor is newer than its source. Do not treat it as a competing run. */
+    ignoreRunId?: string | null;
+  },
+): Promise<
+  | { resume: false; runId: string }
+  | {
+      resume: true;
+      runId: string;
+      nextAttempt: number;
+      accounting: ExecutionRetryAccounting;
+    }
+> {
+  const runId = input.sourceRunId;
+  const [task] = await db
+    .select()
+    .from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  const [run] = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, runId)));
+  if (!task || !run) return { resume: false, runId };
+  const [newer] = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${task.id}::text`,
+        ne(heartbeatRuns.id, run.id),
+        input.ignoreRunId ? ne(heartbeatRuns.id, input.ignoreRunId) : undefined,
+        or(
+          gt(heartbeatRuns.createdAt, run.createdAt),
+          and(eq(heartbeatRuns.createdAt, run.createdAt), gt(heartbeatRuns.id, run.id)),
+        ),
+      ),
+    )
+    .limit(1);
+  const sameOwner =
+    input.returnOwnerAgentId !== null && task.assigneeAgentId === input.returnOwnerAgentId;
+  const currentExecution =
+    (!task.executionRunId || task.executionRunId === run.id) &&
+    (!task.checkoutRunId || task.checkoutRunId === run.id);
+  const consumed = executionFailureRetryCount(run);
+  const resume =
+    INTERRUPTION_RESUME_ERROR_CODES.has(run.errorCode ?? "") &&
+    INTERRUPTION_RESUME_STATUSES.has(task.status) &&
+    sameOwner &&
+    currentExecution &&
+    !newer &&
+    !hasWorkspaceRestoreFailure(run.resultJson) &&
+    !isSupersededConversationRun(task, run) &&
+    consumed < AUTOMATIC_INTERRUPTION_RETRY_LIMIT;
+  if (!resume) return { resume: false, runId };
+  const nextAttempt = consumed + 1;
+  return {
+    resume: true,
+    runId,
+    nextAttempt,
+    accounting: accountingForScheduledRetry(run, "transient_failure", nextAttempt),
+  };
+}
+
+/**
+ * The fresh-session gate accepts only a complete reconciliation record.
+ * `mixed` records that this sweep did not verify earlier tool calls, so the
+ * new session must not replay them.
+ */
+function interruptionReconciliation(runId: string): ExecutionReconciliation {
+  return {
+    runId,
+    providerStopped: true,
+    actionOutcome: "mixed",
+    outcomeEvidence:
+      "The server lost this running session before it could finish. Earlier tool calls are not replayed. One fresh session continues the open task.",
+  };
+}
+
+/**
+ * Stamp the stopped run on every conversation fold so the stranded-work sweep
+ * does not insert another action for it. Queue one fresh session only while
+ * this hold is still the task's current execution.
+ */
+async function conversationInterruptionResume(
+  db: Db,
+  action: typeof issueRecoveryActions.$inferSelect,
+): Promise<{ runId: string; resume: boolean } | null> {
+  const runId = action.evidence.runId;
+  if (typeof runId !== "string") return null;
+  const liveHold = action.status === "active" || action.status === "escalated";
+  const decision = await evaluateAutomaticInterruptionResume(db, {
+    companyId: action.companyId,
+    issueId: action.sourceIssueId,
+    sourceRunId: runId,
+    returnOwnerAgentId: action.returnOwnerAgentId,
+  });
+  return { runId, resume: liveHold && decision.resume };
 }
 
 /** Durable delivery marker lives on the existing source-scoped recovery action. */
@@ -247,6 +383,23 @@ export async function deliverReconciledExecutions(
           .where(pendingDecision);
         continue;
       }
+      const automaticResume = isAutomaticInterruptionResumeEvidence(action.evidence)
+        ? await evaluateAutomaticInterruptionResume(db, {
+            companyId: action.companyId,
+            issueId: task.id,
+            sourceRunId: decision.runId,
+            returnOwnerAgentId: action.returnOwnerAgentId,
+          })
+        : null;
+      if (automaticResume && !automaticResume.resume) {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+          })
+          .where(pendingDecision);
+        continue;
+      }
       const run = await wake(action.returnOwnerAgentId, {
         source: "automation",
         triggerDetail: "system",
@@ -264,6 +417,13 @@ export async function deliverReconciledExecutions(
           forceFreshSession: true,
           wakeReason: "issue_recovery_action_restored",
           source: "execution.reconciled",
+          ...(automaticResume?.resume
+            ? {
+                executionRetryAccounting: automaticResume.accounting,
+                scheduledRetryAttempt: automaticResume.nextAttempt,
+                retryReason: "transient_failure",
+              }
+            : {}),
         },
       });
       if (run)
@@ -312,8 +472,10 @@ export async function settleUnrecoverableExecutions(
   now = new Date(),
   options: { failpoint?: (phase: "persisted") => void } = {},
 ) {
-  // Fold obsolete conversation holds without waking historical work on upgrade.
-  // Keep their evidence and record the policy change in the task's activity log.
+  // Fold conversation holds. Historical blocked work stays unwoken. An open task
+  // whose run died with an availability error gets one fresh session, delivered
+  // later by deliverReconciledExecutions. The run id on the action stops the
+  // stranded-work sweep from inserting the same hold again.
   const obsoleteConversationHold = and(
     conversationRecoveryActionPredicate(),
     or(
@@ -326,18 +488,52 @@ export async function settleUnrecoverableExecutions(
       .limit(25).for("update", { skipLocked: true });
     for (const candidate of foldable) {
       if (await getConversationOwnershipBlocker(tx as unknown as Db, candidate.companyId, candidate.sourceIssueId)) continue;
+      const interruption = await conversationInterruptionResume(tx as unknown as Db, candidate);
+      const foldedEvidence = () => sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
+          else ${issueRecoveryActions.evidence} end`;
+      const reconciliationStamp = interruption
+        ? JSON.stringify({ executionReconciliation: interruptionReconciliation(interruption.runId) })
+        : null;
+      const resumeStamp = interruption?.resume
+        ? JSON.stringify({
+            executionReconciliation: interruptionReconciliation(interruption.runId),
+            continuationDelivery: "pending",
+            automaticInterruptionResume: true,
+          })
+        : null;
+      const heldWithoutResume = interruption && !interruption.resume
+        ? JSON.stringify({
+            executionReconciliation: interruptionReconciliation(interruption.runId),
+            automaticRecovery: {
+              policy: "preserve_without_replay_v1",
+              replay: "conversation_continuation",
+              runId: interruption.runId,
+              actionOutcome: "unknown",
+            },
+          })
+        : null;
+      const evidence = resumeStamp
+        ? sql`(${foldedEvidence()}) || ${resumeStamp}::jsonb`
+        : heldWithoutResume
+          ? sql`case when (${foldedEvidence()}) ? 'automaticRecovery'
+              then (${foldedEvidence()}) || ${reconciliationStamp!}::jsonb
+              else (${foldedEvidence()}) || ${heldWithoutResume}::jsonb end`
+          : foldedEvidence();
       const [action] = await tx.update(issueRecoveryActions).set({
         status: "resolved",
         outcome: "cancelled",
         resolvedAt: now,
         updatedAt: now,
-        nextAction: "Automatic attempts stopped. Send a new message to continue the conversation.",
-        resolutionNote: "Conversation continuation does not replay prior tool calls.",
+        nextAction: interruption?.resume
+          ? "The interrupted run is closed. A fresh session is queued for the same task."
+          : "Automatic attempts stopped. Send a new message to continue the conversation.",
+        resolutionNote: interruption?.resume
+          ? "Availability interruption queued one fresh session. Prior tool calls are not replayed."
+          : "Conversation continuation does not replay prior tool calls.",
         wakePolicy: null,
         monitorPolicy: null,
-        evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
-          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
-          else ${issueRecoveryActions.evidence} end`,
+        evidence,
       }).where(and(obsoleteConversationHold, eq(issueRecoveryActions.id, candidate.id))).returning();
       if (!action) continue;
       await persistActivity(tx as unknown as Db, {
@@ -347,7 +543,12 @@ export async function settleUnrecoverableExecutions(
         action: "issue.execution_recovery_settled",
         entityType: "issue",
         entityId: action.sourceIssueId,
-        details: { recoveryActionId: action.id, outcome: "cancelled", continuation: "conversation" },
+        details: {
+          recoveryActionId: action.id,
+          outcome: "cancelled",
+          continuation: "conversation",
+          ...(interruption?.resume ? { freshSessionQueued: true } : {}),
+        },
       });
     }
   });
@@ -570,4 +771,108 @@ export async function settleUnrecoverableExecutions(
       );
     }
   }
+}
+
+const TERMINAL_RUN_STATUSES = ["succeeded", "completed", "failed", "timed_out", "interrupted", "cancelled"];
+
+/** Board evidence for one verified review-wait cancellation. This does not wake or replay. */
+export async function verifiedCancelledBeforeStartRun(db: Db, companyId: string, runId: string) {
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
+  ));
+  return Boolean(run && await isPreDispatchReviewWaitVerified(db, run));
+}
+
+function recordedSettlement(evidence: Record<string, unknown>, decision: ExecutionReconciliation) {
+  const current = evidence.executionReconciliation;
+  if (!current || typeof current !== "object") return "absent" as const;
+  const value = current as Record<string, unknown>;
+  const same = value.runId === decision.runId && value.providerStopped === true
+    && value.actionOutcome === decision.actionOutcome && value.outcomeEvidence === decision.outcomeEvidence;
+  return same ? "same" as const : "different" as const;
+}
+
+export async function settleCancelledBeforeStartHold(input: {
+  db: Db;
+  issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; executionRunId: string | null; checkoutRunId: string | null };
+  actionId: string;
+  decision: ExecutionReconciliation;
+  actorId: string;
+  resolutionNote?: string | null;
+}) {
+  const { db, issue, decision } = input;
+  const [action] = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.id, input.actionId),
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.sourceIssueId, issue.id),
+  )).for("update");
+  if (!action) throw conflict("Active recovery action not found");
+  if (action.fingerprint !== `legacy-execution:${decision.runId}`
+    || (action.evidence.runId ?? action.evidence.sourceRunId) !== decision.runId) {
+    throw conflict("The recovery action changed. Inspect the current hold before continuing.");
+  }
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, decision.runId),
+  )).for("update");
+  if (!run || run.agentId !== action.returnOwnerAgentId
+    || (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issue.id) {
+    throw conflict("The recovery source or task owner changed. Inspect the current execution before continuing.");
+  }
+  const evidence = action.evidence as Record<string, unknown>;
+  const recorded = recordedSettlement(evidence, decision);
+  if (recorded === "same" && evidence.continuationDelivery === "preserved") {
+    return { action, idempotent: true as const };
+  }
+  if (recorded !== "absent") {
+    throw conflict("This recovery event was already settled. A repeated event cannot change the recorded outcome.");
+  }
+  if (issue.executionRunId || issue.checkoutRunId) {
+    throw conflict("A live run still holds this task. Stop it before settling the cancelled run.");
+  }
+  const [live] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId),
+    notInArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
+    or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+  )).limit(1);
+  if (live) throw conflict("A live run still holds this task. Stop it before settling the cancelled run.");
+  if (!(await isPreDispatchReviewWaitVerified(db, run))) {
+    throw conflict("This run is not a verified cancelled-before-start review wait. Provider work or missing proof keeps the hold.");
+  }
+  const automatic = evidence.automaticRecovery as { replay?: string } | undefined;
+  if (automatic?.replay !== "blocked") {
+    throw conflict("Verified outcomes must settle the current no-replay hold.");
+  }
+  const [otherActive] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.sourceIssueId, issue.id),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+  )).limit(1);
+  if (otherActive) throw conflict("Another active recovery action still holds this task.");
+  const retained = { ...evidence };
+  delete retained.automaticRecovery;
+  const recordedAt = new Date().toISOString();
+  const [updated] = await db.update(issueRecoveryActions).set({
+    evidence: {
+      ...retained,
+      executionReconciliation: { ...decision, actorId: input.actorId, recordedAt },
+      continuationDelivery: "preserved",
+      cancelledBeforeStartSettlement: {
+        runId: decision.runId,
+        fingerprint: action.fingerprint,
+        preservedStatus: issue.status,
+        preservedAssigneeAgentId: issue.assigneeAgentId,
+        recordedAt,
+      },
+    },
+    nextAction: "Verified cancelled-before-start. Recorded work stays in place and this run was not replayed.",
+    resolutionNote: input.resolutionNote ?? action.resolutionNote,
+    updatedAt: new Date(),
+  }).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.id, action.id),
+    sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+    sql`${issueRecoveryActions.evidence}->'executionReconciliation' is null`,
+  )).returning();
+  if (!updated) throw conflict("This recovery event was already settled. A repeated event cannot change the recorded outcome.");
+  return { action: updated, idempotent: false as const };
 }

@@ -63,7 +63,8 @@ export type ScheduledRetryGateErrorCode =
   | "issue_paused"
   | "issue_dependencies_blocked"
   | "issue_disposition_repair_superseded"
-  | "issue_waiting_for_response";
+  | "issue_waiting_for_response"
+  | "automatic_interruption_resume_stale";
 
 export type GateDecision =
   | { allowed: true }

@@ -490,6 +490,8 @@ The task thread exposes the guarded Retry action for failed or timed-out convers
 
 A continuation cancelled by the queued-run gate while waiting for review did not start a provider. Its matching dispatch-gate receipt and unclaimed execution fields keep this deliberate wait out of unknown-action reconciliation. Pending review and decision gates still apply. If an older server already created a recovery hold for this exact state, Retry or a new user message can request one fresh turn after the server verifies there is no provider, coordinator, or unfinished cleanup. Saved user input is reconsidered through the same admission path; the cancelled turn is not replayed.
 
+A board operator can also settle that verified hold without a successor run. The operator records that the provider did not perform the action and supplies outcome evidence on the existing recovery resolution route. The server checks the run, the recorded recovery owner, the action fingerprint, the company, and the absence of provider execution. The task status, assignee, and work already received stay unchanged. The settlement does not wake an agent and does not replay the cancelled turn. The same evidence settles once. A different repeated event, a live run, a changed owner, a changed action, another company, provider work, or missing evidence keeps the hold. The durable `issue.recovery_action_resolved` audit is written in that same settlement transaction. Live publication happens only after the transaction commits. If the audit write fails, the hold stays in place. A later retry of the same evidence writes exactly one audit event and still does not wake an agent or replay the cancelled turn.
+
 A valid recovery action must name:
 
 - the source issue and company
@@ -711,6 +713,14 @@ coordinator lease or a delayed retry does not make that run orphaned. The sweep
 checks coordinator ownership in its terminal update, so a result recorded after
 the process check is also protected. Terminal task status remains authoritative;
 exhausted finalization retries do not keep an otherwise orphaned run alive.
+
+The stale-lock sweep also settles claimed wakes attached to terminal runs,
+including historical claims whose issue locks have already been cleared.
+Succeeded runs yield completed wakes, cancelled runs yield cancelled wakes,
+and interrupted, failed, or timed-out runs yield failed wakes. Settlement keeps
+the run's completion time and error evidence, preserves already settled wakes,
+and requires matching company and agent ownership. It does not enqueue a retry
+or bypass pause, blocker, budget, or review gates.
 
 Automatic productivity reviews are retired. Run counts, missing comments, and elapsed task time do not create review tasks or impose continuation holds. Bounded continuation, provider recovery, budget limits, explicit blockers, and normal review/approval stages remain in force. Existing productivity-review tasks, comments, assignments, and dependencies remain unchanged and readable; their historical origins still identify them as recovery work for recursion suppression.
 
@@ -995,7 +1005,9 @@ the run without retrying the admission check.
 
 An interrupted conversation does not permanently block its task. For local conversational adapters, Paperclip starts a new bounded turn with the existing session when compatible, or the full task conversation when the session is unavailable. The prompt says: “Your previous run was interrupted. Continue from where you left off.” The agent decides what remains from the history and latest user request. Paperclip never automatically replays recorded tool calls. Unknown past action outcomes are not a task-wide execution gate, and no action-reconciliation questionnaire is required.
 
-Shutdown, process loss, and provider failure use the existing durable failure retry counter and delay. Ordinary failure recovery permits at most two automatic retries in a failure chain. Accepted-interaction infrastructure recovery retains its existing bounded policy. Repeated scheduler visits reuse the same successor; restarting the server does not reset the counter. After exhaustion, automatic attempts stop. A new explicit user message can start a fresh run and failure budget. Productive max-turn continuation and confirmed workspace waits keep their separate existing semantics.
+When the server loses a running conversational session (`orphaned_running_run`, `process_lost`, or `server_shutdown_interrupted`) and the task is still `todo`, `in_progress`, or `in_review`, settlement records that run and queues one fresh session. The assignee must be unchanged and no newer run may exist. Delivery uses the existing reconciled-execution wake with a fresh session. The new session does not replay earlier tool calls. A done, cancelled, or blocked task, a changed assignee, a newer run, a superseded conversation, or a workspace restore failure is recorded and not woken. Admission checks those conditions again under the task lock before it creates the next run, and invalidates a pending automatic wake that no longer qualifies. An already created successor is left in place. Operator reconciliation keeps its own gates. The recorded run id stops the stranded-work sweep from inserting the same action again.
+
+Shutdown, process loss, and provider failure use the existing durable failure retry counter and its 30-second delay. Ordinary failure recovery permits at most two automatic retries in a failure chain. The fresh-session successor is one `scheduled_retry` on that schedule and records the next attempt. The existing due-retry sweep promotes it, and checks the open task again before promotion. Accepted-interaction infrastructure recovery retains its existing bounded policy. Repeated scheduler visits reuse the same successor; restarting the server does not reset the counter. After exhaustion, automatic attempts stop. A new explicit user message can start a fresh run and failure budget. Productive max-turn continuation and confirmed workspace waits keep their separate existing semantics.
 
 Real gates still apply: company and task ownership, active provider ownership, budget limits, agent availability, dependencies, pending approval/review paths, and explicit pause holds. Native runner reattachment and finalization retain their existing ownership protocol. Process, HTTP, and gateway adapters retain their recovery rules because invoking those adapters can itself repeat an external action rather than start a conversation turn.
 

@@ -284,6 +284,7 @@ export const issuesApi = {
       outcome: "restored" | "false_positive" | "blocked" | "cancelled";
       sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
       resolutionNote?: string | null;
+      preserveWithoutReplay?: true;
     },
   ) =>
     api.post<ResolveRecoveryActionResponse>(
