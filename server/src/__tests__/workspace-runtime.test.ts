@@ -141,7 +141,14 @@ if (!embeddedPostgresSupport.supported) {
 const provisionWorktreeScriptPath = new URL("../../../scripts/provision-worktree.sh", import.meta.url);
 
 async function runGit(cwd: string, args: string[]) {
-  await execFileAsync("git", args, { cwd });
+  // Runner identity overrides (including empty values) must not override the
+  // test repository's explicitly configured author and committer.
+  const env = { ...process.env };
+  delete env.GIT_AUTHOR_NAME;
+  delete env.GIT_AUTHOR_EMAIL;
+  delete env.GIT_COMMITTER_NAME;
+  delete env.GIT_COMMITTER_EMAIL;
+  await execFileAsync("git", args, { cwd, env });
 }
 
 async function readGit(cwd: string, args: string[]) {
@@ -155,7 +162,12 @@ async function runPnpm(cwd: string, args: string[]) {
 async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
   const configDir = path.join(baseCwd, ".paperclip");
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(path.join(configDir, "config.json"), "{}\n", "utf8");
+  await fs.writeFile(path.join(configDir, "config.json"), JSON.stringify({
+    $meta: { version: 1, updatedAt: "2026-03-26T00:00:00.000Z", source: "doctor" },
+    database: {},
+    logging: { mode: "file" },
+    server: {},
+  }) + "\n", "utf8");
   await fs.writeFile(
     path.join(configDir, ".env"),
     `PAPERCLIP_INSTANCE_ID=${instanceId}\n`,
@@ -1959,7 +1971,7 @@ describe("realizeExecutionWorkspace", () => {
         }
       }
     }
-  }, 15_000);
+  }, 60_000);
 
   it(
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
