@@ -19,6 +19,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
+  writeAdapterExecutionTargetTextFile,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asBoolean,
@@ -48,6 +49,13 @@ import {
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { grokHomeHasUsableAuth, resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
+import {
+  LINUX_MAX_ARG_STRLEN,
+  formatGrokPromptDeliveryDiagnostic,
+  grokPromptExceedsSingleArgument,
+  paperclipGrokPromptRemotePath,
+  writePaperclipGrokPromptFile,
+} from "./grok-prompt-file.js";
 import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -519,7 +527,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     }
 
     const commandNotes = (() => {
-      const notes: string[] = ["Prompt is passed to Grok via --single in headless mode."];
+      const notes: string[] = [];
       if (alwaysApprove) notes.push("Added --always-approve for unattended execution.");
       if (stagedAssets.stagedInstructionsPath) {
         notes.push(`Staged project instructions at ${stagedAssets.stagedInstructionsPath} for native Grok discovery.`);
@@ -546,7 +554,10 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     const paperclipEnvNote = renderPaperclipEnvNote(env);
     const apiAccessNote = renderApiAccessNote(env);
 
-    const buildArgs = (resumeSessionId: string | null, prompt: string) => {
+    const buildArgs = (
+      resumeSessionId: string | null,
+      promptArg: { flag: "--single" | "--prompt-file"; value: string },
+    ) => {
       const args = ["--cwd", effectiveExecutionCwd, "--output-format", "streaming-json"];
       if (resumeSessionId) args.push("--resume", resumeSessionId);
       if (model && model !== DEFAULT_GROK_LOCAL_MODEL) args.push("--model", model);
@@ -562,8 +573,49 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         return asStringArray(config.args);
       })();
       if (extraArgs.length > 0) args.push(...extraArgs);
-      args.push("--single", prompt);
+      args.push(promptArg.flag, promptArg.value);
       return args;
+    };
+
+    const resolvePromptArg = async (prompt: string) => {
+      const promptBytes = Buffer.byteLength(prompt);
+      const scratchRecord = parseObject(context.paperclipScratch);
+      const scratchDir =
+        env.PAPERCLIP_RUN_SCRATCH_DIR ??
+        (scratchRecord.type === "heartbeat_run" && typeof scratchRecord.dir === "string"
+          ? scratchRecord.dir
+          : null);
+      if (!grokPromptExceedsSingleArgument(prompt)) {
+        return {
+          promptArg: { flag: "--single" as const, value: prompt },
+          note: "Prompt is passed to Grok via --single in headless mode.",
+          diagnostic: null as string | null,
+        };
+      }
+      const hostPath = await writePaperclipGrokPromptFile({ runId, prompt, scratchDir });
+      let agentPath = hostPath;
+      if (executionTargetIsRemote) {
+        agentPath = paperclipGrokPromptRemotePath(runId);
+        await writeAdapterExecutionTargetTextFile(runId, runtimeExecutionTarget, agentPath, prompt, {
+          cwd,
+          env,
+          timeoutSec: 60,
+        });
+      }
+      if (Buffer.byteLength(agentPath) >= LINUX_MAX_ARG_STRLEN) {
+        throw new Error(
+          `Grok prompt path is ${Buffer.byteLength(agentPath)} bytes and does not fit in one argument.`,
+        );
+      }
+      return {
+        promptArg: { flag: "--prompt-file" as const, value: agentPath },
+        note: `Prompt is ${promptBytes} bytes, past the single-argument limit, so Grok reads it via --prompt-file. The full text stays in the run file.`,
+        diagnostic: formatGrokPromptDeliveryDiagnostic({
+          mode: "file",
+          bytes: promptBytes,
+          argBytes: Buffer.byteLength(agentPath),
+        }),
+      };
     };
 
     const runAttempt = async (resumeSessionId: string | null) => {
@@ -598,7 +650,15 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
         heartbeatPromptChars: attemptRenderedPrompt.length,
       };
-      const args = buildArgs(resumeSessionId, prompt);
+      const delivery = await resolvePromptArg(prompt);
+      const deliveryNotes = [
+        delivery.note,
+        ...commandNotes.filter((note) => !note.startsWith("Prompt is ")),
+      ];
+      commandNotes.length = 0;
+      commandNotes.push(...deliveryNotes);
+      if (delivery.diagnostic) await onLog("stdout", delivery.diagnostic);
+      const args = buildArgs(resumeSessionId, delivery.promptArg);
       if (onMeta) {
         await onMeta({
           adapterType: "grok_local",
@@ -606,7 +666,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
           cwd: effectiveExecutionCwd,
           commandNotes,
           commandArgs: args.map((value, index) => (
-            index === args.length - 1 ? `<prompt ${prompt.length} chars>` : value
+            args[index - 1] === "--single" ? `<prompt ${prompt.length} chars>` : value
           )),
           env: loggedEnv,
           prompt,

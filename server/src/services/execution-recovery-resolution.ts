@@ -143,6 +143,9 @@ const INTERRUPTION_RESUME_ERROR_CODES = new Set([
   "orphaned_running_run",
   "process_lost",
   "server_shutdown_interrupted",
+  // Lease teardown cuts a still-running turn without the SIGTERM drain.
+  // It is the same availability loss: one fresh session, no tool replay.
+  "lease_released_before_terminal",
 ]);
 
 /** Parked and closed tasks stay where an operator or an earlier disposition left them. */
