@@ -70,7 +70,7 @@ describe("grok prompt file", () => {
     expect(filePath).toBe(path.join(dir, "paperclip-grok-prompt.txt"));
     expect(await fs.readFile(filePath, "utf8")).toBe(prompt);
     expect(stat.mode & 0o777).toBe(0o600);
-    expect(paperclipGrokPromptRemotePath("run/id 1")).toBe("/tmp/paperclip-grok-prompt-runid1.txt");
+    expect(paperclipGrokPromptRemotePath("run/id 1")).toBe("/tmp/paperclip-grok-prompt-runid1/prompt.txt");
     expect(Buffer.byteLength(paperclipGrokPromptRemotePath("run-1"))).toBeLessThan(LINUX_MAX_ARG_STRLEN);
     await fs.rm(dir, { recursive: true, force: true });
   });

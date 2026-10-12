@@ -1140,12 +1140,12 @@ describe("grok_local execute", () => {
       const published = writeTextFileMock.mock.calls[0] as unknown[];
       const remotePath = published[2];
       const body = published[3];
-      expect(remotePath).toBe("/tmp/paperclip-grok-prompt-run-remote-long-prompt.txt");
+      expect(remotePath).toBe("/tmp/paperclip-grok-prompt-run-remote-long-prompt/prompt.txt");
       expect(typeof body).toBe("string");
       expect(Buffer.byteLength(body as string)).toBeGreaterThan(131072);
       expect(body).toContain(marker);
       expect(seenArgs).toContain("--prompt-file");
-      expect(seenArgs).toContain("/tmp/paperclip-grok-prompt-run-remote-long-prompt.txt");
+      expect(seenArgs).toContain("/tmp/paperclip-grok-prompt-run-remote-long-prompt/prompt.txt");
       expect(seenArgs).not.toContain("--single");
       for (const arg of seenArgs) {
         expect(arg).not.toContain(marker);

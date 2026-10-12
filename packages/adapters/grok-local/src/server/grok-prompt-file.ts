@@ -17,7 +17,9 @@ export function grokPromptExceedsSingleArgument(prompt: string): boolean {
 export function paperclipGrokPromptRemotePath(runId: string): string {
   const safe = runId.trim().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 80);
   if (!safe) throw new Error("Grok prompt run id is empty.");
-  return `/tmp/paperclip-grok-prompt-${safe}.txt`;
+  // A private directory, not a file directly in /tmp. The publisher creates
+  // that directory mode 0700 and refuses to follow a symlink at this path.
+  return `/tmp/paperclip-grok-prompt-${safe}/prompt.txt`;
 }
 
 export function formatGrokPromptDeliveryDiagnostic(delivery: {
