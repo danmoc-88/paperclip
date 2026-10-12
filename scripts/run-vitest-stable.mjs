@@ -101,17 +101,16 @@ const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
 // even though the local workflow copy is not what CI executes.
 const generalWorkspacesCProjects = ["@paperclipai/db"];
 const generalWorkspacesBProjects = nonServerProjects.filter(
-  // Retain db coverage for release workflows that still invoke only a/b.
-  (project) => !generalWorkspacesAProjects.includes(project),
+  (project) => !generalWorkspacesAProjects.includes(project) && !generalWorkspacesCProjects.includes(project),
 );
 const generalGroupNames = [
   generalServerGroupName,
   generalWorkspacesAGroupName,
   generalWorkspacesBGroupName,
+  generalWorkspacesCGroupName,
 ];
 const allowedGeneralGroupNames = [
   ...generalGroupNames,
-  generalWorkspacesCGroupName,
   generalServerWithoutChatGroupName,
   generalChatGroupName,
   generalServerNativeRunnerGroupName,

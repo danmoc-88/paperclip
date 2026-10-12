@@ -7866,7 +7866,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               <WorkspaceExportRecovery key={issue.activeRecoveryAction?.id ?? issue.id} issueId={issue.id}
                 action={issue.activeRecoveryAction ?? null} canManage={canManageBoardRuntime} onQueued={invalidateIssueDetail} />
               {issue.executionBlocker && (
-                <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
+                <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} sourceStatus={issue.status} canSettle={canResolveBoardRecoveryAction} onRetried={invalidateIssueDetail} />
               )}
               {resolvedDetailTab === "chat" ? (
                 <DispositionRecoveryProvider value={{

@@ -103,13 +103,25 @@ test("shard flags are rejected for the workspaces-b group", () => {
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");
 });
 
-test("workspaces-c accepts the upstream db lane while legacy workspaces-b retains coverage", () => {
-  const c = dryRunJson(["--mode", "general", "--group", "general-workspaces-c"]);
+test("shard flags are rejected for the workspaces-c group", () => {
+  const result = dryRun(["--mode", "general", "--group", "general-workspaces-c", "--shard-index", "0", "--shard-count", "3"]);
+  assert.notEqual(result.status, 0, "workspaces-c must not accept shard flags");
+});
+
+test("workspaces-c runs only the db project and the workspace lanes do not overlap", () => {
+  const a = dryRunJson(["--mode", "general", "--group", "general-workspaces-a"]);
   const b = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
+  const c = dryRunJson(["--mode", "general", "--group", "general-workspaces-c"]);
+
   assert.deepEqual(c.workspaceProjects, ["@paperclipai/db"]);
-  assert.ok(b.workspaceProjects.includes("@paperclipai/db"));
-  const sharded = dryRun(["--mode", "general", "--group", "general-workspaces-c", "--shard-index", "0", "--shard-count", "3"]);
-  assert.notEqual(sharded.status, 0);
+  assert.deepEqual(a.workspaceProjects, ["@paperclipai/ui", "paperclipai"]);
+  assert.ok(!b.workspaceProjects.includes("@paperclipai/db"));
+  assert.ok(!b.workspaceProjects.includes("@paperclipai/ui"));
+  assert.ok(!b.workspaceProjects.includes("paperclipai"));
+
+  const covered = [...a.workspaceProjects, ...b.workspaceProjects, ...c.workspaceProjects];
+  assert.equal(new Set(covered).size, covered.length, "workspace lanes must not overlap");
+  assert.ok(b.workspaceProjects.includes("@paperclipai/shared"));
 });
 
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
