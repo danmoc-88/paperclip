@@ -27,7 +27,7 @@ import {
   executionFailureRetryCount,
   type ExecutionRetryAccounting,
 } from "./execution-recovery-attempt.js";
-import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
+import { isAdapterStartupFailureVerified, isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -838,8 +838,10 @@ export async function settleCancelledBeforeStartHold(input: {
     or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
   )).limit(1);
   if (live) throw conflict("A live run still holds this task. Stop it before settling the cancelled run.");
-  if (!(await isPreDispatchReviewWaitVerified(db, run))) {
-    throw conflict("This run is not a verified cancelled-before-start review wait. Provider work or missing proof keeps the hold.");
+  const proof = (await isPreDispatchReviewWaitVerified(db, run)) ? "review_wait" as const
+    : (await isAdapterStartupFailureVerified(db, run)) ? "adapter_startup_failure" as const : null;
+  if (!proof) {
+    throw conflict("This run is not a verified cancelled-before-start run. Provider work or missing proof keeps the hold.");
   }
   const automatic = evidence.automaticRecovery as { replay?: string } | undefined;
   if (automatic?.replay !== "blocked") {
@@ -861,6 +863,7 @@ export async function settleCancelledBeforeStartHold(input: {
       continuationDelivery: "preserved",
       cancelledBeforeStartSettlement: {
         runId: decision.runId,
+        proof,
         fingerprint: action.fingerprint,
         preservedStatus: issue.status,
         preservedAssigneeAgentId: issue.assigneeAgentId,

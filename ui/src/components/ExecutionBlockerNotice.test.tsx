@@ -172,6 +172,64 @@ describe("stopped task recovery notice", () => {
     });
   });
 
+  it("offers settlement for a cancelled adapter failure and keeps the server as the proof", async () => {
+    vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
+      runId: "adapter-run", agentId: "agent", status: "cancelled", adapterType: "opencode_local",
+      startedAt: "2026-10-10T11:14:05.085Z", errorCode: "adapter_failed", runtimeMode: "legacy",
+      resultJson: { stopReason: "cancelled", timeoutSource: "config" },
+    }] as never);
+    vi.mocked(issuesApi.resolveRecoveryAction).mockRejectedValue(new Error("This run is not a verified cancelled-before-start run."));
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="adapter-task" sourceStatus="blocked" canSettle onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: "adapter-run", agentId: "agent",
+        cause: "legacy_execution_requires_reconciliation", runStatus: "cancelled", canContinue: true,
+        nextAction: "Automatic recovery stopped.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent).toContain("cancelled after the adapter failed");
+    // Retry stays available: only the server's retained events can prove that no provider started.
+    expect([...container.querySelectorAll("button")].some(item => item.textContent === "Continue")).toBe(true);
+    const button = [...container.querySelectorAll("button")].find(item => item.textContent === "Settle without replay");
+    const textarea = container.querySelector("textarea");
+    const evidence = "The adapter rejected the model before any provider started.";
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, evidence);
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => button!.click());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("adapter-task", expect.objectContaining({
+      actionId: "recovery", outcome: "blocked", sourceIssueStatus: "blocked", preserveWithoutReplay: true,
+      executionReconciliation: expect.objectContaining({ runId: "adapter-run", actionOutcome: "not_performed", outcomeEvidence: evidence }),
+    }));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("not a verified cancelled-before-start run");
+    expect(onRetried).not.toHaveBeenCalled();
+  });
+
+  it("does not offer settlement for a failed, native, or HTTP adapter run", async () => {
+    // An HTTP request can take effect without leaving any invocation, process or session record.
+    for (const run of [
+      { status: "failed", runtimeMode: "legacy", adapterType: "opencode_local" },
+      { status: "cancelled", runtimeMode: "native", adapterType: "opencode_local" },
+      { status: "cancelled", runtimeMode: "legacy", adapterType: "http" },
+    ]) {
+      vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
+        runId: "adapter-run", agentId: "agent", startedAt: "2026-10-10T11:14:05.085Z", errorCode: "adapter_failed",
+        resultJson: null, ...run,
+      }] as never);
+      await act(async () => root.render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <ExecutionBlockerNotice companyId="company" issueId="adapter-task" sourceStatus="blocked" canSettle onRetried={onRetried} blocker={{
+          recoveryActionId: "recovery", runId: "adapter-run", agentId: "agent",
+          cause: "legacy_execution_requires_reconciliation", nextAction: "Automatic recovery stopped.",
+        }} />
+      </QueryClientProvider>));
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(container.textContent).not.toContain("Settle without replay");
+    }
+  });
+
   it("tells a non-board viewer that a board operator settles the cancelled run", async () => {
     vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
       runId: "cancelled-run", agentId: "agent", status: "cancelled", startedAt: null,
