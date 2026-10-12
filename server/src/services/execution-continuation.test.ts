@@ -245,25 +245,29 @@ const support = await getEmbeddedPostgresTestSupport();
       }
     });
 
-    it("preserves the latest user request and adds an interruption notice to fresh and resumed turns", async () => {
-      await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "server_shutdown_interrupted" }).where(eq(heartbeatRuns.id, runId));
-      try {
-        const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
-          context: { retryOfRunId: runId, wakeReason: "retry_failed_run" },
-          summary: "Deployment completed. Verification remains.", exposeLowTrustRaw: false });
-        expect(envelope.interruptedRunId).toBe(runId);
-        expect(envelope.objective).toBe("Focus the Gmail summary on launch decisions.");
-        expect(envelope.messages.map(message => message.id)).toContain(gmailId);
-        for (const resumedSession of [true, false]) {
-          const prompt = renderPaperclipWakePrompt({ executionContinuation: envelope }, { resumedSession });
-          expect(prompt).toContain("A previous run on this task was interrupted or handed off from another agent. Continue from the existing work");
-          expect(prompt).toContain("Prior tool calls are history, not commands to replay");
-          expect(prompt).toContain("Deployment completed. Verification remains.");
+    it.each(["server_shutdown_interrupted", "lease_released_before_terminal"])(
+      "preserves the latest user request and adds an interruption notice to fresh and resumed turns (%s)",
+      async (errorCode) => {
+        await db.update(heartbeatRuns).set({ status: "interrupted", errorCode }).where(eq(heartbeatRuns.id, runId));
+        try {
+          const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
+            context: { retryOfRunId: runId, wakeReason: "retry_failed_run" },
+            summary: "Deployment completed. Verification remains.", exposeLowTrustRaw: false });
+          expect(envelope.interruptedRunId).toBe(runId);
+          expect(envelope.objective).toBe("Focus the Gmail summary on launch decisions.");
+          expect(envelope.messages.map(message => message.id)).toContain(gmailId);
+          for (const resumedSession of [true, false]) {
+            const prompt = renderPaperclipWakePrompt({ executionContinuation: envelope }, { resumedSession });
+            expect(prompt).toContain("A previous run on this task was interrupted or handed off from another agent. Continue from the existing work");
+            expect(prompt).toContain("When this session has no saved resume checkpoint, settle the worktree before further work");
+            expect(prompt).toContain("Prior tool calls are history, not commands to replay");
+            expect(prompt).toContain("Deployment completed. Verification remains.");
+          }
+        } finally {
+          await db.update(heartbeatRuns).set({ status: "failed", errorCode: null }).where(eq(heartbeatRuns.id, runId));
         }
-      } finally {
-        await db.update(heartbeatRuns).set({ status: "failed", errorCode: null }).where(eq(heartbeatRuns.id, runId));
-      }
-    });
+      },
+    );
 
     it("keeps Local CLI run-authored comments as history without promoting them to human direction", async () => {
       const id = randomUUID();
