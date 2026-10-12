@@ -174,7 +174,7 @@ describe("stopped task recovery notice", () => {
 
   it("offers settlement for a cancelled adapter failure and keeps the server as the proof", async () => {
     vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
-      runId: "adapter-run", agentId: "agent", status: "cancelled",
+      runId: "adapter-run", agentId: "agent", status: "cancelled", adapterType: "opencode_local",
       startedAt: "2026-10-10T11:14:05.085Z", errorCode: "adapter_failed", runtimeMode: "legacy",
       resultJson: { stopReason: "cancelled", timeoutSource: "config" },
     }] as never);
@@ -207,8 +207,13 @@ describe("stopped task recovery notice", () => {
     expect(onRetried).not.toHaveBeenCalled();
   });
 
-  it("does not offer settlement for a failed or native adapter run", async () => {
-    for (const run of [{ status: "failed", runtimeMode: "legacy" }, { status: "cancelled", runtimeMode: "native" }]) {
+  it("does not offer settlement for a failed, native, or HTTP adapter run", async () => {
+    // An HTTP request can take effect without leaving any invocation, process or session record.
+    for (const run of [
+      { status: "failed", runtimeMode: "legacy", adapterType: "opencode_local" },
+      { status: "cancelled", runtimeMode: "native", adapterType: "opencode_local" },
+      { status: "cancelled", runtimeMode: "legacy", adapterType: "http" },
+    ]) {
       vi.mocked(activityApi.runsForIssue).mockResolvedValue([{
         runId: "adapter-run", agentId: "agent", startedAt: "2026-10-10T11:14:05.085Z", errorCode: "adapter_failed",
         resultJson: null, ...run,

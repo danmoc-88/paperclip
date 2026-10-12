@@ -56,16 +56,41 @@ export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise
   return hasNoRetainedExecutionEvidence(db, run);
 }
 
+/** Adapters proven to record `adapter.invoke` before any provider work can
+ * start, so a missing invocation event is positive proof that no provider ran.
+ * OpenCode checks the configured model, then awaits `onMeta`, and only then
+ * starts the provider process. Other adapters do not qualify by default: the
+ * HTTP adapter, for one, sends its request without ever recording an
+ * invocation, process, or session, so silence there proves nothing. Add an
+ * adapter here only with a code-level proof that it records the invocation
+ * before the first provider side effect. */
+const ADAPTERS_RECORDING_INVOCATION_BEFORE_PROVIDER_WORK: ReadonlySet<string> = new Set(["opencode_local"]);
+
+/** The adapter the run was dispatched to, as recorded on the run when it was
+ * dispatched. The agent's current adapter may have changed since, so it is not
+ * consulted. Missing or malformed snapshots fail closed. */
+function dispatchedAdapterType(run: Partial<Pick<Run, "runnerProfileJson">>): string | null {
+  const dispatch = run.runnerProfileJson?.adapterDispatch;
+  if (!dispatch || typeof dispatch !== "object" || Array.isArray(dispatch)) return null;
+  const adapterType = (dispatch as Record<string, unknown>).adapterType;
+  return typeof adapterType === "string" ? adapterType : null;
+}
+
 /** A run the adapter failed before launching any provider, for example because
  * the configured model was unavailable. The run row alone is only a candidate:
- * `adapter_failed` also covers failures after provider work, so settlement still
- * requires the retained evidence to show that no execution was ever recorded.
+ * `adapter_failed` also covers failures after provider work, so settlement
+ * requires both an adapter that records its invocation before any provider work
+ * (so the missing `adapter.invoke` is positive proof) and retained evidence
+ * showing that no execution was ever recorded.
  * This is for an explicit board settlement only. It never lets the automatic
  * retry classifier treat the run as safe to replay. */
 export function isAdapterStartupFailure(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "finishedAt" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "finishedAt" | "resultJson"> &
+    Partial<Pick<Run, DispatchFields | "runnerProfileJson">>,
 ): boolean {
+  const adapterType = dispatchedAdapterType(run);
   return run.runtimeMode === "legacy" && run.status === "cancelled" &&
+    adapterType !== null && ADAPTERS_RECORDING_INVOCATION_BEFORE_PROVIDER_WORK.has(adapterType) &&
     run.errorCode === "adapter_failed" && run.finishedAt != null &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
     run.processPid == null && run.processGroupId == null && run.processStartedAt == null &&

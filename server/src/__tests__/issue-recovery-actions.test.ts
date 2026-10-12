@@ -35,6 +35,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { legacyExecutionNeedsReconciliationWithEvidence } from "../services/legacy-execution-recovery.js";
+import { isPreDispatchReviewWaitVerified } from "../services/pre-dispatch-review-wait.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -1910,6 +1912,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       controllerBootId: randomUUID(),
       controllerLeaseExpiresAt: new Date("2026-10-10T11:15:15.130Z"),
       resultJson: { stopReason: "cancelled", timeoutFired: false, timeoutSource: "config", timeoutConfigured: true },
+      runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
     }).where(eq(heartbeatRuns.id, seeded.runId));
     const events = [
       { eventType: "lifecycle", stream: "system", level: "info", message: "run started" },
@@ -2003,7 +2006,37 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await expectCancelledHoldRemains(live)).body.error).toMatch(/live run/);
   });
 
-  it("lets only a board operator settle an adapter failure, and does not make it replay-safe", async () => {
+  /** An adapter that can act without recording an invocation, process, or session
+   * (HTTP sends its request and records nothing) leaves exactly the evidence of a
+   * run that never started. Silence is not proof for it, so the hold stays. */
+  it.each([
+    ["http", { adapterDispatch: { adapterType: "http" } }],
+    ["process", { adapterDispatch: { adapterType: "process" } }],
+    ["no dispatch snapshot", {}],
+    ["malformed snapshot", { adapterDispatch: "opencode_local" }],
+    ["non-string adapter type", { adapterDispatch: { adapterType: 7 } }],
+  ])("keeps the hold on an adapter failure whose dispatch cannot prove no provider ran: %s", async (_name, runnerProfileJson) => {
+    const seeded = await seedAdapterStartupFailure();
+    await db.update(heartbeatRuns).set({ runnerProfileJson }).where(eq(heartbeatRuns.id, seeded.runId));
+    expect((await expectCancelledHoldRemains(seeded)).body.error).toMatch(/not a verified cancelled-before-start/);
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.sourceIssueId)).not.toBeNull();
+  });
+
+  it("uses the adapter recorded at dispatch, not the agent's current adapter", async () => {
+    const seeded = await seedAdapterStartupFailure();
+    await db.update(agents).set({ adapterType: "http" }).where(eq(agents.id, seeded.coderId));
+    await request(createApp()).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send(seeded.body).expect(200);
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.sourceIssueId)).toBeNull();
+  });
+
+  it("does not let the automatic classifier treat a settleable adapter failure as replay-safe", async () => {
+    const seeded = await seedAdapterStartupFailure();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(await isPreDispatchReviewWaitVerified(db, run!)).toBe(false);
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run!)).toBe(true);
+  });
+
+  it("lets only a board operator settle an adapter failure, and leaves restoring it unchanged", async () => {
     const agent = await seedAdapterStartupFailure();
     const agentRunId = randomUUID();
     await seedHeartbeatRun({ companyId: agent.companyId, agentId: agent.managerId, runId: agentRunId, issueId: agent.sourceIssueId, status: "running" });
@@ -2012,14 +2045,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(response.body.error).toMatch(/Board access required/);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, agent.action.id)))[0]!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
 
-    // The verified review-wait replay refusal is not extended to adapter failures:
-    // a board operator can still choose to restore and continue after verifying.
+    // This change adds no way to restore an adapter failure: the existing owner
+    // check still refuses it (the task owner is not the run's agent), and the
+    // refusal must leave the hold, the issue and the run table untouched.
     const replay = await seedAdapterStartupFailure();
+    const [before] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, replay.action.id));
     const refused = await request(createApp()).post(`/api/issues/${replay.sourceIssueId}/recovery-actions/resolve`).send({
       actionId: replay.action.id, outcome: "restored", sourceIssueStatus: "todo",
       executionReconciliation: replay.body.executionReconciliation,
-    });
-    expect(refused.body.error ?? "").not.toMatch(/cannot be replayed/);
+    }).expect(409);
+    expect(refused.body.error).toMatch(/owner changed/);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, replay.action.id)))[0]).toEqual(before);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, replay.sourceIssueId));
+    expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: replay.managerId, executionRunId: null });
+    expect(await getExecutionBlocker(db, replay.companyId, replay.sourceIssueId)).not.toBeNull();
+    await deliverReconciledExecutions(db, async () => { throw new Error("replay"); });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, replay.companyId))).toHaveLength(0);
   });
 
   it("keeps the cancelled-before-start hold when the audit write fails, then records one event on retry", async () => {

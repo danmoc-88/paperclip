@@ -22,10 +22,12 @@ function isCancelledBeforeStartRun(run: RunForIssue) {
     && result?.timeoutSource === "stale_queued_run_gate";
 }
 
-/** Candidate only: the server settles this solely when the run's retained events
- * show that no provider execution was ever recorded. Retry stays available. */
+/** Candidate only: the server settles this solely for an adapter that records
+ * its invocation before any provider work (currently OpenCode) and only when
+ * the run's retained events show no execution. Retry stays available. */
 function isAdapterStartupFailureRun(run: RunForIssue) {
   return (run.runtimeMode ?? "legacy") === "legacy"
+    && run.adapterType === "opencode_local"
     && run.status === "cancelled"
     && run.errorCode === "adapter_failed";
 }
