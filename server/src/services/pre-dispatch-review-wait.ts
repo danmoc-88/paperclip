@@ -25,11 +25,9 @@ export function isPreDispatchReviewWait(
     run.controllerBootId === null && run.controllerLeaseExpiresAt === null && run.executionStage === null;
 }
 
-/** The row receipt is a candidate, not permission to discard conflicting
- * retained execution or cleanup evidence. Historical false holds must be
- * checked against the same evidence that gates explicit user admission. */
-export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise<boolean> {
-  if (!isPreDispatchReviewWait(run)) return false;
+/** Retained evidence that no provider execution began for this run. Shared by
+ * every pre-provider settlement proof so they cannot drift apart. */
+async function hasNoRetainedExecutionEvidence(db: Db, run: Run): Promise<boolean> {
   const [coordinator] = await db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
   )).limit(1);
@@ -48,4 +46,33 @@ export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise
         "provider.event", "provider.rpc_result", "tool.execution.started"])),
   )).limit(1);
   return !execution;
+}
+
+/** The row receipt is a candidate, not permission to discard conflicting
+ * retained execution or cleanup evidence. Historical false holds must be
+ * checked against the same evidence that gates explicit user admission. */
+export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise<boolean> {
+  if (!isPreDispatchReviewWait(run)) return false;
+  return hasNoRetainedExecutionEvidence(db, run);
+}
+
+/** A run the adapter failed before launching any provider, for example because
+ * the configured model was unavailable. The run row alone is only a candidate:
+ * `adapter_failed` also covers failures after provider work, so settlement still
+ * requires the retained evidence to show that no execution was ever recorded.
+ * This is for an explicit board settlement only. It never lets the automatic
+ * retry classifier treat the run as safe to replay. */
+export function isAdapterStartupFailure(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "finishedAt" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+): boolean {
+  return run.runtimeMode === "legacy" && run.status === "cancelled" &&
+    run.errorCode === "adapter_failed" && run.finishedAt != null &&
+    run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
+    run.processPid == null && run.processGroupId == null && run.processStartedAt == null &&
+    run.nativeIssueId == null && run.nativeSessionId == null && run.sessionIdAfter == null;
+}
+
+export async function isAdapterStartupFailureVerified(db: Db, run: Run): Promise<boolean> {
+  if (!isAdapterStartupFailure(run)) return false;
+  return hasNoRetainedExecutionEvidence(db, run);
 }

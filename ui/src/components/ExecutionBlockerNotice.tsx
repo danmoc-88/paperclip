@@ -22,6 +22,14 @@ function isCancelledBeforeStartRun(run: RunForIssue) {
     && result?.timeoutSource === "stale_queued_run_gate";
 }
 
+/** Candidate only: the server settles this solely when the run's retained events
+ * show that no provider execution was ever recorded. Retry stays available. */
+function isAdapterStartupFailureRun(run: RunForIssue) {
+  return (run.runtimeMode ?? "legacy") === "legacy"
+    && run.status === "cancelled"
+    && run.errorCode === "adapter_failed";
+}
+
 export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried, sourceStatus = "", canSettle = false }: {
   companyId: string;
   issueId: string;
@@ -44,6 +52,11 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried,
   const cancelledBeforeStart = Boolean(
     blocker.recoveryActionId && blocker.runId && sourceRun && preserveStatus
     && isCancelledBeforeStartRun(sourceRun),
+  );
+  const adapterStartupFailure = Boolean(
+    !cancelledBeforeStart && blocker.recoveryActionId && blocker.runId && sourceRun && preserveStatus
+    && blocker.cause === "legacy_execution_requires_reconciliation"
+    && isAdapterStartupFailureRun(sourceRun),
   );
   const settle = useMutation({
     mutationFn: () => issuesApi.resolveRecoveryAction(issueId, {
@@ -101,9 +114,11 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried,
       {retry.isError && (
         <p role="alert" className="w-full text-destructive">{retry.error.message}</p>
       )}
-      {cancelledBeforeStart && (
+      {(cancelledBeforeStart || adapterStartupFailure) && (
         <div className="flex w-full flex-col gap-2">
-          <p className="text-muted-foreground">This run was cancelled before a provider started. Record that the provider did not perform the action. The task status and recorded work stay unchanged, and this run is not replayed.</p>
+          <p className="text-muted-foreground">{cancelledBeforeStart
+            ? "This run was cancelled before a provider started. Record that the provider did not perform the action. The task status and recorded work stay unchanged, and this run is not replayed."
+            : "This run was cancelled after the adapter failed. If the run's events show that no provider started, you can record that the provider did not perform the action. The task status and recorded work stay unchanged, and this run is not replayed. The server refuses this when any provider work is recorded."}</p>
           {canSettle ? <>
             <Label htmlFor={evidenceId}>Outcome evidence</Label>
             <Textarea id={evidenceId} value={evidence} onChange={event => setEvidence(event.target.value)} maxLength={12_000}

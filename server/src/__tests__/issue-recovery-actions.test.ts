@@ -16,6 +16,7 @@ import {
   createDb,
   environmentLeases,
   environments,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueInboxArchives,
@@ -155,6 +156,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issueComments);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
@@ -1891,6 +1893,133 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }).expect(409);
     expect(changed.body.error).toMatch(/already settled/);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id)))[0]).toEqual(action);
+  });
+
+  /** SAK-1029: the adapter rejected the configured model before launching any
+   * provider. The run was started and dispatching, then cancelled, and the hold
+   * was already resolved with replay blocked. */
+  async function seedAdapterStartupFailure(issueStatus: "in_review" | "blocked" = "blocked") {
+    const seeded = await seedCancelledBeforeStart(issueStatus);
+    await db.update(heartbeatRuns).set({
+      startedAt: new Date("2026-10-10T11:14:05.085Z"),
+      finishedAt: new Date("2026-10-10T11:16:19.910Z"),
+      errorCode: "adapter_failed",
+      error: "Configured OpenCode model is unavailable: openrouter/z-ai/glm-5.3-flash.",
+      runtimeModeResolvedAt: new Date("2026-10-10T11:14:11.087Z"),
+      executionStage: "dispatching",
+      controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date("2026-10-10T11:15:15.130Z"),
+      resultJson: { stopReason: "cancelled", timeoutFired: false, timeoutSource: "config", timeoutConfigured: true },
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    const events = [
+      { eventType: "lifecycle", stream: "system", level: "info", message: "run started" },
+      { eventType: "error", stream: "system", level: "error", message: "Configured OpenCode model is unavailable" },
+      { eventType: "lifecycle", stream: "system", level: "info", message: "run scratch cleaned" },
+    ];
+    await db.insert(heartbeatRunEvents).values(events.map((event, index) => ({
+      companyId: seeded.companyId, runId: seeded.runId, agentId: seeded.coderId, seq: index + 1, ...event,
+    })));
+    return {
+      ...seeded,
+      body: {
+        ...seeded.body,
+        executionReconciliation: {
+          ...seeded.body.executionReconciliation,
+          outcomeEvidence: "The adapter rejected the configured model before any provider started; the run log has no provider event.",
+        },
+      },
+    };
+  }
+
+  it.each(["blocked", "in_review"] as const)("settles an adapter failure that never launched a provider without replay or a status change: %s", async (issueStatus) => {
+    const seeded = await seedAdapterStartupFailure(issueStatus);
+    // The task owner differs from the run's agent, as on SAK-1029.
+    expect(seeded.managerId).not.toBe(seeded.coderId);
+    const app = createApp();
+    const resolved = await request(app).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send(seeded.body).expect(200);
+    expect(resolved.body.issue.status).toBe(issueStatus);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+    expect(issue).toMatchObject({ status: issueStatus, assigneeAgentId: seeded.managerId, executionRunId: null, checkoutRunId: null });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id));
+    expect(action).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(action!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(action!.evidence).toMatchObject({
+      continuationDelivery: "preserved",
+      executionReconciliation: { runId: seeded.runId, actionOutcome: "not_performed" },
+      cancelledBeforeStartSettlement: { proof: "adapter_startup_failure", preservedStatus: issueStatus },
+    });
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.sourceIssueId)).toBeNull();
+    // No wake, no retry of the settled run, and no new run row.
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
+    await deliverReconciledExecutions(db, async () => { throw new Error("replay"); });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId));
+    expect(runs.map((run) => run.id)).toEqual([seeded.runId]);
+    const repeated = await request(app).post(`/api/issues/${seeded.sourceIssueId}/recovery-actions/resolve`).send(seeded.body).expect(200);
+    expect(repeated.body.issue.status).toBe(issueStatus);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seeded.action.id)))[0]).toEqual(action);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.sourceIssueId));
+    expect(activity.filter((row) => row.action === "issue.recovery_action_resolved")).toHaveLength(1);
+  });
+
+  it("keeps the hold on an adapter failure unless the run proves that no provider started", async () => {
+    const invoked = await seedAdapterStartupFailure();
+    await db.insert(heartbeatRunEvents).values({
+      companyId: invoked.companyId, runId: invoked.runId, agentId: invoked.coderId, seq: 10,
+      eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter invocation",
+    });
+    expect((await expectCancelledHoldRemains(invoked)).body.error).toMatch(/not a verified cancelled-before-start/);
+
+    const sourced = await seedAdapterStartupFailure();
+    await db.insert(heartbeatRunEvents).values({
+      companyId: sourced.companyId, runId: sourced.runId, agentId: sourced.coderId, seq: 10,
+      eventType: "lifecycle", sourceEventId: "provider-event-1",
+    });
+    await expectCancelledHoldRemains(sourced);
+
+    const spawned = await seedAdapterStartupFailure();
+    await db.update(heartbeatRuns).set({ processPid: 4242 }).where(eq(heartbeatRuns.id, spawned.runId));
+    await expectCancelledHoldRemains(spawned);
+
+    const sessioned = await seedAdapterStartupFailure();
+    await db.update(heartbeatRuns).set({ sessionIdAfter: "session-after" }).where(eq(heartbeatRuns.id, sessioned.runId));
+    await expectCancelledHoldRemains(sessioned);
+
+    const failed = await seedAdapterStartupFailure();
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, failed.runId));
+    await expectCancelledHoldRemains(failed);
+
+    const otherCode = await seedAdapterStartupFailure();
+    await db.update(heartbeatRuns).set({ errorCode: "process_lost" }).where(eq(heartbeatRuns.id, otherCode.runId));
+    await expectCancelledHoldRemains(otherCode);
+
+    const unsafeWorkspace = await seedAdapterStartupFailure();
+    await db.update(heartbeatRuns).set({
+      resultJson: { stopReason: "cancelled", workspaceRestoreFailure: "restore_unsafe_archive" },
+    }).where(eq(heartbeatRuns.id, unsafeWorkspace.runId));
+    await expectCancelledHoldRemains(unsafeWorkspace);
+
+    const live = await seedAdapterStartupFailure();
+    await seedHeartbeatRun({ companyId: live.companyId, agentId: live.coderId, runId: randomUUID(), issueId: live.sourceIssueId, status: "running" });
+    expect((await expectCancelledHoldRemains(live)).body.error).toMatch(/live run/);
+  });
+
+  it("lets only a board operator settle an adapter failure, and does not make it replay-safe", async () => {
+    const agent = await seedAdapterStartupFailure();
+    const agentRunId = randomUUID();
+    await seedHeartbeatRun({ companyId: agent.companyId, agentId: agent.managerId, runId: agentRunId, issueId: agent.sourceIssueId, status: "running" });
+    const agentApp = createApp({ type: "agent", agentId: agent.managerId, companyId: agent.companyId, runId: agentRunId, source: "agent_jwt" });
+    const response = await request(agentApp).post(`/api/issues/${agent.sourceIssueId}/recovery-actions/resolve`).send(agent.body).expect(403);
+    expect(response.body.error).toMatch(/Board access required/);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, agent.action.id)))[0]!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+
+    // The verified review-wait replay refusal is not extended to adapter failures:
+    // a board operator can still choose to restore and continue after verifying.
+    const replay = await seedAdapterStartupFailure();
+    const refused = await request(createApp()).post(`/api/issues/${replay.sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: replay.action.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: replay.body.executionReconciliation,
+    });
+    expect(refused.body.error ?? "").not.toMatch(/cannot be replayed/);
   });
 
   it("keeps the cancelled-before-start hold when the audit write fails, then records one event on retry", async () => {
