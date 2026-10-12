@@ -712,6 +712,14 @@ checks coordinator ownership in its terminal update, so a result recorded after
 the process check is also protected. Terminal task status remains authoritative;
 exhausted finalization retries do not keep an otherwise orphaned run alive.
 
+The stale-lock sweep also settles claimed wakes attached to terminal runs,
+including historical claims whose issue locks have already been cleared.
+Succeeded runs yield completed wakes, cancelled runs yield cancelled wakes,
+and interrupted, failed, or timed-out runs yield failed wakes. Settlement keeps
+the run's completion time and error evidence, preserves already settled wakes,
+and requires matching company and agent ownership. It does not enqueue a retry
+or bypass pause, blocker, budget, or review gates.
+
 Automatic productivity reviews are retired. Run counts, missing comments, and elapsed task time do not create review tasks or impose continuation holds. Bounded continuation, provider recovery, budget limits, explicit blockers, and normal review/approval stages remain in force. Existing productivity-review tasks, comments, assignments, and dependencies remain unchanged and readable; their historical origins still identify them as recovery work for recursion suppression.
 
 ### Issue-thread interaction resolution

@@ -103,6 +103,15 @@ test("shard flags are rejected for the workspaces-b group", () => {
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");
 });
 
+test("workspaces-c accepts the upstream db lane while legacy workspaces-b retains coverage", () => {
+  const c = dryRunJson(["--mode", "general", "--group", "general-workspaces-c"]);
+  const b = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
+  assert.deepEqual(c.workspaceProjects, ["@paperclipai/db"]);
+  assert.ok(b.workspaceProjects.includes("@paperclipai/db"));
+  const sharded = dryRun(["--mode", "general", "--group", "general-workspaces-c", "--shard-index", "0", "--shard-count", "3"]);
+  assert.notEqual(sharded.status, 0);
+});
+
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
   const shards = [0, 1].map((index) =>
     dryRunJson([
