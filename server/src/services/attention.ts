@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   approvals,
   assets,
@@ -49,6 +50,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
+import { decideFailedRunAttention, FAILED_RUN_EVIDENCE_ACTIONS } from "./failed-run-reconciliation.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1681,7 +1683,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         oldestFailedRunCreatedAt && failedAgentIds.length > 0
           ? db
             .select({
+              id: heartbeatRuns.id,
               agentId: heartbeatRuns.agentId,
+              status: heartbeatRuns.status,
               createdAt: heartbeatRuns.createdAt,
               // Project just the ids readRunIssueId needs; pulling the whole
               // context_snapshot detoasts megabytes per feed build.
@@ -1696,22 +1700,83 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             ))
           : Promise.resolve([]),
       ]);
-      const latestRunCreatedAtByKey = new Map<string, Date>();
+      const succeededNewerIds = newerRuns.filter((run) => run.status === "succeeded").map((run) => run.id);
+      const evidenceRunIds = new Set<string>();
+      if (succeededNewerIds.length > 0) {
+        const evidenceRows = await db
+          .select({ runId: activityLog.runId })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            inArray(activityLog.runId, succeededNewerIds),
+            inArray(activityLog.action, [...FAILED_RUN_EVIDENCE_ACTIONS]),
+          ));
+        for (const row of evidenceRows) {
+          if (row.runId) evidenceRunIds.add(row.runId);
+        }
+      }
+      const dispositionIssueIds = [...new Set(failedIssueIds.filter((value): value is string => Boolean(value)))];
+      const dispositionByIssue = new Set<string>();
+      if (dispositionIssueIds.length > 0 && oldestFailedRunCreatedAt) {
+        const dispositionRows = await db
+          .select({
+            entityId: activityLog.entityId,
+            actorType: activityLog.actorType,
+            runId: activityLog.runId,
+          })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.entityType, "issue"),
+            inArray(activityLog.entityId, dispositionIssueIds),
+            gt(activityLog.createdAt, oldestFailedRunCreatedAt),
+            inArray(activityLog.action, [...FAILED_RUN_EVIDENCE_ACTIONS]),
+          ));
+        const knownStatus = new Map(newerRuns.map((run) => [run.id, run.status]));
+        const missingRunIds = [...new Set(dispositionRows.flatMap((row) => row.runId ? [row.runId] : []))]
+          .filter((runId) => !knownStatus.has(runId));
+        if (missingRunIds.length > 0) {
+          const extraRuns = await db
+            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, missingRunIds)));
+          for (const extra of extraRuns) knownStatus.set(extra.id, extra.status);
+        }
+        for (const row of dispositionRows) {
+          const recorded = row.actorType === "user" || (row.runId !== null && knownStatus.get(row.runId) === "succeeded");
+          if (recorded) dispositionByIssue.add(row.entityId);
+        }
+      }
+      const newerByScope = new Map<string, typeof newerRuns>();
       for (const newerRun of newerRuns) {
         const newerRunIssueId = readRunIssueId({ issueId: newerRun.runIssueId, taskId: newerRun.runTaskId });
         const newerRunKey = `${newerRun.agentId}:${newerRunIssueId ?? ""}`;
-        const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
-        if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
-          latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
-        }
+        const bucket = newerByScope.get(newerRunKey) ?? [];
+        bucket.push(newerRun);
+        newerByScope.set(newerRunKey, bucket);
       }
       for (const run of failedRows) {
         const issueId = readRunIssueId(run.contextSnapshot);
         const runKey = `${run.agentId}:${issueId ?? ""}`;
-        const hasNewerRun = (latestRunCreatedAtByKey.get(runKey)?.getTime() ?? 0) > run.createdAt.getTime();
-        if (hasNewerRun) continue;
-
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
+        const sameScopeNewer = newerByScope.get(runKey) ?? [];
+        const decision = decideFailedRunAttention({
+          failedAtMs: run.createdAt.getTime(),
+          errorCode: run.errorCode ?? null,
+          errorText: run.error ?? null,
+          issueStatus: issue?.status ?? null,
+          sameScopeNewer: sameScopeNewer.map((newerRun) => ({
+            createdAtMs: newerRun.createdAt.getTime(),
+            status: newerRun.status,
+            hasEvidence: evidenceRunIds.has(newerRun.id),
+          })),
+          agentSucceededAfter: newerRuns.some((newerRun) =>
+            newerRun.agentId === run.agentId
+            && newerRun.status === "succeeded"
+            && newerRun.createdAt.getTime() > run.createdAt.getTime()),
+          dispositionAfterFailure: issueId ? dispositionByIssue.has(issueId) : false,
+        });
+        if (!decision.show) continue;
         const dedupKey = `run:${run.id}`;
         add(createItem({
           companyId,
@@ -1740,8 +1805,8 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             { id: "dismiss", label: "Dismiss", description: "Dismiss this failed-run attention row." },
           ),
           inlineResolvable: true,
-          entryRule: "latest failed/timed_out run has a Bounded retry exhausted lifecycle event.",
-          exitRule: "A newer run exists for the same issue/agent pair or the row is dismissed.",
+          entryRule: "latest failed/timed_out run has a Bounded retry exhausted lifecycle event and is not reconciled.",
+          exitRule: "Same scope has a live run, a later success with a work trace, or a terminal issue whose provider failure is closed and recorded. A bare success, an open provider failure, and a new failure after recovery stay visible.",
           dedupKey,
           severity: "high",
           activityAt: toIso(run.finishedAt ?? run.updatedAt ?? run.createdAt),
