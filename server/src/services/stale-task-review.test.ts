@@ -286,6 +286,7 @@ describe("reviewQueue", () => {
     expect(longWait?.needsHuman).toBe(false);
     expect(first.digest.servicerActions.map((group) => group.causeKey)).toEqual(["approved-checkpoint"]);
     expect(first.digest.notify).toBe(true);
+    expect(first.digest.fingerprints).toHaveLength(first.digest.danielTopics.length + first.digest.servicerActions.length);
     expect(first.matters.every((item) => item.category !== "close_after_evidence" || item.needsHuman)).toBe(true);
 
     const second = reviewQueue({ ok: true, tasks }, NOW + 2 * HOUR_MS, undefined, {
@@ -295,10 +296,23 @@ describe("reviewQueue", () => {
     expect(second.ok).toBe(true);
     if (!second.ok) return;
     expect(second.analyzed).toBe(400);
-    expect(second.digest.danielTopics).toEqual([]);
+    expect(second.digest.danielTopics.map((topic) => topic.causeKey)).toEqual(["duplicate:canon", "blocker:blocker-e"]);
     expect(second.digest.servicerActions).toEqual([]);
-    expect(second.digest.notify).toBe(false);
-    expect(second.digest.suppressedUnchanged).toBe(first.groups.length);
+    expect(second.digest.notify).toBe(true);
+    expect(second.digest.suppressedUnchanged).toBe(4);
+    const alreadyShown = new Set(first.digest.danielTopics.map((topic) => topic.causeKey));
+    expect(second.digest.danielTopics.some((topic) => alreadyShown.has(topic.causeKey))).toBe(false);
+
+    const third = reviewQueue({ ok: true, tasks }, NOW + 4 * HOUR_MS, undefined, {
+      atMs: second.digest.shown[0]?.atMs ?? NOW,
+      fingerprints: second.digest.fingerprints,
+      shown: second.digest.shown,
+    });
+    expect(third.ok).toBe(true);
+    if (!third.ok) return;
+    expect(third.digest.danielTopics).toEqual([]);
+    expect(third.digest.servicerActions).toEqual([]);
+    expect(third.digest.notify).toBe(false);
 
     const reminded = reviewQueue({ ok: true, tasks }, NOW + 25 * HOUR_MS, undefined, {
       atMs: NOW,
@@ -308,6 +322,52 @@ describe("reviewQueue", () => {
     if (!reminded.ok) return;
     expect(reminded.digest.danielTopics).toHaveLength(3);
     expect(reminded.digest.notify).toBe(true);
+  });
+
+  it("shows a capped topic on the next cycle and does not repeat the first three", () => {
+    const causes = ["a", "b", "c", "d"] as const;
+    const tasks = causes.map((name, index) => task({
+      id: name,
+      identifier: `SAK-${name}`,
+      ownerId: null,
+      causeKey: name,
+      causeLabel: name,
+      progress: [{ atMs: NOW - (12 + index) * HOUR_MS, kind: "substantive" }],
+    }));
+    const first = reviewQueue({ ok: true, tasks }, NOW);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.digest.danielTopics.map((topic) => topic.causeKey)).toEqual(["a", "b", "c"]);
+    expect(first.digest.fingerprints).toEqual(["a|fix_assignment", "b|fix_assignment", "c|fix_assignment"]);
+
+    const second = reviewQueue({ ok: true, tasks }, NOW + 2 * HOUR_MS, undefined, {
+      atMs: NOW,
+      fingerprints: first.digest.fingerprints,
+      shown: first.digest.shown,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.digest.danielTopics.map((topic) => topic.causeKey)).toEqual(["d"]);
+    expect(second.digest.notify).toBe(true);
+
+    const third = reviewQueue({ ok: true, tasks }, NOW + 4 * HOUR_MS, undefined, {
+      atMs: NOW,
+      fingerprints: second.digest.fingerprints,
+      shown: second.digest.shown,
+    });
+    expect(third.ok).toBe(true);
+    if (!third.ok) return;
+    expect(third.digest.danielTopics).toEqual([]);
+    expect(third.digest.notify).toBe(false);
+
+    const reminded = reviewQueue({ ok: true, tasks }, NOW + 25 * HOUR_MS, undefined, {
+      atMs: NOW,
+      fingerprints: second.digest.fingerprints,
+      shown: second.digest.shown,
+    });
+    expect(reminded.ok).toBe(true);
+    if (!reminded.ok) return;
+    expect(reminded.digest.danielTopics.map((topic) => topic.causeKey)).toEqual(["a", "b", "c"]);
   });
 
   it("still surfaces a new cause during the reminder throttle", () => {

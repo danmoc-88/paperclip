@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideFailedRunAttention, isProviderScopedFailure } from "./failed-run-reconciliation.js";
+import { decideFailedRunAttention, isProviderScopedFailure, recoveryEvidenceIssueId } from "./failed-run-reconciliation.js";
 
 const base = {
   failedAtMs: 1_000,
@@ -10,6 +10,48 @@ const base = {
   agentSucceededAfter: false,
   dispositionAfterFailure: false,
 };
+
+describe("recoveryEvidenceIssueId", () => {
+  it("binds a comment, document, or work product to the issue it records", () => {
+    expect(recoveryEvidenceIssueId({
+      entityType: "issue",
+      entityId: "issue-a",
+      details: { documentId: "doc-1", workProductId: "wp-1" },
+    })).toBe("issue-a");
+    expect(recoveryEvidenceIssueId({
+      entityType: "document",
+      entityId: "doc-1",
+      details: { issueId: "issue-a", documentId: "doc-1" },
+    })).toBe("issue-a");
+    expect(recoveryEvidenceIssueId({
+      entityType: "work_product",
+      entityId: "wp-1",
+      details: { issueId: "issue-a", workProductId: "wp-1" },
+    })).toBe("issue-a");
+    expect(recoveryEvidenceIssueId({
+      entityType: "issue_document",
+      entityId: "doc-1",
+      details: { issueId: "issue-a" },
+    })).toBe("issue-a");
+  });
+
+  it("does not treat another issue, or a bare document id, as evidence for this task", () => {
+    expect(recoveryEvidenceIssueId({
+      entityType: "issue",
+      entityId: "issue-b",
+    })).toBe("issue-b");
+    expect(recoveryEvidenceIssueId({
+      entityType: "document",
+      entityId: "doc-1",
+      details: { documentId: "doc-1" },
+    })).toBeNull();
+    expect(recoveryEvidenceIssueId({
+      entityType: "work_product",
+      entityId: "wp-1",
+      details: { workProductId: "wp-1" },
+    })).toBeNull();
+  });
+});
 
 describe("decideFailedRunAttention", () => {
   it("keeps an exhausted failure with no later result", () => {

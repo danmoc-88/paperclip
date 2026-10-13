@@ -11,6 +11,28 @@ export const FAILED_RUN_EVIDENCE_ACTIONS = [
   "issue.work_product_created",
 ] as const;
 
+const DETAIL_ISSUE_ENTITY_TYPES = new Set(["document", "issue_document", "work_product"]);
+
+// Comments, documents, and work products are stored on the issue: entityType
+// "issue" and entityId = issue id. details carries documentId or workProductId
+// and does not name the task by itself. Older rows may store the document or
+// product as the entity and put the issue id in details.issueId.
+export function recoveryEvidenceIssueId(row: {
+  entityType: string;
+  entityId: string | null;
+  details?: unknown;
+}): string | null {
+  if (row.entityType === "issue" && row.entityId) return row.entityId;
+  const details = row.details && typeof row.details === "object"
+    ? row.details as Record<string, unknown>
+    : null;
+  const detailedIssueId = typeof details?.issueId === "string" && details.issueId
+    ? details.issueId
+    : null;
+  if (detailedIssueId && DETAIL_ISSUE_ENTITY_TYPES.has(row.entityType)) return detailedIssueId;
+  return null;
+}
+
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 export type ScopeRun = {

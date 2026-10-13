@@ -50,7 +50,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
-import { decideFailedRunAttention, FAILED_RUN_EVIDENCE_ACTIONS } from "./failed-run-reconciliation.js";
+import { decideFailedRunAttention, FAILED_RUN_EVIDENCE_ACTIONS, recoveryEvidenceIssueId } from "./failed-run-reconciliation.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1701,10 +1701,15 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           : Promise.resolve([]),
       ]);
       const succeededNewerIds = newerRuns.filter((run) => run.status === "succeeded").map((run) => run.id);
-      const evidenceRunIds = new Set<string>();
+      const evidenceIssuesByRun = new Map<string, Set<string>>();
       if (succeededNewerIds.length > 0) {
         const evidenceRows = await db
-          .select({ runId: activityLog.runId })
+          .select({
+            runId: activityLog.runId,
+            entityType: activityLog.entityType,
+            entityId: activityLog.entityId,
+            details: activityLog.details,
+          })
           .from(activityLog)
           .where(and(
             eq(activityLog.companyId, companyId),
@@ -1712,17 +1717,25 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             inArray(activityLog.action, [...FAILED_RUN_EVIDENCE_ACTIONS]),
           ));
         for (const row of evidenceRows) {
-          if (row.runId) evidenceRunIds.add(row.runId);
+          const evidenceIssueId = recoveryEvidenceIssueId(row);
+          if (!row.runId || !evidenceIssueId) continue;
+          const issuesForRun = evidenceIssuesByRun.get(row.runId) ?? new Set<string>();
+          issuesForRun.add(evidenceIssueId);
+          evidenceIssuesByRun.set(row.runId, issuesForRun);
         }
       }
       const dispositionIssueIds = [...new Set(failedIssueIds.filter((value): value is string => Boolean(value)))];
-      const dispositionByIssue = new Set<string>();
+      const dispositionIssueIdSet = new Set(dispositionIssueIds);
+      const dispositionAtByIssue = new Map<string, number>();
       if (dispositionIssueIds.length > 0 && oldestFailedRunCreatedAt) {
         const dispositionRows = await db
           .select({
             entityId: activityLog.entityId,
+            entityType: activityLog.entityType,
+            details: activityLog.details,
             actorType: activityLog.actorType,
             runId: activityLog.runId,
+            createdAt: activityLog.createdAt,
           })
           .from(activityLog)
           .where(and(
@@ -1744,7 +1757,12 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         }
         for (const row of dispositionRows) {
           const recorded = row.actorType === "user" || (row.runId !== null && knownStatus.get(row.runId) === "succeeded");
-          if (recorded) dispositionByIssue.add(row.entityId);
+          if (!recorded) continue;
+          const evidenceIssueId = recoveryEvidenceIssueId(row);
+          if (!evidenceIssueId || !dispositionIssueIdSet.has(evidenceIssueId)) continue;
+          const atMs = row.createdAt.getTime();
+          const previous = dispositionAtByIssue.get(evidenceIssueId);
+          if (previous === undefined || atMs > previous) dispositionAtByIssue.set(evidenceIssueId, atMs);
         }
       }
       const newerByScope = new Map<string, typeof newerRuns>();
@@ -1768,13 +1786,15 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           sameScopeNewer: sameScopeNewer.map((newerRun) => ({
             createdAtMs: newerRun.createdAt.getTime(),
             status: newerRun.status,
-            hasEvidence: evidenceRunIds.has(newerRun.id),
+            hasEvidence: issueId ? evidenceIssuesByRun.get(newerRun.id)?.has(issueId) === true : false,
           })),
           agentSucceededAfter: newerRuns.some((newerRun) =>
             newerRun.agentId === run.agentId
             && newerRun.status === "succeeded"
             && newerRun.createdAt.getTime() > run.createdAt.getTime()),
-          dispositionAfterFailure: issueId ? dispositionByIssue.has(issueId) : false,
+          dispositionAfterFailure: issueId
+            ? (dispositionAtByIssue.get(issueId) ?? Number.NEGATIVE_INFINITY) > run.createdAt.getTime()
+            : false,
         });
         if (!decision.show) continue;
         const dedupKey = `run:${run.id}`;

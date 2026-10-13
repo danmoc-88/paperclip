@@ -68,9 +68,15 @@ export interface StaleThresholds {
   shortWaitMs: number;
 }
 
+export interface ShownMatter {
+  fingerprint: string;
+  atMs: number;
+}
+
 export interface PriorDigest {
   atMs: number;
   fingerprints: string[];
+  shown?: ShownMatter[];
 }
 
 export interface ClassifiedTask {
@@ -124,6 +130,7 @@ export type ReviewResult =
         suppressedShortWait: number;
         notify: boolean;
         fingerprints: string[];
+        shown: ShownMatter[];
       };
     }
   | { ok: false; reason: "read_failed"; analyzed: 0; digest: null };
@@ -461,10 +468,17 @@ export function reviewQueue(
     return { ok: false, reason: "read_failed", analyzed: 0, digest: null };
   }
   const thresholds = resolveThresholds(override);
-  const throttled = (fingerprint: string) => {
-    if (!prior || !prior.fingerprints.includes(fingerprint)) return false;
-    return nowMs - prior.atMs < thresholds.reminderThrottleMs;
-  };
+  const shownAt = new Map<string, number>();
+  if (prior?.shown) {
+    for (const item of prior.shown) {
+      if (nowMs - item.atMs < thresholds.reminderThrottleMs) shownAt.set(item.fingerprint, item.atMs);
+    }
+  } else if (prior) {
+    for (const fingerprint of prior.fingerprints) {
+      if (nowMs - prior.atMs < thresholds.reminderThrottleMs) shownAt.set(fingerprint, prior.atMs);
+    }
+  }
+  const throttled = (fingerprint: string) => shownAt.has(fingerprint);
   const classified = read.tasks.map((task) => classifyTask(task, nowMs, thresholds));
   const matters = classified.filter((task) => task.category !== null);
   const groups = groupMatters(classified, throttled);
@@ -474,6 +488,13 @@ export function reviewQueue(
     .slice(0, MAX_DANIEL_TOPICS);
   const servicerActions = groups.filter((group) => group.servicerMayAct && visible(group));
   const ownerFollowUps = groups.filter((group) => !group.needsHuman && !group.servicerMayAct && visible(group));
+  // Only matters that were actually shown stay throttled. A topic past the
+  // limit of three stays eligible for the next cycle. Previously shown matters
+  // keep their original time so a later cycle does not refresh their window.
+  for (const group of [...danielTopics, ...servicerActions]) {
+    if (!shownAt.has(group.fingerprint)) shownAt.set(group.fingerprint, nowMs);
+  }
+  const shown = [...shownAt.entries()].map(([fingerprint, atMs]) => ({ fingerprint, atMs }));
   return {
     ok: true,
     analyzed: classified.length,
@@ -487,7 +508,8 @@ export function reviewQueue(
       suppressedUnchanged: groups.filter((group) => group.throttled).length,
       suppressedShortWait: classified.filter((task) => task.idleMs !== null && task.idleMs < thresholds.shortWaitMs && !task.alarm).length,
       notify: danielTopics.length > 0,
-      fingerprints: groups.map((group) => group.fingerprint),
+      fingerprints: shown.map((item) => item.fingerprint),
+      shown,
     },
   };
 }
