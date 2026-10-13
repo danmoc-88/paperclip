@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   ADAPTER_INVOKE_PROMPT_MAX_CHARS,
@@ -13,7 +12,7 @@ import {
 } from "../services/heartbeat-run-summary.ts";
 import { boundHeartbeatRunEventPayloadForStorage } from "../services/heartbeat.ts";
 
-const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+const isWellFormed = (text: string) => !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text);
 
 describe("adapter.invoke payload compaction", () => {
   const heavyWake = { messages: Array.from({ length: 40 }, (_, i) => ({ id: i, body: "m".repeat(2000) })) };
@@ -30,7 +29,7 @@ describe("adapter.invoke payload compaction", () => {
     small: { a: 1 },
   };
 
-  it("keeps identifiers and short values, drops heavy ones with size and hash", () => {
+  it("keeps identifiers and short values, drops heavy ones, recording size only", () => {
     const compacted = compactAdapterInvokeContext(context);
     expect(compacted).toMatchObject({
       issueId: "issue-1",
@@ -42,18 +41,15 @@ describe("adapter.invoke payload compaction", () => {
     for (const key of ["paperclipWake", "executionContinuation", "paperclipTaskMarkdown", "paperclipWorkspace"]) {
       expect(compacted).not.toHaveProperty(key);
     }
-    const omitted = (compacted._compacted as { omitted: Record<string, { bytes: number; sha256: string }> }).omitted;
+    const omitted = (compacted._compacted as { omitted: Record<string, { bytes: number }> }).omitted;
     expect(Object.keys(omitted).sort()).toEqual([
       "executionContinuation",
       "paperclipTaskMarkdown",
       "paperclipWake",
       "paperclipWorkspace",
     ]);
-    expect(omitted.paperclipTaskMarkdown).toEqual({
-      bytes: 11_000,
-      sha256: sha256("t".repeat(11_000)),
-    });
-    expect(omitted.paperclipWake.sha256).toBe(sha256(JSON.stringify(heavyWake)));
+    expect(omitted.paperclipTaskMarkdown).toEqual({ bytes: 11_000 });
+    expect(omitted.paperclipWake).toEqual({ bytes: Buffer.byteLength(JSON.stringify(heavyWake)) });
     expect(JSON.stringify(compacted).length).toBeLessThan(2_000);
   });
 
@@ -90,7 +86,7 @@ describe("adapter.invoke payload compaction", () => {
     const kept = payload.prompt as string;
     expect(kept.startsWith("p".repeat(ADAPTER_INVOKE_PROMPT_MAX_CHARS))).toBe(true);
     expect(kept).toContain(`truncated ${20_000 - ADAPTER_INVOKE_PROMPT_MAX_CHARS} chars`);
-    expect(kept).toContain(sha256(prompt));
+    expect(kept).not.toMatch(/sha256/i);
     expect((payload.context as Record<string, unknown>).issueId).toBe("issue-1");
   });
 
@@ -116,7 +112,7 @@ describe("adapter.invoke payload compaction", () => {
 });
 
 describe("run result compaction", () => {
-  it("keeps head and tail of oversized stdout/stderr and records hash and omitted size", () => {
+  it("keeps head and tail of oversized stdout/stderr and records omitted size without a hash", () => {
     const stdout = `HEAD${"a".repeat(400_000)}TAIL`;
     const result = compactRunResultJsonForStorage({ stdout, stderr: "err", summary: "s", costUsd: 0.2 });
     expect(result).toMatchObject({ stderr: "err", summary: "s", costUsd: 0.2 });
@@ -125,7 +121,7 @@ describe("run result compaction", () => {
     expect(kept.startsWith("HEAD")).toBe(true);
     expect(kept.endsWith("TAIL")).toBe(true);
     expect(kept).toContain(`omitted ${stdout.length - RESULT_OUTPUT_HEAD_CHARS - RESULT_OUTPUT_TAIL_CHARS} chars`);
-    expect(kept).toContain(sha256(stdout));
+    expect(kept).not.toMatch(/sha256/i);
   });
 
   it("keeps the head the run API serves unchanged and still reads as truncated", () => {
@@ -156,5 +152,49 @@ describe("run result compaction", () => {
   it("an exactly-at-limit output is stored in full", () => {
     const stdout = "y".repeat(RESULT_OUTPUT_HEAD_CHARS + RESULT_OUTPUT_TAIL_CHARS);
     expect(compactRunResultJsonForStorage({ stdout })?.stdout).toBe(stdout);
+  });
+});
+
+describe("compaction never produces malformed UTF-16", () => {
+  const emoji = "\u{1F600}";
+
+  it("does not split a surrogate pair at the head boundary of stdout", () => {
+    const stdout = "a".repeat(RESULT_OUTPUT_HEAD_CHARS - 1) + emoji + "b".repeat(9000);
+    expect(isWellFormed(stdout)).toBe(true);
+    const kept = compactRunResultJsonForStorage({ stdout })?.stdout as string;
+    expect(isWellFormed(kept)).toBe(true);
+    expect(kept.startsWith("a".repeat(RESULT_OUTPUT_HEAD_CHARS - 1))).toBe(true);
+  });
+
+  it("does not split a surrogate pair at the tail boundary of stdout", () => {
+    const stdout = "a".repeat(9000) + emoji + "b".repeat(RESULT_OUTPUT_TAIL_CHARS - 1);
+    expect(isWellFormed(stdout)).toBe(true);
+    const kept = compactRunResultJsonForStorage({ stdout })?.stdout as string;
+    expect(isWellFormed(kept)).toBe(true);
+    expect(kept.endsWith("b".repeat(RESULT_OUTPUT_TAIL_CHARS - 1))).toBe(true);
+  });
+
+  it("keeps emoji-only output well formed and reports consistent omitted size", () => {
+    const stdout = emoji.repeat(20_000);
+    const kept = compactRunResultJsonForStorage({ stdout })?.stdout as string;
+    expect(isWellFormed(kept)).toBe(true);
+    const keptEmoji = kept.split(emoji).length - 1;
+    expect(kept).toContain(`omitted ${stdout.length - keptEmoji * 2} chars`);
+  });
+
+  it("does not split a surrogate pair at the prompt boundary", () => {
+    const prompt = "a".repeat(ADAPTER_INVOKE_PROMPT_MAX_CHARS - 1) + emoji + "b".repeat(9000);
+    expect(isWellFormed(prompt)).toBe(true);
+    const kept = compactAdapterInvokePayload({ prompt }).prompt as string;
+    expect(isWellFormed(kept)).toBe(true);
+    const keptPrompt = kept.split("\n[truncated")[0]!;
+    expect(kept).toContain(`truncated ${prompt.length - keptPrompt.length} chars`);
+  });
+
+  it("stores no hash of raw dropped data, so a nested secret cannot be confirmed by guessing", () => {
+    const context = { issueId: "i", blob: { neutral: { password: "1234" }, pad: "x".repeat(2000) } };
+    const compacted = JSON.stringify(compactAdapterInvokeContext(context));
+    expect(compacted).not.toContain("1234");
+    expect(compacted).not.toMatch(/sha256|[0-9a-f]{64}/i);
   });
 });
