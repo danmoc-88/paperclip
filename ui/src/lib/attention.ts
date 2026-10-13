@@ -9,6 +9,7 @@ import type {
   AttentionSourceKind,
   AttentionWorkspaceRef,
 } from "@paperclipai/shared";
+import { formatDecisionMinutesLabel, readEstimatedMinutes } from "@paperclipai/shared";
 
 export type AttentionListOptions = AttentionFeedQuery;
 
@@ -199,6 +200,13 @@ function countNoun(count: number, singular: string): string {
  * can fall back to `whyNow`.
  */
 export function attentionDetailLine(item: AttentionItem): string | null {
+  const line = attentionDetailBody(item);
+  const label = formatDecisionMinutesLabel(item.estimatedMinutes);
+  if (!label) return line;
+  return line ? `${label} · ${line}` : label;
+}
+
+function attentionDetailBody(item: AttentionItem): string | null {
   const detail = item.detail;
   if (!detail) return null;
   switch (detail.kind) {
@@ -518,7 +526,7 @@ export function resolveAttentionDateRange(
 // ---------------------------------------------------------------------------
 
 export type AttentionGroupBy = "none" | "date" | "type" | "project" | "severity";
-export type AttentionSortOrder = "newest" | "oldest";
+export type AttentionSortOrder = "newest" | "oldest" | "fastest";
 
 /** Ordered list used to render the group-by picker (label + value). */
 export const ATTENTION_GROUP_BY_OPTIONS: ReadonlyArray<[AttentionGroupBy, string]> = [
@@ -532,6 +540,7 @@ export const ATTENTION_GROUP_BY_OPTIONS: ReadonlyArray<[AttentionGroupBy, string
 export const ATTENTION_SORT_OPTIONS: ReadonlyArray<[AttentionSortOrder, string]> = [
   ["newest", "Newest first"],
   ["oldest", "Oldest first"],
+  ["fastest", "Od najszybszych"],
 ];
 
 /**
@@ -600,7 +609,8 @@ export function saveAttentionGroupBy(groupBy: AttentionGroupBy) {
 export function loadAttentionSortOrder(): AttentionSortOrder {
   try {
     const raw = localStorage.getItem(ATTENTION_SORT_KEY);
-    return raw === "oldest" ? "oldest" : "newest";
+    if (raw === "oldest" || raw === "fastest") return raw;
+    return "newest";
   } catch {
     return "newest";
   }
@@ -709,7 +719,24 @@ function attentionActivityTimestamp(item: AttentionItem): number {
  * tiebreaker (lower rank = higher priority) so equal-timestamp rows keep the
  * server's escalation order.
  */
+function attentionMinutes(item: AttentionItem): number | null {
+  return readEstimatedMinutes(item.estimatedMinutes);
+}
+
 export function sortAttentionItems(items: AttentionItem[], order: AttentionSortOrder): AttentionItem[] {
+  if (order === "fastest") {
+    return [...items].sort((a, b) => {
+      const aMinutes = attentionMinutes(a);
+      const bMinutes = attentionMinutes(b);
+      if (aMinutes != null && bMinutes != null && aMinutes !== bMinutes) return aMinutes - bMinutes;
+      if (aMinutes != null && bMinutes != null) return a.rank - b.rank;
+      if (aMinutes != null) return -1;
+      if (bMinutes != null) return 1;
+      const diff = attentionActivityTimestamp(b) - attentionActivityTimestamp(a);
+      if (diff !== 0) return diff;
+      return a.rank - b.rank;
+    });
+  }
   const sign = order === "oldest" ? -1 : 1;
   return [...items].sort((a, b) => {
     const diff = attentionActivityTimestamp(b) - attentionActivityTimestamp(a);

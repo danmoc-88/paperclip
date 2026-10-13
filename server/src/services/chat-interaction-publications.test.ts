@@ -4,6 +4,7 @@ import { TelegramAdapter } from "@chat-adapter/telegram";
 import { Actions, Button, Card, CardText } from "chat";
 import {
   createChatQuestionOptionActionToken,
+  interactionPublicationText,
   nativeChatQuestion,
   TELEGRAM_CALLBACK_DATA_LIMIT_BYTES,
   telegramCallbackDataByteLength,
@@ -55,6 +56,25 @@ describe("native chat question eligibility", () => {
 
   it("keeps an explicitly open question on the Paperclip-only response path", () => {
     expect(nativeChatQuestion(closedQuestion(true))).toBeNull();
+  });
+});
+
+describe("decision minute line", () => {
+  it("adds ok. 6 min only when the stored number is 6", () => {
+    const six = closedQuestion();
+    six.payload.estimatedMinutes = 6;
+    const text = interactionPublicationText(six, null);
+    expect(text).toContain("ok. 6 min");
+    expect(text.match(/ok\. \d+ min/g)).toEqual(["ok. 6 min"]);
+
+    const one = closedQuestion();
+    one.payload.estimatedMinutes = 1;
+    expect(interactionPublicationText(one, null)).toContain("ok. 1 min");
+    expect(interactionPublicationText(one, null)).not.toContain("ok. 6 min");
+
+    const missing = interactionPublicationText(closedQuestion(), null);
+    expect(missing).not.toContain("ok.");
+    expect(missing).not.toContain("ok. 0 min");
   });
 });
 

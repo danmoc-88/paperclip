@@ -26,7 +26,7 @@ import {
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
-import { deriveProjectUrlKey } from "@paperclipai/shared";
+import { deriveProjectUrlKey, readEstimatedMinutes } from "@paperclipai/shared";
 import type {
   AttentionDecisionVerb,
   AttentionFeed,
@@ -1262,6 +1262,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           relatedIssue: issue ? issueSubject(prefix, issue) : null,
           ...issueContext(issue),
           detail,
+          estimatedMinutes: readEstimatedMinutes(payload.estimatedMinutes),
           resolverAudience: interactionResolverAudience(
             interaction,
             (agentId) => companyAgentMap.get(agentId)?.name ?? null,
@@ -1279,6 +1280,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         status: decisions.status,
         expiresAt: decisions.expiresAt,
         originIssueId: decisions.originIssueId,
+        metadata: decisions.metadata,
         createdAt: decisions.createdAt,
         updatedAt: decisions.updatedAt,
       }).from(decisions).where(and(eq(decisions.companyId, companyId), eq(decisions.status, "open")))
@@ -1321,6 +1323,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           updatedAt: toIso(decision.updatedAt),
           relatedIssue: issue ? issueSubject(prefix, issue) : null,
           ...issueContext(issue),
+          estimatedMinutes: readEstimatedMinutes(readRecord(decision.metadata).estimatedMinutes),
           detail: { kind: "generic", summaryExcerpt: decision.body.slice(0, DETAIL_EXCERPT_LENGTH), images: [] },
         }));
       }

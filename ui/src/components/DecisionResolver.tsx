@@ -163,6 +163,19 @@ export function DecisionResolver({ companyId, decisionId, originIssue, agentMap,
     },
   });
 
+  const minutesMutation = useMutation({
+    mutationFn: (minutes: number) => decisionsApi.updateEstimatedMinutes(decisionId, minutes),
+    onSuccess: (saved) => {
+      queryClient.setQueryData<DecisionOutcome | undefined>(
+        queryKeys.decisions.detail(decisionId),
+        (current) => current
+          ? { ...current, metadata: saved.metadata, updatedAt: saved.updatedAt }
+          : current,
+      );
+      queryClient.invalidateQueries({ queryKey: queryKeys.attention(companyId) });
+    },
+  });
+
   if (detail.isLoading) {
     return (
       <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground">
@@ -179,10 +192,11 @@ export function DecisionResolver({ companyId, decisionId, originIssue, agentMap,
     );
   }
 
-  const busy = decideMutation.isPending || dismissMutation.isPending;
+  const busy = decideMutation.isPending || dismissMutation.isPending || minutesMutation.isPending;
   const errorMessage =
     (decideMutation.error instanceof Error && decideMutation.error.message) ||
     (dismissMutation.error instanceof Error && dismissMutation.error.message) ||
+    (minutesMutation.error instanceof Error && minutesMutation.error.message) ||
     null;
 
   return (
@@ -208,6 +222,7 @@ export function DecisionResolver({ companyId, decisionId, originIssue, agentMap,
       errorMessage={errorMessage}
       onDecide={(optionId, inputValues) => decideMutation.mutate({ optionId, inputValues, idempotencyKey: crypto.randomUUID() })}
       onDismiss={(reason) => dismissMutation.mutate(reason)}
+      onEstimatedMinutesChange={(minutes) => minutesMutation.mutate(minutes)}
     />
   );
 }

@@ -9,6 +9,7 @@ import {
   type AttentionArchiveTargetSnapshot,
   type AttentionItem,
   type CreateDecisionArchiveProposalInput,
+  updateEstimatedMinutesSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { decisionService, type DecisionServiceOptions } from "../services/decisions.js";
@@ -177,6 +178,12 @@ export function decisionRoutes(db: Db, options: DecisionServiceOptions) {
     if (!decision) return;
     if (req.actor.type === "agent" && req.actor.agentId !== decision.originAgentId) { res.status(403).json({ error: "Only the origin agent may read this decision" }); return; }
     res.json(await svc.outcome(decision.id));
+  });
+  router.patch("/decisions/:id/estimated-minutes", validate(updateEstimatedMinutesSchema), async (req, res) => {
+    assertBoard(req);
+    const decision = await getAccessibleResource(req, res, svc.get(req.params.id as string), "Decision not found");
+    if (!decision) return;
+    res.json(await svc.updateEstimatedMinutes(decision.id, req.body.estimatedMinutes));
   });
   router.post("/decisions/:id/decide", validate(decideSchema), async (req, res) => {
     const userId = boardUserId(req);

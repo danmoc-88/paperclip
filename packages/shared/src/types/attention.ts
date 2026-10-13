@@ -254,6 +254,12 @@ export interface AttentionItem {
   detail: AttentionItemDetail | null;
   trainingExampleId: string | null;
   /**
+   * Minutes stored on the decision card when it was created. Missing on older
+   * cards and on rows that are not decisions. Display reads this number; it
+   * does not estimate again.
+   */
+  estimatedMinutes?: number | null;
+  /**
    * Set for `issue_thread_interaction` rows only. Absent on every other source
    * kind, whose decisions are not governed by a resolver policy.
    */

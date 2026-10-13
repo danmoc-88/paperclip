@@ -405,6 +405,50 @@ describe("attentionDetailLine (§7)", () => {
   it("returns null when there is no detail block", () => {
     expect(attentionDetailLine(buildItem({ detail: null }))).toBeNull();
   });
+
+  it("shows the stored minutes and does not invent a zero", () => {
+    const line = attentionDetailLine(
+      buildItem({
+        estimatedMinutes: 6,
+        detail: { kind: "questions", questionCount: 6, firstQuestionText: "Pierwsze pytanie", images: [] },
+      }),
+    );
+    expect(line).toContain("ok. 6 min");
+    expect(line).toContain("Pierwsze pytanie");
+    const oldCard = attentionDetailLine(
+      buildItem({
+        detail: { kind: "questions", questionCount: 6, firstQuestionText: "Pierwsze pytanie", images: [] },
+      }),
+    );
+    expect(oldCard).not.toContain("ok.");
+    expect(oldCard).not.toContain("ok. 0 min");
+  });
+});
+
+describe("sortAttentionItems fastest", () => {
+  function row(id: string, minutes: number | null, activityAt: string, rank: number) {
+    return buildItem({
+      id,
+      rank,
+      activityAt,
+      estimatedMinutes: minutes,
+      sourceKind: minutes == null && id.startsWith("err") ? "agent_error_alert" : "issue_thread_interaction",
+    });
+  }
+
+  it("puts 1 before 6 and leaves cards without a number underneath, newest first", () => {
+    const sorted = sortAttentionItems(
+      [
+        row("six", 6, "2026-10-13T10:00:00Z", 2),
+        row("err-new", null, "2026-10-13T12:00:00Z", 0),
+        row("one", 1, "2026-10-13T08:00:00Z", 9),
+        row("err-old", null, "2026-10-13T09:00:00Z", 1),
+        row("one-b", 1, "2026-10-13T11:00:00Z", 3),
+      ],
+      "fastest",
+    );
+    expect(sorted.map((item) => item.id)).toEqual(["one-b", "one", "six", "err-new", "err-old"]);
+  });
 });
 
 describe("sortAttentionItems", () => {
