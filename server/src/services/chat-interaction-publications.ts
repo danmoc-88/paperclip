@@ -10,12 +10,14 @@ import {
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
-import type {
-  AskUserQuestionsInteraction,
-  AskUserQuestionsQuestion,
-  IssueThreadInteraction,
-  RequestConfirmationInteraction,
-  SafeExternalChatCardAction,
+import {
+  appendDecisionMinutesLine,
+  readEstimatedMinutes,
+  type AskUserQuestionsInteraction,
+  type AskUserQuestionsQuestion,
+  type IssueThreadInteraction,
+  type RequestConfirmationInteraction,
+  type SafeExternalChatCardAction,
 } from "@paperclipai/shared";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -216,6 +218,36 @@ function genericInteractionText(taskUrl: string | null): string {
     .join("\n\n");
 }
 
+function storedPublicationMinutes(interaction: IssueThreadInteraction): number | null {
+  if (
+    interaction.kind !== "ask_user_questions" &&
+    interaction.kind !== "request_confirmation"
+  ) {
+    return null;
+  }
+  return readEstimatedMinutes(interaction.payload.estimatedMinutes);
+}
+
+/** Message text for a question or confirmation. Reads the stored minute count only. */
+export function interactionPublicationText(
+  interaction: IssueThreadInteraction,
+  taskUrl: string | null,
+): string {
+  const base =
+    interaction.kind === "ask_user_questions"
+      ? textForQuestionInteraction(interaction, taskUrl)
+      : genericInteractionText(taskUrl);
+  return appendDecisionMinutesLine(base, storedPublicationMinutes(interaction));
+}
+
+function publicationBody(
+  text: string | undefined,
+  minutes: number | null,
+): string | undefined {
+  const withLine = appendDecisionMinutesLine(text ?? "", minutes);
+  return withLine.length > 0 ? withLine : undefined;
+}
+
 /**
  * Enqueues one immutable outbox item per live external task binding. A lone
  * closed single-select question receives compact executable buttons. Slack and
@@ -371,10 +403,8 @@ export async function enqueueIssueInteractionChatPublications(
                 },
               ]
             : [];
-    const text =
-      interaction.kind === "ask_user_questions"
-        ? textForQuestionInteraction(interaction, taskUrl)
-        : genericInteractionText(taskUrl);
+    const minutes = storedPublicationMinutes(interaction);
+    const text = interactionPublicationText(interaction, taskUrl);
     const payload = projectSafeChatPublication({
       classification: "external",
       source: "issue_interaction",
@@ -400,9 +430,9 @@ export async function enqueueIssueInteractionChatPublications(
                 : "Response needed in Paperclip",
           body:
             interaction.kind === "ask_user_questions"
-              ? (question?.helpText ?? undefined)
+              ? publicationBody(question?.helpText ?? undefined, minutes)
               : interaction.kind === "request_confirmation"
-                ? (interaction.payload.detailsMarkdown ?? undefined)
+                ? publicationBody(interaction.payload.detailsMarkdown ?? undefined, minutes)
                 : "Open the task in Paperclip to review and respond.",
           actions,
         },

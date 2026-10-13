@@ -11,7 +11,8 @@ import {
   ShieldAlert,
   XCircle,
 } from "lucide-react";
-import { decisionEffectTargetIssueIds, type DecisionEffect, type DecisionOption } from "@paperclipai/shared";
+import { decisionEffectTargetIssueIds, readEstimatedMinutes, type DecisionEffect, type DecisionOption } from "@paperclipai/shared";
+import { DecisionMinutesControl } from "./DecisionMinutesControl";
 import type {
   Decision,
   DecisionEffectExecution,
@@ -58,6 +59,7 @@ export interface DecisionCardProps {
   errorMessage?: string | null;
   onDecide?: (optionId: string, inputValues: Record<string, string>) => void;
   onDismiss?: (reason?: string) => void;
+  onEstimatedMinutesChange?: (minutes: number) => void;
   className?: string;
 }
 
@@ -237,6 +239,7 @@ export function DecisionCard({
   errorMessage,
   onDecide,
   onDismiss,
+  onEstimatedMinutesChange,
   className,
 }: DecisionCardProps) {
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
@@ -329,7 +332,15 @@ export function DecisionCard({
     >
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <h3 className="min-w-0 flex-1 text-base font-semibold text-foreground">{decision.title}</h3>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-base font-semibold text-foreground">{decision.title}</h3>
+          <DecisionMinutesControl
+            minutes={readEstimatedMinutes(decision.metadata?.estimatedMinutes)}
+            editable={open && Boolean(onEstimatedMinutesChange)}
+            busy={busy}
+            onCommit={onEstimatedMinutesChange}
+          />
+        </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {open && hasCancelTree && (
             <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-(length:--text-micro) font-semibold uppercase tracking-wide", BADGE.destructive)}>

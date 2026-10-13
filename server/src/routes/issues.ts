@@ -75,6 +75,7 @@ import {
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
+  updateEstimatedMinutesSchema,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
@@ -16001,6 +16002,29 @@ export function issueRoutes(
       }
 
       res.status(201).json(interaction);
+    },
+  );
+
+  router.patch(
+    "/issues/:id/interactions/:interactionId/estimated-minutes",
+    validate(updateEstimatedMinutesSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      const interaction = await issueThreadInteractionService(db).updateEstimatedMinutes(
+        issue,
+        interactionId,
+        req.body.estimatedMinutes,
+      );
+      res.json(interaction);
     },
   );
 

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, count, desc, eq, gt, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
-import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
+import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds, readEstimatedMinutes, stampDecisionMetadata } from "@paperclipai/shared";
 import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
@@ -189,6 +189,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
   }
 
   async function createInStore(input: CreateInputWithSnapshots, dbOrTx: Db) {
+    const metadata = stampDecisionMetadata(input.body, input.options, input.metadata);
     if (input.idempotencyKey) {
       const lockKey = `decision-create:${input.companyId}:${input.idempotencyKey}`;
       await dbOrTx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
@@ -199,7 +200,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         .then((rows) => rows[0] ?? null);
       if (existing) {
         const archiveEquivalent = input.additionalTargetSnapshots === undefined || (
-          canonicalJson(existing.metadata ?? {}) === canonicalJson(input.metadata ?? {}) &&
+          canonicalJson(existing.metadata ?? {}) === canonicalJson(metadata) &&
           canonicalJson(Object.fromEntries(Object.entries(existing.targetSnapshots as Record<string, Snapshot>)
             .filter(([key]) => key.startsWith("attention:")))) === canonicalJson(input.additionalTargetSnapshots)
         );
@@ -227,13 +228,13 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       originAgentId: input.agentId, originIssueId: provenance.issueId, originRunId: input.runId, ruleKey: input.ruleKey ?? null,
       title: input.title, body: input.body, options: input.options, inputs: input.inputs ?? null, expiresAt,
       idempotencyKey: input.idempotencyKey ?? null, signedSpec: signDecisionSpec(spec({ id, options: input.options, targetSnapshots })),
-      targetSnapshots, continuationPolicy: input.continuationPolicy ?? "none", metadata: input.metadata ?? {} }).onConflictDoNothing().returning();
+      targetSnapshots, continuationPolicy: input.continuationPolicy ?? "none", metadata }).onConflictDoNothing().returning();
     if (!created) {
       const existing = input.idempotencyKey
         ? await dbOrTx.select().from(decisions).where(and(eq(decisions.companyId, input.companyId), eq(decisions.idempotencyKey, input.idempotencyKey))).then((rows) => rows[0] ?? null)
         : null;
       const archiveEquivalent = !existing || input.additionalTargetSnapshots === undefined || (
-        canonicalJson(existing.metadata ?? {}) === canonicalJson(input.metadata ?? {}) &&
+        canonicalJson(existing.metadata ?? {}) === canonicalJson(metadata) &&
         canonicalJson(Object.fromEntries(Object.entries(existing.targetSnapshots as Record<string, Snapshot>)
           .filter(([key]) => key.startsWith("attention:")))) === canonicalJson(input.additionalTargetSnapshots)
       );
@@ -782,5 +783,20 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     return { expired, resumed };
   }
 
-  return { create, createBundle, get, list, stats, outcome, decide, cancel, dismiss, sweepExpired };
+  async function updateEstimatedMinutes(id: string, estimatedMinutes: number) {
+    const minutes = readEstimatedMinutes(estimatedMinutes);
+    if (!minutes) throw unprocessable("estimatedMinutes must be an integer from 1 to 30");
+    const [saved] = await db.update(decisions).set({
+      metadata: sql`${decisions.metadata} || ${JSON.stringify({ estimatedMinutes: minutes })}::jsonb`,
+      updatedAt: new Date(),
+    }).where(and(eq(decisions.id, id), eq(decisions.status, "open"))).returning();
+    if (!saved) {
+      const existing = await get(id);
+      if (!existing) throw notFound("Decision not found");
+      throw conflict("Only an open decision can change its minutes");
+    }
+    return saved;
+  }
+
+  return { create, createBundle, get, list, stats, outcome, decide, cancel, dismiss, sweepExpired, updateEstimatedMinutes };
 }

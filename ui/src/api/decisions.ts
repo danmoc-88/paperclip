@@ -111,4 +111,6 @@ export const decisionsApi = {
   dismiss: (id: string, reason?: string | null) =>
     api.post<DecisionOutcome>(`/decisions/${id}/dismiss`, reason ? { reason } : {}),
   cancel: (id: string) => api.post<Decision>(`/decisions/${id}/cancel`, {}),
+  updateEstimatedMinutes: (id: string, estimatedMinutes: number) =>
+    api.patch<Decision>(`/decisions/${id}/estimated-minutes`, { estimatedMinutes }),
 };

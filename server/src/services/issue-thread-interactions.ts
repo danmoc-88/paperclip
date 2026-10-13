@@ -93,6 +93,8 @@ import {
   suggestTasksResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
   withdrawIssueThreadInteractionSchema,
+  readEstimatedMinutes,
+  stampInteractionEstimatedMinutes,
 } from "@paperclipai/shared";
 import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
@@ -3361,15 +3363,56 @@ export function issueThreadInteractionService(
       return { expired: expired.length };
     },
 
+    updateEstimatedMinutes: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      estimatedMinutes: number,
+    ) => {
+      const minutes = readEstimatedMinutes(estimatedMinutes);
+      if (!minutes) throw unprocessable("estimatedMinutes must be an integer from 1 to 30");
+      const updated = await db.transaction(async (tx) => {
+        const [locked] = await tx
+          .select({
+            id: issueThreadInteractions.id,
+            status: issueThreadInteractions.status,
+          })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.id, interactionId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.companyId, issue.companyId),
+          ))
+          .for("update");
+        if (!locked) throw notFound("Interaction not found");
+        if (locked.status !== "pending") {
+          throw conflict("Only a pending decision card can change its minutes");
+        }
+        const [saved] = await tx
+          .update(issueThreadInteractions)
+          .set({
+            payload: sql`${issueThreadInteractions.payload} || ${JSON.stringify({ estimatedMinutes: minutes })}::jsonb`,
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, locked.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (!saved) throw conflict("Only a pending decision card can change its minutes");
+        return saved;
+      });
+      return hydrateInteraction(updated);
+    },
+
     create: async (
       issue: { id: string; companyId: string },
       input: CreateIssueThreadInteractionInput,
       actor: InteractionActor,
       options: CreateInteractionOptions = {},
     ) => {
-      const data = normalizeCreateInteractionInput(
+      const data = stampInteractionEstimatedMinutes(normalizeCreateInteractionInput(
         createIssueThreadInteractionSchema.parse(input),
-      );
+      ));
       // Chat ownership is server-owned and immutable. Ordinary human questions
       // must not depend on a model copying an opaque user identity correctly.
       let defaultAddresseeUserId: string | null = null;

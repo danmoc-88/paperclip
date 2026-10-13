@@ -1127,6 +1127,7 @@ export interface SuggestedTaskDraft {
 
 export interface SuggestTasksPayload {
   version: 1;
+  estimatedMinutes?: number;
   defaultParentId?: string | null;
   tasks: SuggestedTaskDraft[];
 }
@@ -1220,6 +1221,7 @@ export interface PaperclipQuestionSetPayload {
 
 export interface AskUserQuestionsPayload {
   version: 1;
+  estimatedMinutes?: number;
   title?: string | null;
   submitLabel?: string | null;
   supersedeOnUserComment?: boolean;
@@ -1382,6 +1384,7 @@ export interface ConnectionIntentResult {
 
 export interface RequestConfirmationPayload {
   version: 1;
+  estimatedMinutes?: number;
   prompt: string;
   acceptLabel?: string | null;
   rejectLabel?: string | null;
@@ -1405,6 +1408,7 @@ export interface RequestCheckboxConfirmationOption {
 
 export interface RequestCheckboxConfirmationPayload {
   version: 1;
+  estimatedMinutes?: number;
   prompt: string;
   detailsMarkdown?: string | null;
   options: RequestCheckboxConfirmationOption[];
@@ -1434,6 +1438,7 @@ export interface RequestItemVerdictsItem {
 
 export interface RequestItemVerdictsPayload {
   version: 1;
+  estimatedMinutes?: number;
   prompt: string;
   detailsMarkdown?: string | null;
   items: RequestItemVerdictsItem[];

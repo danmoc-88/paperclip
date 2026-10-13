@@ -428,6 +428,11 @@ export const issuesApi = {
     ),
   createInteraction: (id: string, data: Record<string, unknown>) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions`, data),
+  updateInteractionEstimatedMinutes: (id: string, interactionId: string, estimatedMinutes: number) =>
+    api.patch<IssueThreadInteraction>(
+      `/issues/${id}/interactions/${interactionId}/estimated-minutes`,
+      { estimatedMinutes },
+    ),
   acceptInteraction: (
     id: string,
     interactionId: string,

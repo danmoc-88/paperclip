@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { Agent } from "@paperclipai/shared";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { readEstimatedMinutes, type Agent } from "@paperclipai/shared";
 import { AlertTriangle, ArrowUpRight, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Clock, ExternalLink, FileText, GitBranch, ImagePlus, KeyRound, Loader2, MessageSquareQuote, MinusCircle, ShieldAlert, ThumbsUp, TriangleAlert, Wrench, X, XCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { formatAssigneeUserLabel } from "../lib/assignees";
@@ -30,7 +31,10 @@ import {
   type SuggestedTaskDraft,
   type SuggestedTaskTreeNode,
 } from "../lib/issue-thread-interactions";
+import { issuesApi } from "../api/issues";
+import { queryKeys } from "../lib/queryKeys";
 import { cn, formatDateTime, formatShortDate } from "../lib/utils";
+import { DecisionMinutesControl } from "./DecisionMinutesControl";
 import { InteractionPreparationNotice } from "./InteractionPreparationNotice";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "./MarkdownBody";
@@ -1687,6 +1691,40 @@ function ToolActionResolution({
   );
 }
 
+function storedCardMinutes(interaction: IssueThreadInteraction): number | null {
+  const payload = interaction.payload;
+  if (!payload || typeof payload !== "object" || !("estimatedMinutes" in payload)) return null;
+  return readEstimatedMinutes(payload.estimatedMinutes);
+}
+
+function InteractionMinutesEditor({ interaction }: { interaction: IssueThreadInteraction }) {
+  const queryClient = useQueryClient();
+  const stored = storedCardMinutes(interaction);
+  const [override, setOverride] = useState<number | null>(null);
+  useEffect(() => {
+    if (override !== null && stored === override) setOverride(null);
+  }, [stored, override]);
+  const mutation = useMutation({
+    mutationFn: (minutes: number) =>
+      issuesApi.updateInteractionEstimatedMinutes(interaction.issueId, interaction.id, minutes),
+    onSuccess: (saved) => {
+      const next = storedCardMinutes(saved);
+      if (next != null) setOverride(next);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.attention(interaction.companyId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(interaction.issueId) });
+    },
+  });
+  return (
+    <DecisionMinutesControl
+      minutes={override ?? stored}
+      editable={interaction.status === "pending"}
+      busy={mutation.isPending}
+      errorMessage={mutation.error instanceof Error ? mutation.error.message : null}
+      onCommit={(minutes) => mutation.mutate(minutes)}
+    />
+  );
+}
+
 function RequestToolActionCard({
   interaction,
   state,
@@ -1732,6 +1770,7 @@ function RequestToolActionCard({
         </span>
         <div className="min-w-0 flex-1 space-y-1 text-sm">
           <MarkdownBody externalReferences={externalReferences}>{payload.previewMarkdown || payload.toolDisplayName}</MarkdownBody>
+          <InteractionMinutesEditor interaction={interaction} />
           {!isPending ? <ToolActionResolution state={state} interaction={interaction} /> : null}
         </div>
       </div>
@@ -3785,6 +3824,7 @@ export function IssueThreadInteractionCard({
                           ? "Plan review"
                           : "Confirmation requested")}
             </div>
+            <InteractionMinutesEditor interaction={interaction} />
             {/* A connection-authorization card composes its own single body
                 below, because the closing sentence depends on whether the
                 reader is the person who may consent. Rendering the summary here
