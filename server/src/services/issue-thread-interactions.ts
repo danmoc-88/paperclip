@@ -588,6 +588,14 @@ function isUserCommentSupersedableKind(
   ).includes(kind);
 }
 
+/** Minutes are filled in at creation and can be corrected later. A retry of the same card is still the same request. */
+function withoutEstimatedMinutes(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const rest = { ...(value as Record<string, unknown>) };
+  delete rest.estimatedMinutes;
+  return rest;
+}
+
 function isEquivalentCreateRequest(
   row: IssueThreadInteractionRow,
   input: CreateIssueThreadInteraction,
@@ -607,7 +615,7 @@ function isEquivalentCreateRequest(
     (row.summary ?? null) === (input.summary ?? null) &&
     (row.createdByAgentId ?? null) === (actor.agentId ?? null) &&
     (row.createdByUserId ?? null) === (actor.userId ?? null) &&
-    isDeepStrictEqual(row.payload, input.payload)
+    isDeepStrictEqual(withoutEstimatedMinutes(row.payload), withoutEstimatedMinutes(input.payload))
   );
 }
 

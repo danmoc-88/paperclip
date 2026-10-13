@@ -1770,7 +1770,9 @@ function RequestToolActionCard({
         </span>
         <div className="min-w-0 flex-1 space-y-1 text-sm">
           <MarkdownBody externalReferences={externalReferences}>{payload.previewMarkdown || payload.toolDisplayName}</MarkdownBody>
-          <InteractionMinutesEditor interaction={interaction} />
+          {storedCardMinutes(interaction) != null ? (
+            <InteractionMinutesEditor interaction={interaction} />
+          ) : null}
           {!isPending ? <ToolActionResolution state={state} interaction={interaction} /> : null}
         </div>
       </div>
@@ -3824,7 +3826,9 @@ export function IssueThreadInteractionCard({
                           ? "Plan review"
                           : "Confirmation requested")}
             </div>
-            <InteractionMinutesEditor interaction={interaction} />
+            {storedCardMinutes(interaction) != null ? (
+              <InteractionMinutesEditor interaction={interaction} />
+            ) : null}
             {/* A connection-authorization card composes its own single body
                 below, because the closing sentence depends on whether the
                 reader is the person who may consent. Rendering the summary here

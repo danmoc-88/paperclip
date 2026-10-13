@@ -73,6 +73,13 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function metadataWithoutEstimatedMinutes(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value ?? {};
+  const rest = { ...(value as Record<string, unknown>) };
+  delete rest.estimatedMinutes;
+  return rest;
+}
+
 function parseAttentionArchiveManifest(
   companyId: string,
   targetSnapshots: Record<string, Snapshot>,
@@ -200,7 +207,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         .then((rows) => rows[0] ?? null);
       if (existing) {
         const archiveEquivalent = input.additionalTargetSnapshots === undefined || (
-          canonicalJson(existing.metadata ?? {}) === canonicalJson(metadata) &&
+          canonicalJson(metadataWithoutEstimatedMinutes(existing.metadata ?? {})) === canonicalJson(metadataWithoutEstimatedMinutes(metadata)) &&
           canonicalJson(Object.fromEntries(Object.entries(existing.targetSnapshots as Record<string, Snapshot>)
             .filter(([key]) => key.startsWith("attention:")))) === canonicalJson(input.additionalTargetSnapshots)
         );
@@ -234,7 +241,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         ? await dbOrTx.select().from(decisions).where(and(eq(decisions.companyId, input.companyId), eq(decisions.idempotencyKey, input.idempotencyKey))).then((rows) => rows[0] ?? null)
         : null;
       const archiveEquivalent = !existing || input.additionalTargetSnapshots === undefined || (
-        canonicalJson(existing.metadata ?? {}) === canonicalJson(metadata) &&
+        canonicalJson(metadataWithoutEstimatedMinutes(existing.metadata ?? {})) === canonicalJson(metadataWithoutEstimatedMinutes(metadata)) &&
         canonicalJson(Object.fromEntries(Object.entries(existing.targetSnapshots as Record<string, Snapshot>)
           .filter(([key]) => key.startsWith("attention:")))) === canonicalJson(input.additionalTargetSnapshots)
       );
