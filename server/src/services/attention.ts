@@ -1778,8 +1778,12 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const runKey = `${run.agentId}:${issueId ?? ""}`;
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
         const sameScopeNewer = newerByScope.get(runKey) ?? [];
+        // Reconciliation starts at the failure itself. A comment or success
+        // recorded after the run was created, but before it finished, is not
+        // evidence that this failure was recovered.
+        const failureBoundaryMs = (run.finishedAt ?? run.updatedAt ?? run.createdAt).getTime();
         const decision = decideFailedRunAttention({
-          failedAtMs: run.createdAt.getTime(),
+          failedAtMs: failureBoundaryMs,
           errorCode: run.errorCode ?? null,
           errorText: run.error ?? null,
           issueStatus: issue?.status ?? null,
@@ -1791,9 +1795,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           agentSucceededAfter: newerRuns.some((newerRun) =>
             newerRun.agentId === run.agentId
             && newerRun.status === "succeeded"
-            && newerRun.createdAt.getTime() > run.createdAt.getTime()),
+            && newerRun.createdAt.getTime() > failureBoundaryMs),
           dispositionAfterFailure: issueId
-            ? (dispositionAtByIssue.get(issueId) ?? Number.NEGATIVE_INFINITY) > run.createdAt.getTime()
+            ? (dispositionAtByIssue.get(issueId) ?? Number.NEGATIVE_INFINITY) > failureBoundaryMs
             : false,
         });
         if (!decision.show) continue;

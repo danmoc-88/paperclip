@@ -1215,6 +1215,67 @@ describeEmbeddedPostgres("attention service", () => {
     expect(afterNewFailure.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([secondFailureId]);
   });
 
+  it.each(["done", "cancelled"])("keeps a %s failure visible when the disposition predates the failure end", async (status) => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Failure after an earlier comment",
+      status,
+    });
+    const failedRunId = randomUUID();
+    const startedAt = new Date("2026-07-09T12:00:00.000Z");
+    const commentAt = new Date("2026-07-09T12:05:00.000Z");
+    const finishedAt = new Date("2026-07-09T12:10:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId },
+      createdAt: startedAt,
+      startedAt,
+      updatedAt: finishedAt,
+      finishedAt,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: finishedAt,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: commentAt,
+    });
+
+    const during = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(during.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([failedRunId]);
+
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date("2026-07-09T12:11:00.000Z"),
+    });
+    const after = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(after.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+  });
+
   it("keeps failure when recovery evidence belongs to another issue", async () => {
     const { companyId, workerId } = await seedCompany("ATN");
     const issueId = await insertIssue({

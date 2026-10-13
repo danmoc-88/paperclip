@@ -489,9 +489,10 @@ export function reviewQueue(
   const servicerActions = groups.filter((group) => group.servicerMayAct && visible(group));
   const ownerFollowUps = groups.filter((group) => !group.needsHuman && !group.servicerMayAct && visible(group));
   // Only matters that were actually shown stay throttled. A topic past the
-  // limit of three stays eligible for the next cycle. Previously shown matters
-  // keep their original time so a later cycle does not refresh their window.
-  for (const group of [...danielTopics, ...servicerActions]) {
+  // limit of three stays eligible for the next cycle. Owner follow-ups are
+  // shown in the saved review, so they use the same window. Previously shown
+  // matters keep their original time so a later cycle does not refresh it.
+  for (const group of [...danielTopics, ...servicerActions, ...ownerFollowUps]) {
     if (!shownAt.has(group.fingerprint)) shownAt.set(group.fingerprint, nowMs);
   }
   const shown = [...shownAt.entries()].map(([fingerprint, atMs]) => ({ fingerprint, atMs }));

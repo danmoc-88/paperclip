@@ -286,7 +286,10 @@ describe("reviewQueue", () => {
     expect(longWait?.needsHuman).toBe(false);
     expect(first.digest.servicerActions.map((group) => group.causeKey)).toEqual(["approved-checkpoint"]);
     expect(first.digest.notify).toBe(true);
-    expect(first.digest.fingerprints).toHaveLength(first.digest.danielTopics.length + first.digest.servicerActions.length);
+    expect(first.digest.ownerFollowUps.map((group) => group.causeKey)).toEqual(["blocker:blocker-b"]);
+    expect(first.digest.fingerprints).toHaveLength(
+      first.digest.danielTopics.length + first.digest.servicerActions.length + first.digest.ownerFollowUps.length,
+    );
     expect(first.matters.every((item) => item.category !== "close_after_evidence" || item.needsHuman)).toBe(true);
 
     const second = reviewQueue({ ok: true, tasks }, NOW + 2 * HOUR_MS, undefined, {
@@ -298,8 +301,9 @@ describe("reviewQueue", () => {
     expect(second.analyzed).toBe(400);
     expect(second.digest.danielTopics.map((topic) => topic.causeKey)).toEqual(["duplicate:canon", "blocker:blocker-e"]);
     expect(second.digest.servicerActions).toEqual([]);
+    expect(second.digest.ownerFollowUps).toEqual([]);
     expect(second.digest.notify).toBe(true);
-    expect(second.digest.suppressedUnchanged).toBe(4);
+    expect(second.digest.suppressedUnchanged).toBe(5);
     const alreadyShown = new Set(first.digest.danielTopics.map((topic) => topic.causeKey));
     expect(second.digest.danielTopics.some((topic) => alreadyShown.has(topic.causeKey))).toBe(false);
 
@@ -368,6 +372,32 @@ describe("reviewQueue", () => {
     expect(reminded.ok).toBe(true);
     if (!reminded.ok) return;
     expect(reminded.digest.danielTopics.map((topic) => topic.causeKey)).toEqual(["a", "b", "c"]);
+  });
+
+  it("does not repeat an owner follow-up inside the throttle", () => {
+    const owned = task({
+      id: "owner-task",
+      identifier: "ATN-1",
+      title: "Owner follow-up",
+      progress: [{ atMs: NOW - 12 * HOUR_MS, kind: "substantive" }],
+    });
+    const first = reviewQueue({ ok: true, tasks: [owned] }, NOW);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.digest.notify).toBe(false);
+    expect(first.digest.ownerFollowUps.map((group) => group.fingerprint)).toEqual(["task:owner-task|resume"]);
+    expect(first.digest.fingerprints).toEqual(["task:owner-task|resume"]);
+
+    const second = reviewQueue({ ok: true, tasks: [owned] }, NOW + 2 * HOUR_MS, undefined, {
+      atMs: NOW,
+      fingerprints: first.digest.fingerprints,
+      shown: first.digest.shown,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.digest.ownerFollowUps).toEqual([]);
+    expect(second.digest.notify).toBe(false);
+    expect(second.digest.suppressedUnchanged).toBe(1);
   });
 
   it("still surfaces a new cause during the reminder throttle", () => {
