@@ -60,6 +60,7 @@ import { evaluateAutomaticInterruptionResume } from "./execution-recovery-resolu
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import { RUN_CONTEXT_COMPACTION_MARKER_KEY } from "./run-context-compaction.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -21056,6 +21057,9 @@ export function heartbeatService(
             })
           : null;
       context.executionContinuation = executionContinuation;
+      // A context copied from a compacted run must not claim to be compact
+      // once full continuation content is rebuilt into it.
+      delete context[RUN_CONTEXT_COMPACTION_MARKER_KEY];
       const paperclipWakePayload = await buildPaperclipWakePayload({
         db,
         companyId: agent.companyId,

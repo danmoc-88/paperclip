@@ -18,6 +18,7 @@ import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { RUN_CONTEXT_COMPACTION_MARKER_KEY } from "../run-context-compaction.js";
 
 export const NATIVE_SAFE_REPLACEMENT_REASON = "native_safe_replacement";
 const record = (v: unknown): Record<string, unknown> =>
@@ -376,6 +377,8 @@ export async function reconcileSafeNativeReplacements(
           "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
           "paperclipWake", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact",
           "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTurnContext",
+          // Describes the predecessor's stored row only.
+          RUN_CONTEXT_COMPACTION_MARKER_KEY,
         ]) delete predecessorContext[key];
         const context = {
           ...predecessorContext,
