@@ -426,3 +426,90 @@ describe("reviewQueue", () => {
     expect(second.analyzed).toBe(2);
   });
 });
+
+describe("waiting between hand-offs", () => {
+  const wait = (over: Partial<TaskSnapshot>) => task({ id: "w", identifier: "SAK-90", status: "in_review", ...over });
+
+  it("does not alarm a long wait that has a live trigger", () => {
+    const r = classifyTask(wait({
+      waiting: { phase: "ci", sinceMs: NOW - 3 * DAY_MS, trigger: "monitor" },
+      progress: [{ atMs: NOW - 3 * DAY_MS, kind: "substantive" }],
+    }), NOW, thresholds);
+    expect(r.alarm).toBe(false);
+    expect(r.category).toBeNull();
+  });
+
+  it("alarms a wait with no trigger past the phase threshold, once per phase group", () => {
+    const tasks = [1, 2].map((i) => wait({
+      id: `w${i}`,
+      identifier: `SAK-9${i}`,
+      waiting: { phase: "review", sinceMs: NOW - 30 * HOUR_MS, trigger: null },
+      progress: [{ atMs: NOW - 30 * HOUR_MS, kind: "substantive" }],
+    }));
+    const out = reviewQueue({ ok: true, tasks }, NOW);
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.matters.every((m) => m.category === "restore_trigger" && m.alarm)).toBe(true);
+    expect(out.groups).toHaveLength(1);
+    expect(out.groups[0]!.impact).toBe(2);
+    expect(out.groups[0]!.needsHuman).toBe(false);
+  });
+
+  it("does not alarm a short wait with no trigger", () => {
+    const r = classifyTask(wait({
+      waiting: { phase: "assignment", sinceMs: NOW - 30 * 60_000, trigger: null },
+    }), NOW, thresholds);
+    expect(r.alarm).toBe(false);
+  });
+
+  it("treats a dated check that passed as a missing trigger", () => {
+    const r = classifyTask(wait({
+      waiting: { phase: "ci", sinceMs: NOW - 10 * HOUR_MS, trigger: "dated_check", nextCheckAtMs: NOW - HOUR_MS },
+    }), NOW, thresholds);
+    expect(r.category).toBe("restore_trigger");
+    expect(r.alarm).toBe(true);
+    expect(r.reason).toMatch(/minęło/);
+  });
+
+  it("keeps a future dated check as a working path", () => {
+    const r = classifyTask(wait({
+      waiting: { phase: "ci", sinceMs: NOW - 10 * HOUR_MS, trigger: "dated_check", nextCheckAtMs: NOW + HOUR_MS },
+    }), NOW, thresholds);
+    expect(r.alarm).toBe(false);
+  });
+
+  it("recommends a trigger, not a split, and never closes", () => {
+    const r = classifyTask(wait({
+      waiting: { phase: "review", sinceMs: NOW - 40 * HOUR_MS, trigger: null },
+    }), NOW, thresholds);
+    expect(r.recommendedAction).toMatch(/Nie dzielić/);
+    expect(r.category).not.toBe("close_after_evidence");
+  });
+
+  it("lets the servicer restore the path only for approved work with checkpoint and owner", () => {
+    const base = { waiting: { phase: "execution" as const, sinceMs: NOW - 12 * HOUR_MS, trigger: null } };
+    expect(classifyTask(wait({ ...base, previouslyApproved: true, hasCheckpoint: true }), NOW, thresholds).servicerMayAct).toBe(true);
+    expect(classifyTask(wait({ ...base, previouslyApproved: true, hasCheckpoint: false }), NOW, thresholds).servicerMayAct).toBe(false);
+  });
+
+  it("ignores waiting state on active runs", () => {
+    const r = classifyTask(wait({
+      activeRun: true,
+      waiting: { phase: "execution", sinceMs: NOW - 40 * HOUR_MS, trigger: null },
+    }), NOW, thresholds);
+    expect(r.alarm).toBe(false);
+  });
+
+  it("does not repeat the same alarm in the next cycle", () => {
+    const tasks = [wait({
+      waiting: { phase: "review", sinceMs: NOW - 30 * HOUR_MS, trigger: null },
+      progress: [{ atMs: NOW - 30 * HOUR_MS, kind: "substantive" }],
+    })];
+    const first = reviewQueue({ ok: true, tasks }, NOW);
+    if (!first.ok) throw new Error("read");
+    const second = reviewQueue({ ok: true, tasks }, NOW + 2 * HOUR_MS, undefined, { atMs: NOW, fingerprints: first.digest.fingerprints, shown: first.digest.shown });
+    if (!second.ok) throw new Error("read");
+    expect(second.digest.ownerFollowUps.length + second.digest.servicerActions.length).toBe(0);
+    expect(second.digest.suppressedUnchanged).toBe(1);
+  });
+});
