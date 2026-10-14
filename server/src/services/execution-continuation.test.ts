@@ -16,6 +16,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { StaleExecutionContinuationError, buildExecutionContinuation, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
+import { compactTerminalRunContextSnapshot } from "./run-context-compaction.js";
 
 const expectStaleContinuation = async (
   run: () => Promise<unknown>,
@@ -358,6 +359,40 @@ const support = await getEmbeddedPostgresTestSupport();
       );
       expect(freshPrompt).toContain("Read my Notion launch notes.");
       expect(freshPrompt).not.toContain('"resumeDelta"');
+    });
+    it("computes the same resume delta after the base run's snapshot was storage-compacted", async () => {
+      const longId = randomUUID();
+      const longBody = "Detailed launch brief. ".repeat(40);
+      await db.insert(issueComments).values({ id: longId, companyId, issueId, authorType: "user",
+        authorUserId: "local-board", body: longBody, createdAt: new Date("2026-09-08T12:00:00Z") });
+      try {
+        const delivered = await build();
+        const resume = () => buildExecutionContinuation({
+          db, companyId, issueId, agentId, previousContextRunId: runId,
+          context: { interactionId }, summary: null, exposeLowTrustRaw: false,
+        });
+        const full = { issueId, executionContinuation: delivered, paperclipWake: { executionContinuation: delivered } };
+        const compacted = compactTerminalRunContextSnapshot(full).snapshot!;
+        const storedMessages = (compacted.executionContinuation as typeof delivered).messages as unknown as Record<string, unknown>[];
+        expect(storedMessages.find((row) => row.id === longId)).toMatchObject({ bodyOmitted: true, bodyChars: longBody.length });
+        expect(storedMessages.find((row) => row.id === longId)).not.toHaveProperty("body");
+        await db.update(heartbeatRuns).set({ contextSnapshot: full }).where(eq(heartbeatRuns.id, runId));
+        const fromFull = await resume();
+        await db.update(heartbeatRuns).set({ contextSnapshot: compacted }).where(eq(heartbeatRuns.id, runId));
+        const fromCompacted = await resume();
+        expect(fromCompacted.resumeDelta).toEqual(fromFull.resumeDelta);
+        expect(fromCompacted.resumeDelta?.messages.map((row) => row.id)).not.toContain(longId);
+        // The successor still receives full current bodies, never the compact form.
+        expect(fromCompacted.messages.find((row) => row.id === longId)?.body).toBe(longBody);
+        // An edit after the compacted delivery is still a new event.
+        await db.update(issueComments).set({ body: `${longBody} Updated.`, updatedAt: new Date() })
+          .where(eq(issueComments.id, longId));
+        expect((await resume()).resumeDelta?.messages.map((row) => row.id)).toContain(longId);
+      } finally {
+        await db.delete(issueComments).where(eq(issueComments.id, longId));
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, commentId: gmailId } })
+          .where(eq(heartbeatRuns.id, runId));
+      }
     });
     it("fails closed when required originating context is missing", async () => {
       await expectMissingContinuationContext(

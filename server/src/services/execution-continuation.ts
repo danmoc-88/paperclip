@@ -15,6 +15,7 @@ import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
+import { deliveredMessageMatches } from "./run-context-compaction.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 
 export class StaleExecutionContinuationError extends Error {
@@ -290,17 +291,8 @@ export async function buildExecutionContinuation(input: {
           messages: messages.filter(
             (message) =>
               originCommentIds.includes(message.id) ||
-              !deliveredMessages.some(
-                (prior) =>
-                  prior.id === message.id &&
-                  prior.updatedAt === message.updatedAt &&
-                  prior.body === message.body &&
-                  prior.deleted === message.deleted &&
-                  prior.authorId === message.authorId &&
-                  (prior.createdByRunId ?? null) === message.createdByRunId &&
-                  JSON.stringify(prior.sourceTrust) ===
-                    JSON.stringify(message.sourceTrust),
-              ),
+              // A finished base run may already be storage-compacted.
+              !deliveredMessages.some((prior) => deliveredMessageMatches(prior, message)),
           ),
         }
       : undefined;
