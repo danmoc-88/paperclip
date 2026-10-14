@@ -245,6 +245,11 @@ vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
   reconcileSafeNativeReplacements: vi.fn(async () => ({ scanned: 0, scheduled: 0 })),
 }));
 
+// Compaction correctness is covered by run-context-compaction.test.ts.
+vi.mock("../services/run-context-compaction.js", () => ({
+  createRunContextCompactionSweep: vi.fn(() => ({ sweep: vi.fn(async () => ({ scanned: 0, compacted: 0 })) })),
+}));
+
 vi.mock("../config.js", () => ({
   loadConfig: loadConfigMock,
 }));
