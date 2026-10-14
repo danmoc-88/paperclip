@@ -77,6 +77,7 @@ describeEmbeddedPostgres("attention service", () => {
     await db.delete(issueApprovals);
     await db.delete(issueAttachments);
     await db.delete(issueDocuments);
+    await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(budgetIncidents);
@@ -85,7 +86,6 @@ describeEmbeddedPostgres("attention service", () => {
     await db.delete(invites);
     await db.delete(issueRecoveryActions);
     await db.delete(issueRelations);
-    await db.delete(activityLog);
     await db.delete(approvals);
     await db.delete(issues);
     await db.delete(assets);
@@ -976,7 +976,7 @@ describeEmbeddedPostgres("attention service", () => {
     expect(failures.find((item) => item.subject.id === timedOutId)?.relatedIssue?.id).toBe(taskId);
   });
 
-  it("suppresses failed-run attention after a newer run for the same issue", async () => {
+  it("keeps failed-run attention when a later success left no work trace", async () => {
     const { companyId, workerId } = await seedCompany("ATN");
     const issueId = await insertIssue({
       companyId,
@@ -986,6 +986,7 @@ describeEmbeddedPostgres("attention service", () => {
     });
     const failedRunId = randomUUID();
     const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const successId = randomUUID();
 
     await db.insert(heartbeatRuns).values([
       {
@@ -995,13 +996,14 @@ describeEmbeddedPostgres("attention service", () => {
         invocationSource: "automation",
         status: "failed",
         error: "adapter failed",
+        errorCode: "adapter_failed",
         contextSnapshot: { issueId },
         createdAt: failedAt,
         updatedAt: failedAt,
         finishedAt: failedAt,
       },
       {
-        id: randomUUID(),
+        id: successId,
         companyId,
         agentId: workerId,
         invocationSource: "automation",
@@ -1023,7 +1025,606 @@ describeEmbeddedPostgres("attention service", () => {
     });
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const again = await attentionService(db).list(companyId, { userId: "board-user" });
 
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([failedRunId]);
+    expect(again.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([failedRunId]);
+  });
+
+  it("clears failed-run attention after a later success with a work trace, and shows a new failure", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Recoverable task",
+      status: "in_progress",
+    });
+    const failedRunId = randomUUID();
+    const successId = randomUUID();
+    const secondFailureId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const successAt = new Date("2026-07-09T12:05:00.000Z");
+    const secondAt = new Date("2026-07-09T12:10:00.000Z");
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: successId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        createdAt: successAt,
+        updatedAt: successAt,
+        finishedAt: successAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: workerId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      agentId: workerId,
+      runId: successId,
+      createdAt: successAt,
+    });
+
+    const recovered = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(recovered.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+
+    await db.insert(heartbeatRuns).values({
+      id: secondFailureId,
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "adapter failed again",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId },
+      createdAt: secondAt,
+      updatedAt: secondAt,
+      finishedAt: secondAt,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: secondFailureId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:10:01.000Z"),
+    });
+
+    const afterNewFailure = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(afterNewFailure.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([secondFailureId]);
+  });
+
+  it.each(["done", "cancelled"])("shows a new failure on a %s task after an older recovery", async (status) => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Finished task",
+      status,
+    });
+    const failedRunId = randomUUID();
+    const successId = randomUUID();
+    const secondFailureId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const successAt = new Date("2026-07-09T12:05:00.000Z");
+    const secondAt = new Date("2026-07-09T12:10:00.000Z");
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: successId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        createdAt: successAt,
+        updatedAt: successAt,
+        finishedAt: successAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: workerId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      agentId: workerId,
+      runId: successId,
+      createdAt: successAt,
+    });
+
+    const recovered = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(recovered.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+
+    await db.insert(heartbeatRuns).values({
+      id: secondFailureId,
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "adapter failed again",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId },
+      createdAt: secondAt,
+      updatedAt: secondAt,
+      finishedAt: secondAt,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: secondFailureId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:10:01.000Z"),
+    });
+
+    const afterNewFailure = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(afterNewFailure.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([secondFailureId]);
+  });
+
+  it.each(["done", "cancelled"])("keeps a %s failure visible when the disposition predates the failure end", async (status) => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Failure after an earlier comment",
+      status,
+    });
+    const failedRunId = randomUUID();
+    const startedAt = new Date("2026-07-09T12:00:00.000Z");
+    const commentAt = new Date("2026-07-09T12:05:00.000Z");
+    const finishedAt = new Date("2026-07-09T12:10:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId },
+      createdAt: startedAt,
+      startedAt,
+      updatedAt: finishedAt,
+      finishedAt,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: finishedAt,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: commentAt,
+    });
+
+    const during = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(during.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([failedRunId]);
+
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date("2026-07-09T12:11:00.000Z"),
+    });
+    const after = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(after.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+  });
+
+  it("keeps failure when recovery evidence belongs to another issue", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Recoverable task",
+      status: "in_progress",
+    });
+    const failedRunId = randomUUID();
+    const successId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const successAt = new Date("2026-07-09T12:05:00.000Z");
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: successId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        createdAt: successAt,
+        updatedAt: successAt,
+        finishedAt: successAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: workerId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: randomUUID(),
+      agentId: workerId,
+      runId: successId,
+      createdAt: successAt,
+    });
+
+    const recovered = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(recovered.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([failedRunId]);
+  });
+
+  it("accepts document and work-product evidence only for the named issue", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Documented task",
+      status: "in_progress",
+    });
+    const otherIssueId = await insertIssue({
+      companyId,
+      identifier: "ATN-2",
+      title: "Other task",
+      status: "in_progress",
+    });
+    const failedRunId = randomUUID();
+    const otherFailedRunId = randomUUID();
+    const successId = randomUUID();
+    const otherSuccessId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const successAt = new Date("2026-07-09T12:05:00.000Z");
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: otherFailedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId: otherIssueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: successId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        createdAt: successAt,
+        updatedAt: successAt,
+        finishedAt: successAt,
+      },
+      {
+        id: otherSuccessId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId: otherIssueId },
+        createdAt: successAt,
+        updatedAt: successAt,
+        finishedAt: successAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values([
+      {
+        companyId,
+        runId: failedRunId,
+        agentId: workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date("2026-07-09T12:00:01.000Z"),
+      },
+      {
+        companyId,
+        runId: otherFailedRunId,
+        agentId: workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date("2026-07-09T12:00:01.000Z"),
+      },
+    ]);
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: workerId,
+        action: "issue.document_updated",
+        entityType: "document",
+        entityId: randomUUID(),
+        details: { issueId, documentId: randomUUID() },
+        agentId: workerId,
+        runId: successId,
+        createdAt: successAt,
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: workerId,
+        action: "issue.work_product_created",
+        entityType: "work_product",
+        entityId: randomUUID(),
+        details: { workProductId: randomUUID() },
+        agentId: workerId,
+        runId: otherSuccessId,
+        createdAt: successAt,
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([otherFailedRunId]);
+  });
+
+  it("keeps a done task visible while the provider failure is still open", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Closed during outage",
+      status: "done",
+    });
+    const failedRunId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "API error (status 402 Payment Required): balance exhausted",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId },
+      createdAt: failedAt,
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date("2026-07-09T12:02:00.000Z"),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id)).toEqual([failedRunId]);
+  });
+
+  it("clears a done provider outage after a later success and a recorded disposition", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Routine cycle",
+      status: "done",
+    });
+    const otherIssueId = await insertIssue({
+      companyId,
+      identifier: "ATN-2",
+      title: "Later work",
+      status: "done",
+    });
+    const failedRunId = randomUUID();
+    const successId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const successAt = new Date("2026-07-09T13:00:00.000Z");
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "API error (status 402 Payment Required): balance exhausted",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: successId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId: otherIssueId },
+        createdAt: successAt,
+        updatedAt: successAt,
+        finishedAt: successAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: workerId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      agentId: workerId,
+      runId: successId,
+      createdAt: successAt,
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+    const runStillThere = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, failedRunId));
+    expect(runStillThere).toHaveLength(1);
+  });
+
+  it("hides an old failure while a newer run of the same scope is active", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Live task",
+      status: "in_progress",
+    });
+    const failedRunId = randomUUID();
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "running",
+        contextSnapshot: { issueId },
+        createdAt: new Date("2026-07-09T12:05:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:05:00.000Z"),
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
   });
 

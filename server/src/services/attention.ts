@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   approvals,
   assets,
@@ -49,6 +50,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
+import { decideFailedRunAttention, FAILED_RUN_EVIDENCE_ACTIONS, recoveryEvidenceIssueId } from "./failed-run-reconciliation.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1681,7 +1683,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         oldestFailedRunCreatedAt && failedAgentIds.length > 0
           ? db
             .select({
+              id: heartbeatRuns.id,
               agentId: heartbeatRuns.agentId,
+              status: heartbeatRuns.status,
               createdAt: heartbeatRuns.createdAt,
               // Project just the ids readRunIssueId needs; pulling the whole
               // context_snapshot detoasts megabytes per feed build.
@@ -1696,22 +1700,107 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             ))
           : Promise.resolve([]),
       ]);
-      const latestRunCreatedAtByKey = new Map<string, Date>();
+      const succeededNewerIds = newerRuns.filter((run) => run.status === "succeeded").map((run) => run.id);
+      const evidenceIssuesByRun = new Map<string, Set<string>>();
+      if (succeededNewerIds.length > 0) {
+        const evidenceRows = await db
+          .select({
+            runId: activityLog.runId,
+            entityType: activityLog.entityType,
+            entityId: activityLog.entityId,
+            details: activityLog.details,
+          })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            inArray(activityLog.runId, succeededNewerIds),
+            inArray(activityLog.action, [...FAILED_RUN_EVIDENCE_ACTIONS]),
+          ));
+        for (const row of evidenceRows) {
+          const evidenceIssueId = recoveryEvidenceIssueId(row);
+          if (!row.runId || !evidenceIssueId) continue;
+          const issuesForRun = evidenceIssuesByRun.get(row.runId) ?? new Set<string>();
+          issuesForRun.add(evidenceIssueId);
+          evidenceIssuesByRun.set(row.runId, issuesForRun);
+        }
+      }
+      const dispositionIssueIds = [...new Set(failedIssueIds.filter((value): value is string => Boolean(value)))];
+      const dispositionIssueIdSet = new Set(dispositionIssueIds);
+      const dispositionAtByIssue = new Map<string, number>();
+      if (dispositionIssueIds.length > 0 && oldestFailedRunCreatedAt) {
+        const dispositionRows = await db
+          .select({
+            entityId: activityLog.entityId,
+            entityType: activityLog.entityType,
+            details: activityLog.details,
+            actorType: activityLog.actorType,
+            runId: activityLog.runId,
+            createdAt: activityLog.createdAt,
+          })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.entityType, "issue"),
+            inArray(activityLog.entityId, dispositionIssueIds),
+            gt(activityLog.createdAt, oldestFailedRunCreatedAt),
+            inArray(activityLog.action, [...FAILED_RUN_EVIDENCE_ACTIONS]),
+          ));
+        const knownStatus = new Map(newerRuns.map((run) => [run.id, run.status]));
+        const missingRunIds = [...new Set(dispositionRows.flatMap((row) => row.runId ? [row.runId] : []))]
+          .filter((runId) => !knownStatus.has(runId));
+        if (missingRunIds.length > 0) {
+          const extraRuns = await db
+            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, missingRunIds)));
+          for (const extra of extraRuns) knownStatus.set(extra.id, extra.status);
+        }
+        for (const row of dispositionRows) {
+          const recorded = row.actorType === "user" || (row.runId !== null && knownStatus.get(row.runId) === "succeeded");
+          if (!recorded) continue;
+          const evidenceIssueId = recoveryEvidenceIssueId(row);
+          if (!evidenceIssueId || !dispositionIssueIdSet.has(evidenceIssueId)) continue;
+          const atMs = row.createdAt.getTime();
+          const previous = dispositionAtByIssue.get(evidenceIssueId);
+          if (previous === undefined || atMs > previous) dispositionAtByIssue.set(evidenceIssueId, atMs);
+        }
+      }
+      const newerByScope = new Map<string, typeof newerRuns>();
       for (const newerRun of newerRuns) {
         const newerRunIssueId = readRunIssueId({ issueId: newerRun.runIssueId, taskId: newerRun.runTaskId });
         const newerRunKey = `${newerRun.agentId}:${newerRunIssueId ?? ""}`;
-        const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
-        if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
-          latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
-        }
+        const bucket = newerByScope.get(newerRunKey) ?? [];
+        bucket.push(newerRun);
+        newerByScope.set(newerRunKey, bucket);
       }
       for (const run of failedRows) {
         const issueId = readRunIssueId(run.contextSnapshot);
         const runKey = `${run.agentId}:${issueId ?? ""}`;
-        const hasNewerRun = (latestRunCreatedAtByKey.get(runKey)?.getTime() ?? 0) > run.createdAt.getTime();
-        if (hasNewerRun) continue;
-
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
+        const sameScopeNewer = newerByScope.get(runKey) ?? [];
+        // Reconciliation starts at the failure itself. A comment or success
+        // recorded after the run was created, but before it finished, is not
+        // evidence that this failure was recovered.
+        const failureBoundaryMs = (run.finishedAt ?? run.updatedAt ?? run.createdAt).getTime();
+        const decision = decideFailedRunAttention({
+          failedAtMs: failureBoundaryMs,
+          errorCode: run.errorCode ?? null,
+          errorText: run.error ?? null,
+          issueStatus: issue?.status ?? null,
+          sameScopeNewer: sameScopeNewer.map((newerRun) => ({
+            createdAtMs: newerRun.createdAt.getTime(),
+            status: newerRun.status,
+            hasEvidence: issueId ? evidenceIssuesByRun.get(newerRun.id)?.has(issueId) === true : false,
+          })),
+          agentSucceededAfter: newerRuns.some((newerRun) =>
+            newerRun.agentId === run.agentId
+            && newerRun.status === "succeeded"
+            && newerRun.createdAt.getTime() > failureBoundaryMs),
+          dispositionAfterFailure: issueId
+            ? (dispositionAtByIssue.get(issueId) ?? Number.NEGATIVE_INFINITY) > failureBoundaryMs
+            : false,
+        });
+        if (!decision.show) continue;
         const dedupKey = `run:${run.id}`;
         add(createItem({
           companyId,
@@ -1740,8 +1829,8 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             { id: "dismiss", label: "Dismiss", description: "Dismiss this failed-run attention row." },
           ),
           inlineResolvable: true,
-          entryRule: "latest failed/timed_out run has a Bounded retry exhausted lifecycle event.",
-          exitRule: "A newer run exists for the same issue/agent pair or the row is dismissed.",
+          entryRule: "latest failed/timed_out run has a Bounded retry exhausted lifecycle event and is not reconciled.",
+          exitRule: "Same scope has a live run, a later success with a work trace, or a terminal issue whose provider failure is closed and recorded. A bare success, an open provider failure, and a new failure after recovery stay visible.",
           dedupKey,
           severity: "high",
           activityAt: toIso(run.finishedAt ?? run.updatedAt ?? run.createdAt),
