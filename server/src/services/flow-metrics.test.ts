@@ -69,6 +69,14 @@ describe("flow metrics", () => {
     expect(docsC.note).toMatch(/Bez wniosku/);
   });
 
+  it("does not count a non-finite delivery time as delivered", () => {
+    const bad = (offset: number) => [1, 2, 3].map((i) => rec(offset + i, { deliveredAtMs: Number.NaN }));
+    expect(summarizeFlow(bad(0)).deliveredTasks).toBe(0);
+    const after = [1, 2, 3].map((i) => rec(100 + i, { createdAtMs: CUT + i * HOUR_MS, deliveredAtMs: Number.NaN }));
+    const out = compareFlow({ ok: true, records: [...bad(0), ...after] }, CUT);
+    expect(out.ok && out.comparison.cohorts[0]!.comparable).toBe(false);
+  });
+
   it("reports card counts as context only and fails loudly on a read failure", () => {
     const out = compareFlow({ ok: true, records: [rec(1), rec(2, { createdAtMs: CUT + HOUR_MS })] }, CUT);
     expect(out.ok && out.comparison.cardsBefore).toBe(1);

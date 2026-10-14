@@ -72,7 +72,7 @@ function diff(to: number | null, from: number | null): number | null {
 export function summarizeFlow(records: FlowRecord[]): FlowSummary {
   return {
     tasks: records.length,
-    deliveredTasks: records.filter((r) => r.deliveredAtMs !== null).length,
+    deliveredTasks: records.filter((r) => typeof r.deliveredAtMs === "number" && Number.isFinite(r.deliveredAtMs)).length,
     assignmentWaitMs: median(records.map((r) => diff(r.firstRunStartedAtMs, r.assignedAtMs))),
     executionMs: median(records.map((r) => diff(r.deliveredAtMs, r.firstRunStartedAtMs))),
     ciWaitMs: median(records.map((r) => r.ciWaitMs)),

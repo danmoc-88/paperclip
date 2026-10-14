@@ -455,6 +455,54 @@ describe("waiting between hand-offs", () => {
     expect(out.groups[0]!.needsHuman).toBe(false);
   });
 
+  it("lets a live trigger win over an open question however old it is", () => {
+    const r = classifyTask(wait({
+      questionAlreadyOpen: true,
+      waiting: { phase: "review", sinceMs: NOW - 10 * DAY_MS, trigger: "interaction" },
+      progress: [{ atMs: NOW - 10 * DAY_MS, kind: "substantive" }],
+    }), NOW, thresholds);
+    expect(r.alarm).toBe(false);
+    expect(r.category).toBeNull();
+  });
+
+  it("lets a live monitor win over a named unfinished blocker", () => {
+    const r = classifyTask(wait({
+      blocker: { id: "b1", identifier: "SAK-1", title: "Zależność", status: "blocked", requiresHuman: false },
+      waiting: { phase: "ci", sinceMs: NOW - 10 * DAY_MS, trigger: "monitor" },
+      progress: [{ atMs: NOW - 10 * DAY_MS, kind: "substantive" }],
+    }), NOW, thresholds);
+    expect(r.alarm).toBe(false);
+    expect(r.category).toBeNull();
+  });
+
+  it("still reports a finished blocker even when a live trigger is registered", () => {
+    const r = classifyTask(wait({
+      blocker: { id: "b1", identifier: "SAK-1", title: "Zależność", status: "done", requiresHuman: false },
+      waiting: { phase: "ci", sinceMs: NOW - 10 * DAY_MS, trigger: "monitor" },
+    }), NOW, thresholds);
+    expect(r.category).toBe("resume");
+  });
+
+  it("does not treat a dated check without a valid date as a working path", () => {
+    for (const nextCheckAtMs of [undefined, null, Number.NaN]) {
+      const r = classifyTask(wait({
+        waiting: { phase: "ci", sinceMs: NOW - 10 * HOUR_MS, trigger: "dated_check", nextCheckAtMs },
+      }), NOW, thresholds);
+      expect(r.category).toBe("restore_trigger");
+      expect(r.alarm).toBe(true);
+      expect(r.reason).toMatch(/poprawnego terminu/);
+    }
+  });
+
+  it("keeps the existing open-question result when the wait has no trigger", () => {
+    const r = classifyTask(wait({
+      questionAlreadyOpen: true,
+      waiting: { phase: "review", sinceMs: NOW - 30 * HOUR_MS, trigger: null },
+    }), NOW, thresholds);
+    expect(r.category).toBe("wait_named_dependency");
+    expect(r.question).toBeNull();
+  });
+
   it("does not alarm a short wait with no trigger", () => {
     const r = classifyTask(wait({
       waiting: { phase: "assignment", sinceMs: NOW - 30 * 60_000, trigger: null },

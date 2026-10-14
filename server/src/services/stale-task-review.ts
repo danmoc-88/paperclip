@@ -268,6 +268,20 @@ const PHASE_LABEL: Record<WaitPhase, string> = {
   review: "review",
 };
 
+type WaitingTriggerIssue = "no_trigger" | "dated_check_invalid" | "due_check_missed";
+
+// A wait has a working path only when a trigger is registered and, for a dated
+// check, its due date is a real timestamp that has not yet passed.
+function waitingTriggerIssue(waiting: WaitState, nowMs: number): WaitingTriggerIssue | null {
+  if (waiting.trigger === null) return "no_trigger";
+  if (waiting.trigger === "dated_check") {
+    const due = waiting.nextCheckAtMs;
+    if (typeof due !== "number" || !Number.isFinite(due)) return "dated_check_invalid";
+    if (nowMs > due) return "due_check_missed";
+  }
+  return null;
+}
+
 function waitLimitMs(phase: WaitPhase, thresholds: StaleThresholds): number {
   switch (phase) {
     case "assignment": return thresholds.waitAssignmentMs;
@@ -376,6 +390,45 @@ export function classifyTask(
       lastSubstantiveAtMs,
     });
   }
+  const waiting = task.waiting ?? null;
+  const waitingIssue = waiting ? waitingTriggerIssue(waiting, nowMs) : null;
+  if (waiting && !waitingIssue) {
+    return notMatter(
+      task,
+      cause,
+      `Czeka (${PHASE_LABEL[waiting.phase]}) z działającym wyzwalaczem wznowienia: ${waiting.trigger}.`,
+      idleMs,
+      lastSubstantiveAtMs,
+    );
+  }
+  const otherNamedPath = Boolean(task.blocker) || task.questionAlreadyOpen;
+  if (waiting && waitingIssue && (!otherNamedPath || waitingIssue === "due_check_missed")) {
+    const waitedMs = Math.max(0, nowMs - waiting.sinceMs);
+    const limitMs = waitLimitMs(waiting.phase, thresholds);
+    if (waitedMs >= limitMs) {
+      const servicerMayAct = task.previouslyApproved && task.hasCheckpoint && Boolean(task.ownerId);
+      return matter({
+        task,
+        cause: { key: `wait-no-trigger:${waiting.phase}`, label: `Oczekiwanie bez wyzwalacza: ${PHASE_LABEL[waiting.phase]}` },
+        category: "restore_trigger",
+        alarm: true,
+        reason: waitingIssue === "due_check_missed"
+          ? `Datowane sprawdzenie (${PHASE_LABEL[waiting.phase]}) minęło i nic nie wznowiło pracy.`
+          : waitingIssue === "dated_check_invalid"
+            ? `Datowane sprawdzenie (${PHASE_LABEL[waiting.phase]}) nie ma poprawnego terminu, więc nie zapewnia wznowienia.`
+            : `Zadanie czeka (${PHASE_LABEL[waiting.phase]}) i nic nie zapewnia wznowienia. Sam czas nie jest dowodem awarii, brak wyzwalacza jest.`,
+        recommendedAction: servicerMayAct
+          ? "Przywrócić wyzwalacz (monitor, kolejka lub datowane sprawdzenie) i wznowić zatwierdzony zakres z checkpointu. Nie dzielić pracy."
+          : "Właściciel ustawia wyzwalacz wznowienia albo datowane sprawdzenie. Nie dzielić pracy tylko dlatego, że czeka.",
+        needsHuman: false,
+        question: null,
+        servicerMayAct,
+        idleMs,
+        lastSubstantiveAtMs,
+      });
+    }
+    return notMatter(task, cause, "Krótkie oczekiwanie między etapami. Brak wyzwalacza, ale próg nie minął.", idleMs, lastSubstantiveAtMs);
+  }
   if (task.blocker) {
     const stagnant = idleKnown && idleMs >= thresholds.blockedNamedDependencyMs;
     const short = idleKnown && idleMs < thresholds.shortWaitMs;
@@ -400,45 +453,6 @@ export function classifyTask(
       idleMs,
       lastSubstantiveAtMs,
     });
-  }
-  const waiting = task.waiting ?? null;
-  if (waiting && !task.questionAlreadyOpen) {
-    const waitedMs = Math.max(0, nowMs - waiting.sinceMs);
-    const limitMs = waitLimitMs(waiting.phase, thresholds);
-    const dueCheckMissed = waiting.trigger === "dated_check"
-      && typeof waiting.nextCheckAtMs === "number"
-      && nowMs > waiting.nextCheckAtMs;
-    const hasLivePath = waiting.trigger !== null && !dueCheckMissed;
-    if (hasLivePath) {
-      return notMatter(
-        task,
-        cause,
-        `Czeka (${PHASE_LABEL[waiting.phase]}) z działającym wyzwalaczem wznowienia: ${waiting.trigger}.`,
-        idleMs,
-        lastSubstantiveAtMs,
-      );
-    }
-    if (waitedMs >= limitMs) {
-      const servicerMayAct = task.previouslyApproved && task.hasCheckpoint && Boolean(task.ownerId);
-      return matter({
-        task,
-        cause: { key: `wait-no-trigger:${waiting.phase}`, label: `Oczekiwanie bez wyzwalacza: ${PHASE_LABEL[waiting.phase]}` },
-        category: "restore_trigger",
-        alarm: true,
-        reason: dueCheckMissed
-          ? `Datowane sprawdzenie (${PHASE_LABEL[waiting.phase]}) minęło i nic nie wznowiło pracy.`
-          : `Zadanie czeka (${PHASE_LABEL[waiting.phase]}) i nic nie zapewnia wznowienia. Sam czas nie jest dowodem awarii, brak wyzwalacza jest.`,
-        recommendedAction: servicerMayAct
-          ? "Przywrócić wyzwalacz (monitor, kolejka lub datowane sprawdzenie) i wznowić zatwierdzony zakres z checkpointu. Nie dzielić pracy."
-          : "Właściciel ustawia wyzwalacz wznowienia albo datowane sprawdzenie. Nie dzielić pracy tylko dlatego, że czeka.",
-        needsHuman: false,
-        question: null,
-        servicerMayAct,
-        idleMs,
-        lastSubstantiveAtMs,
-      });
-    }
-    return notMatter(task, cause, "Krótkie oczekiwanie między etapami. Brak wyzwalacza, ale próg nie minął.", idleMs, lastSubstantiveAtMs);
   }
   if (task.questionAlreadyOpen) {
     const due = idleKnown && idleMs >= thresholds.humanReviewQuietMs;
