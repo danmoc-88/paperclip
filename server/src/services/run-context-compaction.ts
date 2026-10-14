@@ -78,6 +78,10 @@ function compactEnvelope(value: unknown, counter: { bodies: number }): unknown {
 /**
  * Pure: returns a compacted copy of a finished run's snapshot, or
  * `changed: false` when it is already compact. Never mutates the input.
+ *
+ * "Already compact" is decided from the content, never from the marker
+ * alone: a successor run can inherit a predecessor's context (marker
+ * included) and then have full bodies and rendered text rebuilt into it.
  */
 export function compactTerminalRunContextSnapshot(
   snapshot: unknown,
@@ -85,9 +89,6 @@ export function compactTerminalRunContextSnapshot(
 ): { changed: boolean; snapshot: Record<string, unknown> | null } {
   const source = record(snapshot);
   if (!source) return { changed: false, snapshot: source };
-  if (record(source[RUN_CONTEXT_COMPACTION_MARKER_KEY])) {
-    return { changed: false, snapshot: source };
-  }
   const counter = { bodies: 0 };
   const next: Record<string, unknown> = { ...source };
   const omittedKeys: string[] = [];
@@ -118,6 +119,7 @@ export function compactTerminalRunContextSnapshot(
   };
   return { changed: true, snapshot: next };
 }
+
 
 /**
  * Whether a message delivered in an earlier run (full or compacted form) is
@@ -161,8 +163,8 @@ export type RunContextCompactionResult = {
 /**
  * One bounded pass over finished runs older than `minAgeMs`, in
  * (finish time, id) order from an in-memory cursor. After a restart the
- * cursor starts over; already compacted rows are recognized by their marker
- * and skipped. Each write is a compare-and-set on the exact snapshot read and
+ * cursor starts over; already compacted rows are recognized by their content
+ * (no rendered text, no long bodies) and skipped. Each write is a compare-and-set on the exact snapshot read and
  * on a terminal status, so a concurrent writer is never overwritten; such a
  * row is simply retried on a later pass.
  */
@@ -219,6 +221,9 @@ export function createRunContextCompactionSweep(
               eq(heartbeatRuns.id, candidate.id),
               eq(heartbeatRuns.status, row.status),
               inArray(heartbeatRuns.status, [...RUN_CONTEXT_COMPACTION_TERMINAL_STATUSES]),
+              // The age buffer is re-checked at write time, so a finish time
+              // moved forward after candidate selection cannot bypass it.
+              sql`${finishedAt} < ${cutoff}::timestamptz`,
               sql`${heartbeatRuns.contextSnapshot} = ${JSON.stringify(row.contextSnapshot)}::jsonb`,
             ),
           )

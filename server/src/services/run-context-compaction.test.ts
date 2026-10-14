@@ -122,6 +122,30 @@ describe("compactTerminalRunContextSnapshot", () => {
     const snapshot = { executionContinuation: { messages: [message("c", body)] } };
     expect(compactTerminalRunContextSnapshot(snapshot).changed).toBe(false);
   });
+
+  it("compacts a successor that inherited the marker and had full content rebuilt (retry/safe replacement)", () => {
+    const predecessor = compactTerminalRunContextSnapshot(fullSnapshot(), new Date("2026-10-14T10:00:00Z")).snapshot!;
+    // Copy as a retry path would, then rebuild continuation and prompt text as executeRun does.
+    const successor: Record<string, unknown> = {
+      ...predecessor,
+      retryOfRunId: "prev",
+      executionContinuation: envelope(),
+      paperclipWake: { ...(predecessor.paperclipWake as object), executionContinuation: envelope() },
+      paperclipTaskMarkdown: "t".repeat(11_000),
+    };
+    const { changed, snapshot } = compactTerminalRunContextSnapshot(successor, new Date("2026-10-14T12:00:00Z"));
+    expect(changed).toBe(true);
+    const out = snapshot as Record<string, any>;
+    expect(out).not.toHaveProperty("paperclipTaskMarkdown");
+    expect(out.executionContinuation.messages[0]).toMatchObject({ bodyOmitted: true });
+    expect(out.paperclipWake.executionContinuation.messages[0]).toMatchObject({ bodyOmitted: true });
+    expect(out[RUN_CONTEXT_COMPACTION_MARKER_KEY]).toMatchObject({
+      compactedAt: "2026-10-14T12:00:00.000Z",
+      omittedKeys: ["paperclipTaskMarkdown"],
+      omittedMessageBodies: 4,
+    });
+    expect(compactTerminalRunContextSnapshot(out).changed).toBe(false);
+  });
 });
 
 describe("deliveredMessageMatches", () => {
@@ -292,5 +316,56 @@ const support = await getEmbeddedPostgresTestSupport();
     const result = await createRunContextCompactionSweep(flippingDb, { now: () => now }).sweep();
     expect(result.compacted).toBe(0);
     expect(await snapshotOf(id)).toEqual(fullSnapshot());
+  });
+
+  it("does not write when the finish time moved inside the age buffer between read and write", async () => {
+    await db.delete(heartbeatRuns);
+    const id = await insertRun("succeeded", hoursAgo(4));
+    let moved = false;
+    const movingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "update" && !moved) {
+          moved = true;
+          return (table: unknown) => {
+            const builder = target.update(table as typeof heartbeatRuns);
+            return {
+              set: (values: any) => ({
+                where: (cond: any) => ({
+                  returning: async (cols: any) => {
+                    // Same status and context, but finished just now.
+                    await target
+                      .update(heartbeatRuns)
+                      .set({ finishedAt: now, updatedAt: now })
+                      .where(eq(heartbeatRuns.id, id));
+                    return builder.set(values).where(cond).returning(cols);
+                  },
+                }),
+              }),
+            };
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as typeof db;
+    const result = await createRunContextCompactionSweep(movingDb, { now: () => now }).sweep();
+    expect(result).toMatchObject({ compacted: 0, skippedConcurrentWrite: 1 });
+    expect(await snapshotOf(id)).toEqual(fullSnapshot());
+  });
+
+  it("compacts a finished successor whose context was copied from a compacted predecessor", async () => {
+    await db.delete(heartbeatRuns);
+    const predecessor = compactTerminalRunContextSnapshot(fullSnapshot(), hoursAgo(6)).snapshot!;
+    const successor = await insertRun("succeeded", hoursAgo(2), {
+      ...predecessor,
+      retryOfRunId: randomUUID(),
+      executionContinuation: envelope(),
+      paperclipWake: { ...(predecessor.paperclipWake as object), executionContinuation: envelope() },
+      paperclipTaskMarkdown: "t".repeat(11_000),
+    });
+    expect((await createRunContextCompactionSweep(db, { now: () => now }).sweep()).compacted).toBe(1);
+    const snap = await snapshotOf(successor);
+    expect(snap).not.toHaveProperty("paperclipTaskMarkdown");
+    expect(snap.executionContinuation.messages[0]).toMatchObject({ bodyOmitted: true });
+    expect(snap[RUN_CONTEXT_COMPACTION_MARKER_KEY].compactedAt).toBe(now.toISOString());
   });
 });
