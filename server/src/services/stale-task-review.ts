@@ -16,6 +16,14 @@ export const DEFAULT_STALE_THRESHOLDS = {
   humanReviewQuietMs: 3 * DAY_MS,
   reminderThrottleMs: 24 * HOUR_MS,
   shortWaitMs: 2 * HOUR_MS,
+  // Waiting between hand-offs. Only a wait with no resume trigger can raise
+  // an alarm, and only past the phase threshold. A wait with a live trigger
+  // (monitor, open interaction, review participant, queued wake, future dated
+  // check) is normal at any length.
+  waitAssignmentMs: 3 * HOUR_MS,
+  waitExecutionMs: 6 * HOUR_MS,
+  waitCiMs: 4 * HOUR_MS,
+  waitReviewMs: 24 * HOUR_MS,
 } as const;
 
 export const MAX_DANIEL_TOPICS = 3;
@@ -31,7 +39,21 @@ export type MatterCategory =
   | "wait_named_dependency"
   | "defer_with_return"
   | "duplicate"
-  | "close_after_evidence";
+  | "close_after_evidence"
+  | "restore_trigger";
+
+export type WaitPhase = "assignment" | "execution" | "ci" | "review";
+export type WaitTrigger = "monitor" | "interaction" | "review_participant" | "queued_wake" | "dated_check";
+
+export interface WaitState {
+  phase: WaitPhase;
+  sinceMs: number;
+  // null means nothing is registered that will resume the work.
+  trigger: WaitTrigger | null;
+  // For dated_check: when the next check is due. Past due means the trigger
+  // did not fire and the wait has no working path.
+  nextCheckAtMs?: number | null;
+}
 
 export interface TaskSnapshot {
   id: string;
@@ -55,6 +77,7 @@ export interface TaskSnapshot {
   } | null;
   duplicateOf: { id: string; identifier: string; evidence: boolean } | null;
   progress: Array<{ atMs: number; kind: ProgressKind }>;
+  waiting?: WaitState | null;
   causeKey?: string;
   causeLabel?: string;
 }
@@ -66,6 +89,10 @@ export interface StaleThresholds {
   humanReviewQuietMs: number;
   reminderThrottleMs: number;
   shortWaitMs: number;
+  waitAssignmentMs: number;
+  waitExecutionMs: number;
+  waitCiMs: number;
+  waitReviewMs: number;
 }
 
 export interface ShownMatter {
@@ -138,6 +165,7 @@ export type ReviewResult =
 const URGENCY: Record<MatterCategory, number> = {
   fix_assignment: 50,
   resume: 40,
+  restore_trigger: 45,
   close_after_evidence: 30,
   duplicate: 20,
   wait_named_dependency: 10,
@@ -231,6 +259,36 @@ function matter(input: {
     causeLabel: input.cause.label,
     fingerprint: input.alarm ? `${input.cause.key}|${input.category}` : null,
   };
+}
+
+const PHASE_LABEL: Record<WaitPhase, string> = {
+  assignment: "przydział",
+  execution: "wykonanie",
+  ci: "CI",
+  review: "review",
+};
+
+type WaitingTriggerIssue = "no_trigger" | "dated_check_invalid" | "due_check_missed";
+
+// A wait has a working path only when a trigger is registered and, for a dated
+// check, its due date is a real timestamp that has not yet passed.
+function waitingTriggerIssue(waiting: WaitState, nowMs: number): WaitingTriggerIssue | null {
+  if (waiting.trigger === null) return "no_trigger";
+  if (waiting.trigger === "dated_check") {
+    const due = waiting.nextCheckAtMs;
+    if (typeof due !== "number" || !Number.isFinite(due)) return "dated_check_invalid";
+    if (nowMs > due) return "due_check_missed";
+  }
+  return null;
+}
+
+function waitLimitMs(phase: WaitPhase, thresholds: StaleThresholds): number {
+  switch (phase) {
+    case "assignment": return thresholds.waitAssignmentMs;
+    case "execution": return thresholds.waitExecutionMs;
+    case "ci": return thresholds.waitCiMs;
+    case "review": return thresholds.waitReviewMs;
+  }
 }
 
 export function classifyTask(
@@ -331,6 +389,45 @@ export function classifyTask(
       idleMs,
       lastSubstantiveAtMs,
     });
+  }
+  const waiting = task.waiting ?? null;
+  const waitingIssue = waiting ? waitingTriggerIssue(waiting, nowMs) : null;
+  if (waiting && !waitingIssue) {
+    return notMatter(
+      task,
+      cause,
+      `Czeka (${PHASE_LABEL[waiting.phase]}) z działającym wyzwalaczem wznowienia: ${waiting.trigger}.`,
+      idleMs,
+      lastSubstantiveAtMs,
+    );
+  }
+  const otherNamedPath = Boolean(task.blocker) || task.questionAlreadyOpen;
+  if (waiting && waitingIssue && (!otherNamedPath || waitingIssue === "due_check_missed")) {
+    const waitedMs = Math.max(0, nowMs - waiting.sinceMs);
+    const limitMs = waitLimitMs(waiting.phase, thresholds);
+    if (waitedMs >= limitMs) {
+      const servicerMayAct = task.previouslyApproved && task.hasCheckpoint && Boolean(task.ownerId);
+      return matter({
+        task,
+        cause: { key: `wait-no-trigger:${waiting.phase}`, label: `Oczekiwanie bez wyzwalacza: ${PHASE_LABEL[waiting.phase]}` },
+        category: "restore_trigger",
+        alarm: true,
+        reason: waitingIssue === "due_check_missed"
+          ? `Datowane sprawdzenie (${PHASE_LABEL[waiting.phase]}) minęło i nic nie wznowiło pracy.`
+          : waitingIssue === "dated_check_invalid"
+            ? `Datowane sprawdzenie (${PHASE_LABEL[waiting.phase]}) nie ma poprawnego terminu, więc nie zapewnia wznowienia.`
+            : `Zadanie czeka (${PHASE_LABEL[waiting.phase]}) i nic nie zapewnia wznowienia. Sam czas nie jest dowodem awarii, brak wyzwalacza jest.`,
+        recommendedAction: servicerMayAct
+          ? "Przywrócić wyzwalacz (monitor, kolejka lub datowane sprawdzenie) i wznowić zatwierdzony zakres z checkpointu. Nie dzielić pracy."
+          : "Właściciel ustawia wyzwalacz wznowienia albo datowane sprawdzenie. Nie dzielić pracy tylko dlatego, że czeka.",
+        needsHuman: false,
+        question: null,
+        servicerMayAct,
+        idleMs,
+        lastSubstantiveAtMs,
+      });
+    }
+    return notMatter(task, cause, "Krótkie oczekiwanie między etapami. Brak wyzwalacza, ale próg nie minął.", idleMs, lastSubstantiveAtMs);
   }
   if (task.blocker) {
     const stagnant = idleKnown && idleMs >= thresholds.blockedNamedDependencyMs;
