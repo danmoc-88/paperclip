@@ -3,6 +3,7 @@ import {
   DAY_MS,
   HOUR_MS,
   classifyTask,
+  deriveScopeEvidence,
   lastSubstantiveProgressAt,
   resolveThresholds,
   reviewQueue,
@@ -558,6 +559,75 @@ describe("waiting between hand-offs", () => {
     const second = reviewQueue({ ok: true, tasks }, NOW + 2 * HOUR_MS, undefined, { atMs: NOW, fingerprints: first.digest.fingerprints, shown: first.digest.shown });
     if (!second.ok) throw new Error("read");
     expect(second.digest.ownerFollowUps.length + second.digest.servicerActions.length).toBe(0);
+    expect(second.digest.suppressedUnchanged).toBe(1);
+  });
+});
+
+describe("closing needs proof of the whole scope (SAK-1617, SAK-1041)", () => {
+  // Wording from the real comments that produced false close candidates.
+  const c1617 = "Zielony podgląd 61e5d9d to dowód wycinka. A–E nadal czekają na publiczną projekcję SAK-1626, brak eksportu planszy v32, pozostał wybór wysyłki/powiadomienia i ADR-013.";
+  const c1041 = "Pełne G2 pozostaje otwarte. PR 7 to odebrana dokumentacja, live Missive/CO i restart NOT_TESTED.";
+  const stale = [{ atMs: NOW - 3 * DAY_MS, kind: "substantive" as const }];
+
+  it("never derives full-scope evidence from a merged PR, a green preview or a review verdict", () => {
+    for (const comments of [[c1617], [c1041], ["Zielony, odebrane, review done, werdykt: scalać."], []]) {
+      const r = deriveScopeEvidence({ mergedPullRequest: true, recentComments: comments });
+      expect(r.closeEvidence).toBe(false);
+      expect(r.scopeEvidence?.kind).toBe("slice_only");
+    }
+    expect(deriveScopeEvidence({ mergedPullRequest: false, recentComments: ["zielony"] })).toEqual({ closeEvidence: false, scopeEvidence: null });
+  });
+
+  it("keeps open-scope wording as counter evidence", () => {
+    const a = deriveScopeEvidence({ mergedPullRequest: true, recentComments: [c1617] });
+    expect(a.scopeEvidence?.openScopeSignals.join(" ")).toMatch(/nadal czekają|brak eksportu|pozostał/);
+    const b = deriveScopeEvidence({ mergedPullRequest: true, recentComments: [c1041] });
+    expect(b.scopeEvidence?.openScopeSignals.join(" ")).toMatch(/pozostaje otwarte|NOT_TESTED/);
+  });
+
+  it("accepts closing only from a structured full-scope source", () => {
+    expect(deriveScopeEvidence({ mergedPullRequest: false, recentComments: [], structuredScopeComplete: true }).closeEvidence).toBe(true);
+  });
+
+  it("SAK-1617 shape: slice evidence plus a named open dependency stays a named wait, not a close request", () => {
+    const d = deriveScopeEvidence({ mergedPullRequest: true, recentComments: [c1617] });
+    const r = classifyTask(task({
+      id: "1617", identifier: "SAK-1617", status: "blocked", ...d, progress: stale,
+      blocker: { id: "1626", identifier: "SAK-1626", title: "projekcja", status: "in_review", requiresHuman: false },
+    }), NOW, thresholds);
+    expect(r.category).not.toBe("close_after_evidence");
+    expect(r.question ?? "").not.toMatch(/Zamknąć/);
+  });
+
+  it("SAK-1041 shape: merged docs PR with open G2 asks the owner to verify scope, never Daniel to close", () => {
+    const d = deriveScopeEvidence({ mergedPullRequest: true, recentComments: [c1041] });
+    const r = classifyTask(task({ id: "1041", identifier: "SAK-1041", status: "in_review", ...d, progress: stale }), NOW, thresholds);
+    expect(r.category).toBe("verify_scope");
+    expect(r.needsHuman).toBe(false);
+    expect(r.question).toBeNull();
+    expect(r.recommendedAction).toMatch(/Zostawić otwarte/);
+    expect(r.reason).toMatch(/zakres jest otwarty/);
+  });
+
+  it("a cancelled duplicate (SAK-1645) is not a matter", () => {
+    const r = classifyTask(task({ id: "1645", identifier: "SAK-1645", status: "cancelled", ...deriveScopeEvidence({ mergedPullRequest: true, recentComments: [] }), progress: stale }), NOW, thresholds);
+    expect(r.category).toBeNull();
+    expect(r.alarm).toBe(false);
+  });
+
+  it("two cycles keep the distinction and do not repeat an unchanged follow-up", () => {
+    const d = deriveScopeEvidence({ mergedPullRequest: true, recentComments: [c1041] });
+    const tasks = [task({ id: "1041", identifier: "SAK-1041", status: "in_review", ...d, progress: stale })];
+    const first = reviewQueue({ ok: true, tasks }, NOW);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.digest.danielTopics).toEqual([]);
+    expect(first.digest.ownerFollowUps.map((g) => g.category)).toEqual(["verify_scope"]);
+    const second = reviewQueue({ ok: true, tasks }, NOW + 2 * HOUR_MS, undefined, { atMs: NOW, fingerprints: first.digest.fingerprints, shown: first.digest.shown });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.digest.danielTopics).toEqual([]);
+    expect(second.digest.ownerFollowUps).toEqual([]);
     expect(second.digest.suppressedUnchanged).toBe(1);
   });
 });
