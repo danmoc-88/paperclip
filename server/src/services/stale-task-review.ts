@@ -40,6 +40,7 @@ export type MatterCategory =
   | "defer_with_return"
   | "duplicate"
   | "close_after_evidence"
+  | "verify_scope"
   | "restore_trigger";
 
 export type WaitPhase = "assignment" | "execution" | "ci" | "review";
@@ -55,6 +56,13 @@ export interface WaitState {
   nextCheckAtMs?: number | null;
 }
 
+export interface ScopeEvidence {
+  kind: "slice_only";
+  evidence: string;
+  // Short quotes from recent comments saying part of the scope is still open.
+  openScopeSignals: string[];
+}
+
 export interface TaskSnapshot {
   id: string;
   identifier: string;
@@ -65,7 +73,13 @@ export interface TaskSnapshot {
   queuedRun: boolean;
   hasCheckpoint: boolean;
   previouslyApproved: boolean;
+  // True only when the WHOLE scope is proven complete by a structured source.
+  // A merged PR, a green preview, a review verdict, a work product or the word
+  // "done" prove a slice, not the scope. Use scopeEvidence for those.
   closeEvidence: boolean;
+  // A delivered slice exists but nothing proves the whole scope. The task is
+  // never offered for closing from this; the owner verifies the scope.
+  scopeEvidence?: ScopeEvidence | null;
   questionAlreadyOpen: boolean;
   consciousDeferral: { condition: string; reviewAfterMs: number } | null;
   blocker: {
@@ -167,6 +181,7 @@ const URGENCY: Record<MatterCategory, number> = {
   resume: 40,
   restore_trigger: 45,
   close_after_evidence: 30,
+  verify_scope: 25,
   duplicate: 20,
   wait_named_dependency: 10,
   defer_with_return: 5,
@@ -505,6 +520,25 @@ export function classifyTask(
       lastSubstantiveAtMs,
     });
   }
+  if (task.scopeEvidence) {
+    const open = task.scopeEvidence.openScopeSignals;
+    const quiet = idleKnown && idleMs >= thresholds.humanReviewQuietMs;
+    return matter({
+      task,
+      cause,
+      category: "verify_scope",
+      alarm: quiet,
+      reason: open.length > 0
+        ? `Jest dowód wycinka (${task.scopeEvidence.evidence}), ale zadanie samo mówi, że zakres jest otwarty: ${open.join("; ")}.`
+        : `Jest dowód wycinka (${task.scopeEvidence.evidence}), ale nic nie dowodzi spełnienia całego zakresu.`,
+      recommendedAction: "Zostawić otwarte. Właściciel porównuje stan z kryteriami odbioru i zamyka dopiero po dowodzie całego zakresu. Nie proponować zamknięcia z samego scalenia, zielonego podglądu ani werdyktu review.",
+      needsHuman: false,
+      question: null,
+      servicerMayAct: false,
+      idleMs,
+      lastSubstantiveAtMs,
+    });
+  }
   if (!idleKnown) {
     return notMatter(task, cause, "Brak merytorycznego śladu. Nie uznaję zadania za martwe.", idleMs, lastSubstantiveAtMs);
   }
@@ -610,4 +644,37 @@ export function reviewQueue(
       shown,
     },
   };
+}
+
+// Open-scope wording in a task's own recent comments. Used only as counter
+// evidence against closing, never as evidence for it.
+const OPEN_SCOPE_RE = /pozostaje otwart|pozostał[ae]?\b[^.]{0,40}(otwart|do zrobienia)|NOT_TESTED|nadal czeka|nadal (nie|brak)|czekaj[ąa] na|niezweryfikowan|brak eksportu|do rozstrzygnięcia|wybór[^.]{0,30}pozostał/i;
+
+export interface ScopeEvidenceInput {
+  // A merged PR is the only slice signal. The mere existence of a work product
+  // (preview, branch, document) says nothing about the scope and is not used.
+  mergedPullRequest: boolean;
+  // Newest first. Plain comment bodies.
+  recentComments: string[];
+  // Structured proof that the whole scope is complete. No wording is parsed
+  // for it. The live adapter has no such source yet, so this stays false.
+  structuredScopeComplete?: boolean;
+}
+
+export function deriveScopeEvidence(input: ScopeEvidenceInput): {
+  closeEvidence: boolean;
+  scopeEvidence: ScopeEvidence | null;
+} {
+  if (input.structuredScopeComplete === true) return { closeEvidence: true, scopeEvidence: null };
+  const signals: string[] = [];
+  for (const body of input.recentComments.slice(0, 5)) {
+    const hit = OPEN_SCOPE_RE.exec(body);
+    if (!hit) continue;
+    const start = Math.max(0, hit.index - 30);
+    const quote = body.slice(start, hit.index + 70).replace(/\s+/g, " ").trim();
+    if (!signals.includes(quote)) signals.push(quote);
+    if (signals.length >= 2) break;
+  }
+  if (!input.mergedPullRequest) return { closeEvidence: false, scopeEvidence: null };
+  return { closeEvidence: false, scopeEvidence: { kind: "slice_only", evidence: "scalony PR", openScopeSignals: signals } };
 }
