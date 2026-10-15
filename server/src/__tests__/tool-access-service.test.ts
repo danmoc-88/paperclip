@@ -86,6 +86,7 @@ import {
 } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 import * as sentry from "../sentry.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
 import { invalidatePaperclipCloudConnectorCapabilities, type PaperclipCloudConnector } from "../services/paperclip-cloud-connector.js";
@@ -321,6 +322,143 @@ function mcpSseResponse(payload: unknown): Response {
     contentType: "text/event-stream",
     body: `event: message\ndata: ${JSON.stringify(payload)}\n\n`,
   });
+}
+
+const MCP_SESSION_CANARY = "CANARY-AUTH-VALUE-9f3a";
+
+function mockSessionBootstrapServer(options: {
+  missingStatus: number;
+  missingBody?: string;
+  missingContentType?: string;
+  establishedToolsList?: "ok" | "invalid-session";
+  missingResponse?: () => Response;
+}) {
+  const requests: Array<{ method: string; sessionId: string | null; authorization: string | null }> = [];
+  let initializeCount = 0;
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: string };
+    const requestHeaders = new Headers(init?.headers);
+    const method = payload.method ?? "";
+    const sessionId = requestHeaders.get("mcp-session-id");
+    requests.push({
+      method,
+      sessionId,
+      authorization: requestHeaders.get("authorization"),
+    });
+    if (method === "initialize") {
+      initializeCount += 1;
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: {
+            protocolVersion: "2025-06-18",
+            capabilities: { tools: {} },
+            serverInfo: { name: "stateful", version: "1" },
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "mcp-session-id": `session-${initializeCount}`,
+          },
+        },
+      );
+    }
+    if (method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (method === "tools/list" && !sessionId) {
+      if (options.missingResponse) return options.missingResponse();
+      return new Response(options.missingBody ?? "", {
+        status: options.missingStatus,
+        headers: { "content-type": options.missingContentType ?? "text/plain" },
+      });
+    }
+    if (options.establishedToolsList === "invalid-session") {
+      return new Response("Invalid session ID", {
+        status: 404,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+    return mcpHttpResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: { tools: [{ name: "list_services", annotations: { readOnlyHint: true } }] },
+    });
+  });
+  return { requests, initializeCount: () => initializeCount };
+}
+
+function captureDiagnosticLines() {
+  const lines: string[] = [];
+  const push = (...args: unknown[]) => {
+    lines.push(args.map((arg) => {
+      if (typeof arg === "string") return arg;
+      if (arg instanceof Error) return `${arg.name}: ${arg.message}\n${arg.stack ?? ""}`;
+      try { return JSON.stringify(arg); } catch { return String(arg); }
+    }).join(" "));
+  };
+  const consoleSpies = (["log", "info", "warn", "error", "debug"] as const).map((level) =>
+    vi.spyOn(console, level).mockImplementation(push),
+  );
+  // The service logs through the shared Pino instance, which does not write via console.*.
+  const loggerSpies = (["fatal", "error", "warn", "info", "debug", "trace"] as const).map((level) =>
+    vi.spyOn(logger, level).mockImplementation((...args: unknown[]) => {
+      push(...args);
+      return undefined;
+    }),
+  );
+  return {
+    lines,
+    restore() {
+      for (const spy of [...consoleSpies, ...loggerSpies]) spy.mockRestore();
+    },
+  };
+}
+
+function assertCredentialStaysHidden(value: unknown, lines: string[]) {
+  expect(JSON.stringify(value).includes(MCP_SESSION_CANARY)).toBe(false);
+  expect(lines.join("\n").includes(MCP_SESSION_CANARY)).toBe(false);
+  if (value instanceof Error) {
+    expect(value.message.includes(MCP_SESSION_CANARY)).toBe(false);
+    expect((value.stack ?? "").includes(MCP_SESSION_CANARY)).toBe(false);
+    const details = (value as { details?: unknown }).details;
+    if (details !== undefined) {
+      expect(JSON.stringify(details).includes(MCP_SESSION_CANARY)).toBe(false);
+    }
+  }
+}
+
+/** 404 body that keeps offering bytes until the consumer cancels it. */
+function openEnded404(options: { head: string; chunkBytes: number; safetyBytes: number }) {
+  const head = new TextEncoder().encode(options.head);
+  let bytesEnqueued = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (cancelled || bytesEnqueued >= options.safetyBytes) return;
+      const chunk = new Uint8Array(options.chunkBytes);
+      if (bytesEnqueued < head.length) {
+        chunk.set(head.subarray(bytesEnqueued, Math.min(head.length, bytesEnqueued + chunk.byteLength)));
+      } else {
+        chunk.fill(0x41);
+      }
+      bytesEnqueued += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return {
+    response: () => new Response(stream, {
+      status: 404,
+      headers: { "content-type": "text/plain" },
+    }),
+    stats: () => ({ bytesEnqueued, cancelled }),
+  };
 }
 
 function mockToolsList(tools: unknown[]) {
@@ -5602,6 +5740,219 @@ describeEmbeddedPostgres("tool access service", () => {
       requests.filter(({ method }) => method === "notifications/initialized")
         .length,
     ).toBe(requests.filter(({ method }) => method === "initialize").length);
+  });
+
+  it("retries tools/list once after a session-less 404 Invalid session ID", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingBody: "Invalid session ID",
+    });
+    const logs = captureDiagnosticLines();
+    try {
+      const result = await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://stateful.example/mcp",
+          name: "Invalid session bootstrap",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+      expect(result.connection.config).toMatchObject({ mcpSessionRequired: true });
+      expect(result.actions.readOnly).toEqual([
+        expect.objectContaining({ toolName: "list_services", riskLevel: "read" }),
+      ]);
+      assertCredentialStaysHidden(result, logs.lines);
+    } finally {
+      logs.restore();
+    }
+
+    // One handshake. The last tools/list is the connect health check reusing that session.
+    expect(probe.requests.map((request) => `${request.method}:${request.sessionId ?? "-"}`)).toEqual([
+      "tools/list:-",
+      "initialize:-",
+      "notifications/initialized:session-1",
+      "tools/list:session-1",
+      "tools/list:session-1",
+    ]);
+    expect(probe.initializeCount()).toBe(1);
+    expect(probe.requests.filter(({ method }) => method === "notifications/initialized")).toHaveLength(1);
+    expect(probe.requests.every((request) => (request.authorization ?? "").split(MCP_SESSION_CANARY).length === 2)).toBe(true);
+    expect(probe.requests.every((request) => !(request.authorization ?? "").includes("Bearer Bearer"))).toBe(true);
+    assertCredentialStaysHidden(probe.requests.map(({ method, sessionId }) => ({ method, sessionId })), logs.lines);
+  });
+
+  it("keeps a session-less 404 that is not Invalid session ID as a real error", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingBody: "endpoint missing",
+    });
+    const logs = captureDiagnosticLines();
+    let caught: unknown;
+    try {
+      await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://missing.example/mcp",
+          name: "Ordinary missing endpoint",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+    } catch (error) {
+      caught = error;
+    } finally {
+      logs.restore();
+    }
+
+    expect(caught).toMatchObject({
+      status: 502,
+      message: "Remote app returned HTTP 404",
+    });
+    expect(probe.initializeCount()).toBe(0);
+    expect(probe.requests.filter(({ method }) => method === "tools/list")).toHaveLength(1);
+    expect(probe.requests[0]).toMatchObject({ method: "tools/list", sessionId: null });
+    assertCredentialStaysHidden(caught, logs.lines);
+  });
+
+  it("does not handshake again when the retried tools/list is still Invalid session ID", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingBody: "Invalid session ID",
+      establishedToolsList: "invalid-session",
+    });
+    const logs = captureDiagnosticLines();
+    let caught: unknown;
+    try {
+      await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://stateful.example/mcp",
+          name: "Invalid session still missing",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+    } catch (error) {
+      caught = error;
+    } finally {
+      logs.restore();
+    }
+
+    expect(caught).toMatchObject({
+      status: 502,
+      message: "Remote app returned HTTP 404",
+    });
+    expect(probe.initializeCount()).toBe(1);
+    expect(probe.requests.filter(({ method }) => method === "initialize")).toHaveLength(1);
+    expect(probe.requests.filter(({ method }) => method === "notifications/initialized")).toHaveLength(1);
+    expect(probe.requests.filter(({ method }) => method === "tools/list")).toHaveLength(2);
+    assertCredentialStaysHidden(caught, logs.lines);
+  });
+
+  it("stops reading a large open 404 once Invalid session ID is recognized", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const body = openEnded404({
+      head: "Invalid session ID",
+      chunkBytes: 8,
+      safetyBytes: 1024 * 1024,
+    });
+    const clone = vi.spyOn(Response.prototype, "clone");
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingResponse: body.response,
+    });
+    const logs = captureDiagnosticLines();
+    try {
+      const result = await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://stateful.example/mcp",
+          name: "Open invalid session body",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+      expect(result.connection.config).toMatchObject({ mcpSessionRequired: true });
+      assertCredentialStaysHidden(result, logs.lines);
+      expect(clone).not.toHaveBeenCalled();
+    } finally {
+      logs.restore();
+      clone.mockRestore();
+    }
+
+    const stats = body.stats();
+    expect(stats.cancelled).toBe(true);
+    // The marker spans three 8-byte chunks. The stream may enqueue one more
+    // chunk before cancel reaches it; it must not keep reading the open body.
+    expect(stats.bytesEnqueued).toBeLessThanOrEqual(32);
+    expect(stats.bytesEnqueued).toBeLessThan(1024 * 1024);
+    expect(probe.initializeCount()).toBe(1);
+    expect(probe.requests.filter(({ method }) => method === "notifications/initialized")).toHaveLength(1);
+    // Initial list, the retried list, and the connect health check.
+    expect(probe.requests.map((request) => `${request.method}:${request.sessionId ?? "-"}`)).toEqual([
+      "tools/list:-",
+      "initialize:-",
+      "notifications/initialized:session-1",
+      "tools/list:session-1",
+      "tools/list:session-1",
+    ]);
+  });
+
+  it("does not keep reading a large open 404 that is not Invalid session ID", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const body = openEnded404({
+      head: "endpoint missing",
+      chunkBytes: 32,
+      safetyBytes: 1024 * 1024,
+    });
+    const clone = vi.spyOn(Response.prototype, "clone");
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingResponse: body.response,
+    });
+    const logs = captureDiagnosticLines();
+    let caught: unknown;
+    let cloneCalls = 0;
+    try {
+      await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://missing.example/mcp",
+          name: "Open ordinary 404 body",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+    } catch (error) {
+      caught = error;
+    } finally {
+      cloneCalls = clone.mock.calls.length;
+      logs.restore();
+      clone.mockRestore();
+    }
+    expect(cloneCalls).toBe(0);
+
+    expect(caught).toMatchObject({
+      status: 502,
+      message: "Remote app returned HTTP 404",
+    });
+    const stats = body.stats();
+    expect(stats.cancelled).toBe(true);
+    // 256 scanned characters, plus at most one queued chunk after the limit.
+    expect(stats.bytesEnqueued).toBeLessThanOrEqual(256 + 32);
+    expect(stats.bytesEnqueued).toBeLessThan(1024 * 1024);
+    expect(probe.initializeCount()).toBe(0);
+    expect(probe.requests.filter(({ method }) => method === "tools/list")).toHaveLength(1);
+    assertCredentialStaysHidden(caught, logs.lines);
   });
 
   it("serves persisted MCP actions until the cache expires and then refreshes them", async () => {
