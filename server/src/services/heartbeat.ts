@@ -383,6 +383,10 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
+  compactAdapterInvokePayload,
+  compactRunResultJsonForStorage,
+} from "./run-storage-compaction.js";
+import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
@@ -23486,7 +23490,8 @@ export function heartbeatService(
             stream: "system",
             level: "info",
             message: "adapter invocation",
-            payload: meta as unknown as Record<string, unknown>,
+            // The full context stays in heartbeat_runs.context_snapshot; the event keeps a digest.
+            payload: compactAdapterInvokePayload(meta as unknown as Record<string, unknown>),
           });
         };
 
@@ -25523,7 +25528,8 @@ export function heartbeatService(
               } as Record<string, unknown>)
             : null;
 
-        const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
+        // Liveness classification reads the provider output in full; storage keeps head and tail only.
+        const fullResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
           mergeRunStopMetadataForAgent(agent, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
               resultJson: {
@@ -25544,6 +25550,7 @@ export function heartbeatService(
           }),
           adapterResult.summary ?? null,
         ), runErrorCode, runErrorMessage);
+        const persistedResultJson = compactRunResultJsonForStorage(fullResultJson);
 
         const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
           finishedAt: new Date(),
@@ -25618,7 +25625,7 @@ export function heartbeatService(
           persistedRun =
             (await classifyAndPersistRunLiveness(
               persistedRun,
-              persistedResultJson,
+              fullResultJson,
             )) ?? persistedRun;
         }
 
