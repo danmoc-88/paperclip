@@ -323,6 +323,93 @@ function mcpSseResponse(payload: unknown): Response {
   });
 }
 
+const MCP_SESSION_CANARY = "CANARY-AUTH-VALUE-9f3a";
+
+function mockSessionBootstrapServer(options: {
+  missingStatus: number;
+  missingBody: string;
+  missingContentType?: string;
+  establishedToolsList?: "ok" | "invalid-session";
+}) {
+  const requests: Array<{ method: string; sessionId: string | null; authorization: string | null }> = [];
+  let initializeCount = 0;
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: string };
+    const requestHeaders = new Headers(init?.headers);
+    const method = payload.method ?? "";
+    const sessionId = requestHeaders.get("mcp-session-id");
+    requests.push({
+      method,
+      sessionId,
+      authorization: requestHeaders.get("authorization"),
+    });
+    if (method === "initialize") {
+      initializeCount += 1;
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: {
+            protocolVersion: "2025-06-18",
+            capabilities: { tools: {} },
+            serverInfo: { name: "stateful", version: "1" },
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "mcp-session-id": `session-${initializeCount}`,
+          },
+        },
+      );
+    }
+    if (method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (method === "tools/list" && !sessionId) {
+      return new Response(options.missingBody, {
+        status: options.missingStatus,
+        headers: { "content-type": options.missingContentType ?? "text/plain" },
+      });
+    }
+    if (options.establishedToolsList === "invalid-session") {
+      return new Response("Invalid session ID", {
+        status: 404,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+    return mcpHttpResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: { tools: [{ name: "list_services", annotations: { readOnlyHint: true } }] },
+    });
+  });
+  return { requests, initializeCount: () => initializeCount };
+}
+
+function captureConsoleLines() {
+  const lines: string[] = [];
+  const push = (...args: unknown[]) => {
+    lines.push(args.map((arg) => {
+      if (typeof arg === "string") return arg;
+      try { return JSON.stringify(arg); } catch { return String(arg); }
+    }).join(" "));
+  };
+  const spies = (["log", "info", "warn", "error", "debug"] as const).map((level) =>
+    vi.spyOn(console, level).mockImplementation(push),
+  );
+  return {
+    lines,
+    restore() { for (const spy of spies) spy.mockRestore(); },
+  };
+}
+
+function assertCredentialStaysHidden(value: unknown, lines: string[]) {
+  expect(JSON.stringify(value).includes(MCP_SESSION_CANARY)).toBe(false);
+  expect(lines.join("\n").includes(MCP_SESSION_CANARY)).toBe(false);
+}
+
 function mockToolsList(tools: unknown[]) {
   return vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
     const body = JSON.parse(String(init?.body));
@@ -5602,6 +5689,120 @@ describeEmbeddedPostgres("tool access service", () => {
       requests.filter(({ method }) => method === "notifications/initialized")
         .length,
     ).toBe(requests.filter(({ method }) => method === "initialize").length);
+  });
+
+  it("retries tools/list once after a session-less 404 Invalid session ID", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingBody: "Invalid session ID",
+    });
+    const logs = captureConsoleLines();
+    try {
+      const result = await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://stateful.example/mcp",
+          name: "Invalid session bootstrap",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+      expect(result.connection.config).toMatchObject({ mcpSessionRequired: true });
+      expect(result.actions.readOnly).toEqual([
+        expect.objectContaining({ toolName: "list_services", riskLevel: "read" }),
+      ]);
+      assertCredentialStaysHidden(result, logs.lines);
+    } finally {
+      logs.restore();
+    }
+
+    // One handshake. The last tools/list is the connect health check reusing that session.
+    expect(probe.requests.map((request) => `${request.method}:${request.sessionId ?? "-"}`)).toEqual([
+      "tools/list:-",
+      "initialize:-",
+      "notifications/initialized:session-1",
+      "tools/list:session-1",
+      "tools/list:session-1",
+    ]);
+    expect(probe.initializeCount()).toBe(1);
+    expect(probe.requests.filter(({ method }) => method === "notifications/initialized")).toHaveLength(1);
+    expect(probe.requests.every((request) => (request.authorization ?? "").split(MCP_SESSION_CANARY).length === 2)).toBe(true);
+    expect(probe.requests.every((request) => !(request.authorization ?? "").includes("Bearer Bearer"))).toBe(true);
+    assertCredentialStaysHidden(probe.requests.map(({ method, sessionId }) => ({ method, sessionId })), logs.lines);
+  });
+
+  it("keeps a session-less 404 that is not Invalid session ID as a real error", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingBody: "endpoint missing",
+    });
+    const logs = captureConsoleLines();
+    let caught: unknown;
+    try {
+      await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://missing.example/mcp",
+          name: "Ordinary missing endpoint",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+    } catch (error) {
+      caught = error;
+    } finally {
+      logs.restore();
+    }
+
+    expect(caught).toMatchObject({
+      status: 502,
+      message: "Remote app returned HTTP 404",
+    });
+    expect(probe.initializeCount()).toBe(0);
+    expect(probe.requests.filter(({ method }) => method === "tools/list")).toHaveLength(1);
+    expect(probe.requests[0]).toMatchObject({ method: "tools/list", sessionId: null });
+    assertCredentialStaysHidden(caught, logs.lines);
+  });
+
+  it("does not handshake again when the retried tools/list is still Invalid session ID", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const probe = mockSessionBootstrapServer({
+      missingStatus: 404,
+      missingBody: "Invalid session ID",
+      establishedToolsList: "invalid-session",
+    });
+    const logs = captureConsoleLines();
+    let caught: unknown;
+    try {
+      await service.connectGalleryApp(
+        company.id,
+        {
+          link: "https://stateful.example/mcp",
+          name: "Invalid session still missing",
+          credentialValues: { "headers.Authorization": `Bearer ${MCP_SESSION_CANARY}` },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+    } catch (error) {
+      caught = error;
+    } finally {
+      logs.restore();
+    }
+
+    expect(caught).toMatchObject({
+      status: 502,
+      message: "Remote app returned HTTP 404",
+    });
+    expect(probe.initializeCount()).toBe(1);
+    expect(probe.requests.filter(({ method }) => method === "initialize")).toHaveLength(1);
+    expect(probe.requests.filter(({ method }) => method === "notifications/initialized")).toHaveLength(1);
+    expect(probe.requests.filter(({ method }) => method === "tools/list")).toHaveLength(2);
+    assertCredentialStaysHidden(caught, logs.lines);
   });
 
   it("serves persisted MCP actions until the cache expires and then refreshes them", async () => {

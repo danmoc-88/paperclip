@@ -6674,6 +6674,20 @@ export function toolAccessService(
     return headers;
   }
 
+  // HTTP 400 is the historical "session required" signal. A session-less
+  // tools/list that answers 404 is a missing route unless the body is the MCP
+  // session error. The body is not logged and is not copied into the failure.
+  async function toolsListNeedsSessionBootstrap(response: Response): Promise<boolean> {
+    if (response.status === 400) return true;
+    if (response.status !== 404) return false;
+    try {
+      const body = (await response.clone().text()).slice(0, 256);
+      return body.includes("Invalid session ID");
+    } catch {
+      return false;
+    }
+  }
+
   async function remoteTools(
     connection: typeof toolConnections.$inferSelect,
     credentialHeaders?: Record<string, string>,
@@ -6697,6 +6711,7 @@ export function toolAccessService(
         body: JSON.stringify({ jsonrpc: "2.0", id: listRequestId, method: "tools/list", params: cursor ? { cursor } : {} }) });
     };
     let usedInitializedSession = connection.config.mcpSessionRequired === true;
+    let sessionBootstrapAttempted = false;
     let response: Response;
     if (usedInitializedSession) {
       try {
@@ -6710,25 +6725,29 @@ export function toolAccessService(
       }
     } else {
       response = await sendToolsList(headers);
-      // `tools/list` is read-only, so a 400 can safely be retried after the MCP
-      // initialize handshake. Stateful servers such as Supabase require the
-      // returned Mcp-Session-Id on every non-initialization request.
-      if (response.status === 400) {
+      // `tools/list` is read-only, so a missing-session response can be retried
+      // once after initialize. HTTP 400 is the historical signal. HTTP 404 is
+      // retried only when the body says the MCP session is missing.
+      if (await toolsListNeedsSessionBootstrap(response)) {
+        sessionBootstrapAttempted = response.status === 404;
         try {
-          const sessionHeaders = await initializeMcpHttpSession({
+          const sessionHeaders = await getMcpHttpSession({
             send: sendRemote,
             headers,
+            scope: `${connection.id}:catalog:${actor?.actorType}:${actor?.actorId}:${endpoint}`,
             requestId: "paperclip-catalog-refresh",
           });
           response = await sendToolsList(sessionHeaders);
           usedInitializedSession = response.ok;
+          if (!response.ok) forgetMcpHttpSessions(connection.id);
         } catch {
+          forgetMcpHttpSessions(connection.id);
           // Preserve the original HTTP failure below when this was not an MCP
           // session requirement after all.
         }
       }
     }
-    if (response.status === 404 && new Headers(sessionHeaders).has("mcp-session-id")) {
+    if (!sessionBootstrapAttempted && response.status === 404 && new Headers(sessionHeaders).has("mcp-session-id")) {
       // MCP uses 404 for an expired server session. Discovery is read-only, so
       // discard the stale session and retry it once with a new handshake.
       forgetMcpHttpSessions(connection.id);
