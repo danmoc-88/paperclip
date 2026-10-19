@@ -2213,6 +2213,14 @@ function connectorEnrollmentPrincipal(req: Request): string {
     res.json(result);
   });
 
+  // Explicit route: older servers reject it instead of silently refreshing on GET.
+  router.get("/tool-connections/:connectionId/catalog/persisted", async (req, res) => {
+    assertBoard(req);
+    const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!existing) return;
+    res.json({ readMode: "persisted", catalog: await svc.listCatalog(existing.id, existing.companyId, { cacheOnly: true }) });
+  });
+
   router.get("/tool-connections/:connectionId/catalog", async (req, res) => {
     assertBoard(req);
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
