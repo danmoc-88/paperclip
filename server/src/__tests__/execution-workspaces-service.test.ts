@@ -13,6 +13,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  executionWorkspaceRuntimeLeases,
   heartbeatRuns,
   issueComments,
   issueReferenceMentions,
@@ -556,6 +557,99 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
   }, 20_000);
 
+  async function trackDeliveredBase(seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>, options: {
+    remoteUrl?: string; remoteBranch?: string;
+  } = {}) {
+    const remoteBranch = options.remoteBranch ?? "main";
+    await runGit(seeded.repoRoot, ["remote", "add", "origin", options.remoteUrl ?? "https://github.com/paperclipai/paperclip.git"]);
+    await runGit(seeded.repoRoot, ["update-ref", `refs/remotes/origin/${remoteBranch}`, seeded.headSha!]);
+    await runGit(seeded.repoRoot, ["config", "branch.main.remote", "origin"]);
+    await runGit(seeded.repoRoot, ["config", "branch.main.merge", `refs/heads/${remoteBranch}`]);
+  }
+
+  it("reaps delivery in the tracked base when the local base is stale and PR state is unknown", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    pullRequestDetailsByKey.set(`${seeded.companyId}:10623`, { state: "unknown", headRef: null, headSha: null });
+    await trackDeliveredBase(seeded);
+    expect((await svc.list(seeded.companyId))[0]?.deliveryState).toBe("unknown");
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(readiness).toMatchObject({ deliveryState: "merged_by_ancestry", git: {
+      baseRef: "refs/remotes/origin/main", aheadCount: 0, isMergedIntoBase: true,
+    } });
+    const result = await svc.sweepTerminalWorkspaces();
+    const [closed] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(result, closed?.cleanupReason ?? undefined).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+  }, 20_000);
+
+  it.each(["dirty", "untracked", "unpushed", "active_run", "live_lease", "open_tree", "open_linked_issue", "shared", "primary"] as const)(
+    "keeps a delivered tracked-base workspace with %s work",
+    async (protection) => {
+      const seeded = await seedTerminalWorkspace({ activeRun: protection === "active_run", childStatus: protection === "open_tree" ? "todo" : undefined });
+      await trackDeliveredBase(seeded);
+      if (protection === "open_linked_issue") await db.insert(issues).values({
+        companyId: seeded.companyId, projectId: seeded.projectId, title: "Unrelated open issue sharing the workspace",
+        executionWorkspaceId: seeded.executionWorkspaceId, status: "todo",
+      });
+      if (protection === "live_lease") await db.insert(executionWorkspaceRuntimeLeases).values({
+        companyId: seeded.companyId, executionWorkspaceId: seeded.executionWorkspaceId,
+        ownerKey: `issue:${seeded.sourceIssueId}`, ownerIssueId: seeded.sourceIssueId,
+        lastAction: "start", expiresAt: new Date(Date.now() + 60_000),
+      });
+      if (protection === "shared") await db.update(executionWorkspaces).set({ mode: "shared_workspace" })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      if (protection === "primary") await db.insert(projectWorkspaces).values({
+        companyId: seeded.companyId, projectId: seeded.projectId, name: "Primary", isPrimary: true,
+        cwd: seeded.worktreePath,
+      });
+      if (protection === "dirty") await fs.appendFile(path.join(seeded.worktreePath, "delivered.txt"), "unsaved work\n");
+      if (protection === "untracked") await fs.writeFile(path.join(seeded.worktreePath, "untracked.txt"), "untracked work\n");
+      if (protection === "unpushed") await runGit(seeded.worktreePath, ["commit", "--allow-empty", "-m", "Unpushed work"]);
+      const sweep = await svc.sweepTerminalWorkspaces();
+      expect(sweep.archived).toBe(0);
+      expect(sweep.cleanupFailed).toBe(0);
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId)))[0]?.status).toBe("active");
+    }, 20_000,
+  );
+
+  it("keeps the main Git checkout even when it is recorded as an isolated worktree", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await db.update(executionWorkspaces).set({ cwd: seeded.repoRoot, providerRef: seeded.repoRoot, branchName: "main" })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedProtectedWorkspace: 1 });
+    await expect(fs.access(path.join(seeded.repoRoot, "README.md"))).resolves.toBeUndefined();
+    expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId)))[0]?.status).toBe("active");
+  });
+
+  it("checks a runtime lease acquired after delivery assessment before removing files", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await trackDeliveredBase(seeded);
+    const racingService = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      beforeTerminalWorkspaceCleanup: async () => {
+        await db.insert(executionWorkspaceRuntimeLeases).values({
+          companyId: seeded.companyId, executionWorkspaceId: seeded.executionWorkspaceId,
+          ownerKey: `issue:${seeded.sourceIssueId}`, ownerIssueId: seeded.sourceIssueId,
+          lastAction: "start", expiresAt: new Date(Date.now() + 60_000),
+        });
+      },
+    });
+    expect(await racingService.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it.each([
+    { remoteUrl: "https://github.com/other/paperclip.git" },
+    { remoteBranch: "feature" },
+  ])("does not use unrelated upstream delivery: %s", async (options) => {
+    const seeded = await seedTerminalWorkspace();
+    await trackDeliveredBase(seeded, options);
+    expect(await svc.getCloseReadiness(seeded.executionWorkspaceId)).toMatchObject({ deliveryState: "unmerged", git: { baseRef: "main" } });
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
   it("fails closed before archive when git status inspection is unavailable", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
     const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")
@@ -1085,6 +1179,32 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       "Paperclip could not verify the workspace git status. Retry before destructive cleanup.",
     );
     expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("retain worktree after tracked delivery proof disappears", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await trackDeliveredBase(seeded);
+    const racing = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      beforeTerminalWorkspaceCleanup: async () => {
+        await runGit(seeded.repoRoot, ["update-ref", "refs/remotes/origin/main", "main"]);
+        expect((await svc.getCloseReadiness(seeded.executionWorkspaceId))?.deliveryState).toBe("unmerged");
+      },
+    });
+    const sweep = await racing.sweepTerminalWorkspaces();
+    expect(sweep.archived).toBe(0);
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("retain primary path of another project in same company", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await trackDeliveredBase(seeded);
+    const otherProject = randomUUID();
+    await db.insert(projects).values({id: otherProject, companyId: seeded.companyId, name: "Other project", status: "in_progress"});
+    await db.insert(projectWorkspaces).values({companyId: seeded.companyId, projectId: otherProject, name: "Primary", isPrimary: true, cwd: seeded.worktreePath});
+    const sweep = await svc.sweepTerminalWorkspaces();
+    expect(sweep.archived).toBe(0);
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
 

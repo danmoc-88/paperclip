@@ -1721,6 +1721,23 @@ entries. Close-readiness checks, the terminal-workspace reaper, and the final
 cleanup validation still inspect Git afresh. A display result never authorizes
 worktree removal.
 
+The collection inventory deliberately returns `deliveryState: "unknown"` without
+Git or GitHub inspection. Use the workspace `close-readiness` endpoint for a
+fresh delivery assessment; the terminal reaper runs that assessment itself.
+When the saved base is a local branch, delivery comparison uses its existing
+remote-tracking upstream only if it tracks the same branch in the same GitHub
+repository. This avoids a stale local base hiding a completed merge. The check
+uses local refs without a network fetch, does not change the saved base, and
+reports the comparison ref in `git.baseRef`. Missing or unrelated tracking
+configuration retains the original comparison. An unavailable PR lookup remains
+unknown unless Git ancestry independently proves delivery.
+
+The terminal reaper retains shared and project workspace directories, main Git
+checkouts, live runtime leases, active runs, open issue trees, dirty files, and
+commits absent from the delivery base or verified merged PR. Delivery evidence
+alone does not authorize cleanup. Lease and directory checks also run at the
+final cleanup fence.
+
 The connection-health sweep selects only due IDs in SQL before applying its
 limit. Legacy `paperclip_plugin` placeholder connections are excluded: their
 tools run in plugin workers and do not have remote MCP endpoints. These rows

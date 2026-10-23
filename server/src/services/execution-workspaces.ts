@@ -1,3 +1,4 @@
+import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -8,6 +9,7 @@ import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizz
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
+  executionWorkspaceRuntimeLeases,
   heartbeatRuns,
   issueComments,
   issueWorkProducts,
@@ -202,19 +204,6 @@ export function clearMetadataReopenPendingConsumption(
   return next;
 }
 
-// Acquire the per-workspace, transaction-scoped Postgres advisory lock. Postgres
-// releases the lock when the transaction that holds `tx` commits or rolls back.
-// Both the reopen path and the destructive cleanup path acquire the same lock,
-// so they never run against the same workspace at the same time, even on
-// different server processes.
-async function acquireExecutionWorkspaceLifecycleLock(
-  tx: DbTransaction,
-  workspaceId: string,
-): Promise<void> {
-  await tx.execute(
-    sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspaceId}`}, 0))`,
-  );
-}
 
 export type ReopenClosedIsolatedExecutionWorkspaceResult =
   // `generation` is the lifecycle generation the reopen published the active row
@@ -791,6 +780,34 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
+// A local base branch can stay at the original checkout while its remote
+// tracking ref advances after merge. Use only that branch's configured upstream
+// in the workspace repository, never a guessed default branch or a feature ref.
+async function resolveDeliveryBaseRef(workspace: ExecutionWorkspace, cwd: string) {
+  const baseRef = workspace.baseRef;
+  const repository = parseGitHubRepository(workspace.repoUrl);
+  if (!baseRef || !repository) return baseRef;
+  try {
+    const localRef = baseRef.startsWith("refs/heads/") ? baseRef : `refs/heads/${baseRef}`;
+    const tracking = (await runGit([
+      "for-each-ref", "--format=%(refname)%09%(upstream)%09%(upstream:remotename)%09%(upstream:remoteref)",
+      "--", localRef,
+    ], cwd)).stdout.trim().split("\n").find((line) => line.split("\t")[0] === localRef);
+    if (!tracking) return baseRef;
+    const [, upstream, remote, remoteRef] = tracking.split("\t");
+    if (!remote || remote === "." || remoteRef !== localRef
+      || !upstream?.startsWith(`refs/remotes/${remote}/`)) return baseRef;
+    const remoteUrl = (await runGit(["remote", "get-url", "--", remote], cwd)).stdout.trim();
+    const remoteRepository = parseGitHubRepository(remoteUrl);
+    if (remoteRepository?.owner !== repository.owner || remoteRepository.repo !== repository.repo) return baseRef;
+    await runGit(["rev-parse", "--verify", `${upstream}^{commit}`], cwd);
+    return upstream;
+  } catch {
+    // Missing tracking configuration or an unavailable ref is not delivery proof.
+    return baseRef;
+  }
+}
+
 async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
@@ -888,7 +905,7 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   let aheadCount: number | null = null;
   let behindCount: number | null = null;
   let isMergedIntoBase: boolean | null = null;
-  const baseRef = workspace.baseRef;
+  const baseRef = repoRoot ? await resolveDeliveryBaseRef(workspace, workspacePath) : workspace.baseRef;
 
   if (repoRoot && baseRef) {
     try {
@@ -1384,7 +1401,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const issueTree = await listWorkspaceIssueTree(workspace);
     const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
     const sourceIssueTerminal = Boolean(sourceIssue && TERMINAL_ISSUE_STATUSES.has(sourceIssue.status));
-    const subtreeTerminal = Boolean(sourceIssue && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
+    const [openLinkedIssue] = await db.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, workspace.companyId),
+      eq(issues.executionWorkspaceId, workspace.id),
+      sql<boolean>`${issues.status} NOT IN ('done', 'cancelled')`,
+    )).limit(1);
+    const subtreeTerminal = Boolean(sourceIssue && !openLinkedIssue
+      && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
     // The cooldown anchor is the most recent terminal timestamp across the whole
     // issue tree. The reaper compares it against the cooldown window. A null
     // anchor means no issue in the tree is terminal yet, so the cooldown never
@@ -1469,6 +1492,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
   ) {
+    if (await isProtectedCleanupWorkspace(workspace) || await workspaceHasLiveRuntimeLease(workspace)) {
+      throw new Error("Refusing terminal workspace cleanup of a protected or leased workspace");
+    }
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
     if (!workspacePath || !expectedHeadSha) {
@@ -1492,6 +1518,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ) {
       throw new Error("Refusing terminal workspace cleanup because the git worktree changed after delivery was verified");
     }
+    // HEAD can stay unchanged while the tracked base moves or its configuration
+    // changes. Revalidate delivery before each destructive action as well.
+    const delivery = await assessDelivery(workspace, current.git);
+    if (
+      !delivery.sourceIssueTerminal
+      || !delivery.subtreeTerminal
+      || !["merged_by_ancestry", "merged_via_pr"].includes(delivery.deliveryState)
+      || await workspaceHasActiveRun(workspace)
+    ) {
+      throw new Error("Refusing terminal workspace cleanup because delivery or terminal readiness changed");
+    }
   }
 
   async function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
@@ -1501,7 +1538,40 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
   }
 
+  async function workspaceHasLiveRuntimeLease(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId">) {
+    const [lease] = await db.select({ id: executionWorkspaceRuntimeLeases.id })
+      .from(executionWorkspaceRuntimeLeases).where(and(
+        eq(executionWorkspaceRuntimeLeases.companyId, workspace.companyId),
+        eq(executionWorkspaceRuntimeLeases.executionWorkspaceId, workspace.id),
+        gt(executionWorkspaceRuntimeLeases.expiresAt, now()),
+      )).limit(1);
+    return Boolean(lease);
+  }
+
+  async function isProtectedCleanupWorkspace(workspace: ExecutionWorkspaceRow) {
+    if (workspace.mode === "shared_workspace") return true;
+    const cwd = workspace.providerRef ?? workspace.cwd;
+    if (!cwd) return false;
+    const realCwd = await fs.realpath(cwd).catch(() => path.resolve(cwd));
+    const projectPaths = await db.select({ cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
+      .where(eq(projectWorkspaces.companyId, workspace.companyId));
+    for (const project of projectPaths) {
+      if (!project.cwd) continue;
+      const primary = await fs.realpath(project.cwd).catch(() => path.resolve(project.cwd!));
+      if (realCwd === primary || primary.startsWith(`${realCwd}${path.sep}`)) return true;
+    }
+    if (workspace.providerType === "git_worktree") {
+      // The main checkout has the same git-dir and common-dir. Git would refuse
+      // removal, but the reaper must not archive its record or stop its services.
+      const gitDir = await readGitStdout(["rev-parse", "--absolute-git-dir"], cwd).catch(() => null);
+      const commonDir = await readGitStdout(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd).catch(() => null);
+      if (gitDir && commonDir && gitDir === commonDir) return true;
+    }
+    return false;
+  }
+
   async function workspaceHasActiveRun(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
+    if (await workspaceHasLiveRuntimeLease(workspace)) return true;
     const linkedIssues = await db
       .select({
         checkoutRunId: issues.checkoutRunId,
@@ -2541,6 +2611,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived: 0,
           cleanupFailed: 0,
           skippedActiveRun: 0,
+          skippedProtectedWorkspace: 0,
           skippedNonTerminalTree: 0,
           skippedUndelivered: 0,
           skippedRace: 0,
@@ -2605,6 +2676,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         archived: 0,
         cleanupFailed: 0,
         skippedActiveRun: 0,
+        skippedProtectedWorkspace: 0,
         skippedNonTerminalTree: 0,
         skippedUndelivered: 0,
         skippedRace: 0,
@@ -2614,6 +2686,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
 
       for (const workspace of candidates) {
+        if (await isProtectedCleanupWorkspace(workspace)) {
+          result.skippedProtectedWorkspace += 1;
+          continue;
+        }
         const executionWorkspace = toExecutionWorkspace(workspace);
         const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
         if (!statusInspectionSucceeded) {
@@ -2757,6 +2833,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               eq(executionWorkspaces.companyId, workspace.companyId),
               inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
               isNull(executionWorkspaces.closedAt),
+              sql<boolean>`NOT EXISTS (
+                SELECT 1 FROM ${executionWorkspaceRuntimeLeases} lease
+                WHERE lease.company_id = ${workspace.companyId}
+                  AND lease.execution_workspace_id = ${workspace.id}
+                  AND lease.expires_at > ${now().toISOString()}::timestamptz
+              )`,
               sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
               sql<boolean>`EXISTS (
                 SELECT 1
@@ -2778,6 +2860,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   )
                   AND live_run.company_id = ${workspace.companyId}
                   AND live_run.status IN ('queued', 'running')
+              )`,
+              sql<boolean>`NOT EXISTS (
+                SELECT 1 FROM ${issues} linked_issue
+                WHERE linked_issue.company_id = ${workspace.companyId}
+                  AND linked_issue.execution_workspace_id = ${workspace.id}
+                  AND linked_issue.status NOT IN ('done', 'cancelled')
               )`,
               sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE issue_tree(id, status) AS (

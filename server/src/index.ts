@@ -1361,6 +1361,7 @@ async function startServerWithDatabaseTeardown(
           }
           const skipped =
             result.skippedActiveRun
+            + result.skippedProtectedWorkspace
             + result.skippedNonTerminalTree
             + result.skippedUndelivered
             + result.skippedRace

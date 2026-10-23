@@ -1,3 +1,4 @@
+import { acquireExecutionWorkspaceLifecycleLock } from "../services/execution-workspace-lifecycle-lock.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -134,6 +135,26 @@ describeEmbeddedPostgres("execution workspace runtime leases", () => {
       issueId: input.issueId ?? null,
     };
   }
+
+  it("does not grant a lease while cleanup holds the lifecycle lock", async () => {
+    const lane = await seedLane();
+    const issueId = await seedIssue(lane, { title: "Late runtime request" });
+    const runId = await seedRun(lane);
+    let claim!: ReturnType<ReturnType<typeof workspaceRuntimeLeaseService>["claim"]>;
+    await db.transaction(async (tx) => {
+      await acquireExecutionWorkspaceLifecycleLock(tx, lane.executionWorkspaceId);
+      claim = workspaceRuntimeLeaseService(otherProcessDb).claim({
+        companyId: lane.companyId, executionWorkspaceId: lane.executionWorkspaceId,
+        action: "start", owner: ownerFor({ agentId: lane.agentId, runId, issueId }),
+      });
+      // Observe the competing request before publishing the closed state.
+      const outcome = await Promise.race([claim.then(() => "claimed"), new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 100))]);
+      expect(outcome).toBe("waiting");
+      await tx.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, lane.executionWorkspaceId));
+    });
+    await expect(claim).rejects.toThrow("closed execution workspace");
+    expect(await db.select().from(executionWorkspaceRuntimeLeases)).toHaveLength(0);
+  });
 
   it("grants the first claim and lets the same owner keep operating across runs", async () => {
     const lane = await seedLane();

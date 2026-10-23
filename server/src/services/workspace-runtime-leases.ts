@@ -1,6 +1,7 @@
+import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaceRuntimeLeases, heartbeatRuns, issues } from "@paperclipai/db";
+import { executionWorkspaceRuntimeLeases, executionWorkspaces, heartbeatRuns, issues } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 
 type ExecutionWorkspaceRuntimeLeaseRow = typeof executionWorkspaceRuntimeLeases.$inferSelect;
@@ -191,6 +192,17 @@ export function workspaceRuntimeLeaseService(db: Db) {
       };
 
       return await db.transaction(async (tx) => {
+        // Reaping and reopening hold this same lock through file cleanup. A
+        // claimant must not acquire a fresh lease after the final cleanup check.
+        await acquireExecutionWorkspaceLifecycleLock(tx, input.executionWorkspaceId);
+        const [workspace] = await tx.select({ status: executionWorkspaces.status })
+          .from(executionWorkspaces).where(and(
+            eq(executionWorkspaces.id, input.executionWorkspaceId),
+            eq(executionWorkspaces.companyId, input.companyId),
+          ));
+        if (!workspace || !["active", "idle", "in_review"].includes(workspace.status)) {
+          throw conflict("Cannot claim a runtime lease for a closed execution workspace");
+        }
         const created = await tx
           .insert(executionWorkspaceRuntimeLeases)
           .values({
