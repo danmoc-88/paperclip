@@ -96,9 +96,9 @@ const generalWorkspacesAGroupName = "general-workspaces-a";
 const generalWorkspacesBGroupName = "general-workspaces-b";
 const generalWorkspacesCGroupName = "general-workspaces-c";
 const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
-// Upstream pr-trusted.yml@master runs @paperclipai/db in its own lane.
-// This branch's caller uses that workflow, so the group has to exist here
-// even though the local workflow copy is not what CI executes.
+// The trusted PR workflow runs @paperclipai/db in its own lane, so the group
+// has to exist here. The fork executes its own pinned pr-trusted.yml copy,
+// which defines the general-workspaces-c group.
 const generalWorkspacesCProjects = ["@paperclipai/db"];
 const generalWorkspacesBProjects = nonServerProjects.filter(
   (project) => !generalWorkspacesAProjects.includes(project) && !generalWorkspacesCProjects.includes(project),
