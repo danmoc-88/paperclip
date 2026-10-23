@@ -582,11 +582,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
   }, 20_000);
 
-  it.each(["dirty", "untracked", "unpushed", "active_run", "live_lease", "open_tree", "shared", "primary"] as const)(
+  it.each(["dirty", "untracked", "unpushed", "active_run", "live_lease", "open_tree", "open_linked_issue", "shared", "primary"] as const)(
     "keeps a delivered tracked-base workspace with %s work",
     async (protection) => {
       const seeded = await seedTerminalWorkspace({ activeRun: protection === "active_run", childStatus: protection === "open_tree" ? "todo" : undefined });
       await trackDeliveredBase(seeded);
+      if (protection === "open_linked_issue") await db.insert(issues).values({
+        companyId: seeded.companyId, projectId: seeded.projectId, title: "Unrelated open issue sharing the workspace",
+        executionWorkspaceId: seeded.executionWorkspaceId, status: "todo",
+      });
       if (protection === "live_lease") await db.insert(executionWorkspaceRuntimeLeases).values({
         companyId: seeded.companyId, executionWorkspaceId: seeded.executionWorkspaceId,
         ownerKey: `issue:${seeded.sourceIssueId}`, ownerIssueId: seeded.sourceIssueId,

@@ -1401,7 +1401,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const issueTree = await listWorkspaceIssueTree(workspace);
     const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
     const sourceIssueTerminal = Boolean(sourceIssue && TERMINAL_ISSUE_STATUSES.has(sourceIssue.status));
-    const subtreeTerminal = Boolean(sourceIssue && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
+    const [openLinkedIssue] = await db.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, workspace.companyId),
+      eq(issues.executionWorkspaceId, workspace.id),
+      sql<boolean>`${issues.status} NOT IN ('done', 'cancelled')`,
+    )).limit(1);
+    const subtreeTerminal = Boolean(sourceIssue && !openLinkedIssue
+      && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
     // The cooldown anchor is the most recent terminal timestamp across the whole
     // issue tree. The reaper compares it against the cooldown window. A null
     // anchor means no issue in the tree is terminal yet, so the cooldown never
@@ -2843,6 +2849,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   )
                   AND live_run.company_id = ${workspace.companyId}
                   AND live_run.status IN ('queued', 'running')
+              )`,
+              sql<boolean>`NOT EXISTS (
+                SELECT 1 FROM ${issues} linked_issue
+                WHERE linked_issue.company_id = ${workspace.companyId}
+                  AND linked_issue.execution_workspace_id = ${workspace.id}
+                  AND linked_issue.status NOT IN ('done', 'cancelled')
               )`,
               sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE issue_tree(id, status) AS (
