@@ -659,7 +659,10 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
   }
 }
 
-async function streamLocalFileToSsh(input: {
+// Exported for the stdin-EPIPE regression test (SAK-2143): it is the file → SSH
+// transfer that pipes a local file into `ssh.stdin`. The `spawnText` regression
+// does not cover this write site.
+export async function streamLocalFileToSsh(input: {
   spec: SshConnectionConfig;
   localFile: string;
   remoteScript: string;
@@ -696,6 +699,12 @@ async function streamLocalFileToSsh(input: {
     });
     source.on("error", fail);
     ssh.on("error", fail);
+    // The pipe writes into `ssh.stdin`. An `ssh` that closes its read end first
+    // makes that write emit an asynchronous EPIPE `error` on the socket; with no
+    // listener Node would raise the unhandled event and exit the whole server
+    // (SAK-2143). A closed destination also means the transfer can never
+    // complete, so abort it instead of leaving the source blocked on a dead pipe.
+    ssh.stdin?.on("error", fail);
     if (input.progress) {
       input.progress.counter.on("error", fail);
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
@@ -1415,6 +1424,12 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    // tar streams into `ssh.stdin`. An `ssh` that closes its read end before tar
+    // finishes makes that write emit an asynchronous EPIPE `error`; with no
+    // listener Node would raise the unhandled event and exit the whole server
+    // (SAK-2143). A closed destination also means the sync can never complete, so
+    // abort it instead of leaving tar blocked on a dead pipe.
+    ssh.stdin?.on("error", fail);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
@@ -1526,6 +1541,12 @@ export async function syncDirectoryFromSsh(input: {
         reject(error);
       };
 
+      // The restore streams `ssh` stdout into `tar.stdin`. A `tar` that closes
+      // its read end first makes that write emit an asynchronous EPIPE `error`;
+      // with no listener Node would raise the unhandled event and exit the whole
+      // server (SAK-2143). A closed destination also means the restore can never
+      // complete, so abort it instead of leaving ssh blocked on a dead pipe.
+      tar.stdin?.on("error", fail);
       if (progress) {
         progress.counter.on("error", fail);
         ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);
