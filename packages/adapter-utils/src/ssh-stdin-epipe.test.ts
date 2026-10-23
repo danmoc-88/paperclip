@@ -46,6 +46,18 @@ function watchUncaughtExceptions() {
   };
 }
 
+// Capture the transfer rejection so the test proves the closed-stdin scenario
+// was actually reached with a pipe error, instead of accepting any failure (an
+// unrelated tool-launch error would otherwise pass a bare `.catch`).
+async function captureTransferError(run: () => Promise<void>): Promise<NodeJS.ErrnoException> {
+  try {
+    await run();
+  } catch (error) {
+    return error as NodeJS.ErrnoException;
+  }
+  throw new Error("expected the transfer to reject when the destination closes stdin");
+}
+
 // Prepends a temp bin dir (holding an `ssh` and/or `tar` stand-in) to PATH so
 // the transfer spawns the stand-in instead of reaching a real SSH host. The
 // real `tar` stays reachable when only `ssh` is overridden.
@@ -129,12 +141,15 @@ describe("ssh child stdin pipe errors (SAK-2143)", () => {
       await writeFile(localFile, Buffer.alloc(1024 * 1024, 0x61));
       const uncaught = watchUncaughtExceptions();
       try {
-        await streamLocalFileToSsh({
-          spec: testSpec(),
-          localFile,
-          remoteScript: "mkdir -p /tmp/paperclip-remote",
-        }).catch(() => undefined);
+        const error = await captureTransferError(() =>
+          streamLocalFileToSsh({
+            spec: testSpec(),
+            localFile,
+            remoteScript: "mkdir -p /tmp/paperclip-remote",
+          }),
+        );
         expect(uncaught.seen).toHaveLength(0);
+        expect(error.code).toBe("EPIPE");
       } finally {
         uncaught.restore();
         await bin.restore();
@@ -154,12 +169,15 @@ describe("ssh child stdin pipe errors (SAK-2143)", () => {
       await writeFile(path.join(localDir, "big.bin"), Buffer.alloc(1024 * 1024, 0x62));
       const uncaught = watchUncaughtExceptions();
       try {
-        await syncDirectoryToSsh({
-          spec: testSpec(),
-          localDir,
-          remoteDir: "/tmp/paperclip-remote",
-        }).catch(() => undefined);
+        const error = await captureTransferError(() =>
+          syncDirectoryToSsh({
+            spec: testSpec(),
+            localDir,
+            remoteDir: "/tmp/paperclip-remote",
+          }),
+        );
         expect(uncaught.seen).toHaveLength(0);
+        expect(error.code).toBe("EPIPE");
       } finally {
         uncaught.restore();
         await bin.restore();
@@ -181,12 +199,15 @@ describe("ssh child stdin pipe errors (SAK-2143)", () => {
       await mkdir(localDir, { recursive: true });
       const uncaught = watchUncaughtExceptions();
       try {
-        await syncDirectoryFromSsh({
-          spec: testSpec(),
-          remoteDir: "/tmp/paperclip-remote",
-          localDir,
-        }).catch(() => undefined);
+        const error = await captureTransferError(() =>
+          syncDirectoryFromSsh({
+            spec: testSpec(),
+            remoteDir: "/tmp/paperclip-remote",
+            localDir,
+          }),
+        );
         expect(uncaught.seen).toHaveLength(0);
+        expect(error.code).toBe("EPIPE");
       } finally {
         uncaught.restore();
         await bin.restore();

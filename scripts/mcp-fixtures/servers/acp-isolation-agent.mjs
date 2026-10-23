@@ -36,6 +36,14 @@ async function inspectStdioServer(server) {
 
   let nextId = 1;
   const pending = new Map();
+  // A fixture child that closes its stdin before a request is written makes the
+  // next `child.stdin.write` emit an asynchronous EPIPE on the socket. Without a
+  // listener the unhandled `error` event would end this fixture process
+  // (SAK-2143); fail the in-flight requests instead.
+  child.stdin.on("error", (error) => {
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+  });
   const lines = createInterface({ input: child.stdout });
 
   lines.on("line", (line) => {
