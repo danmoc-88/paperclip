@@ -28,21 +28,26 @@ GitHub Actions owns `pnpm-lock.yaml`.
 
 ## Trusted PR Workflow
 
-The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
-The AWS runner group `paperclip-public-pr` must allow
-`paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master`.
-New workflow versions merged into master then receive runner access without a
-separate SHA allowlist update. Dependabot leaves this first-party reference on
-master.
+This fork's PR caller pins `danmoc-88/paperclip/.github/workflows/pr-trusted.yml`
+to an immutable commit SHA.
+
+The fork must not follow
+`paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`. Upstream's
+workflow gained gates for files this fork's tree does not carry
+(`scripts/docker-deps-postinstall.test.mjs`, `scripts/docker-compose-secrets.test.mjs`,
+`scripts/server-boot-smoke.sh`, and a `@paperclipai/server` `build:runtime`
+script), so every pull request failed on files that are simply absent here. The
+pinned SHA keeps the active CI definition equal to
+`.github/workflows/pr-trusted.yml` in this repository. Bump the SHA in the same
+pull request that changes that file.
+
+The fork's copy fails the upstream runner-routing check closed, so its jobs run on
+GitHub-hosted runners. The `paperclip-public-pr` AWS runner group is not used here.
 
 Keep the `.github/**` rule in `.github/CODEOWNERS` and the active master ruleset's
 code-owner review requirement enabled. This covers the caller, the trusted
 workflow, and CODEOWNERS itself. Existing administrator pull-request bypasses
 remain governed by the repository ruleset.
-
-When changing the workflow path or branch, authorize the new reference before
-updating the caller. Retain older authorized SHA references while queued runs or
-supported reruns still use them.
 
 ## Start Dev
 

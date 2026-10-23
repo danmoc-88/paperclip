@@ -38,5 +38,6 @@ updates:
       time: "06:00"
     open-pull-requests-limit: 5
     ignore:
-      # This first-party workflow follows CODEOWNERS-protected master.
-      - dependency-name: "paperclipai/paperclip/.github/workflows/pr-trusted.yml"
+      # The PR caller pins this first-party workflow to an immutable SHA that
+      # must stay in sync with the same pull request that changes the file.
+      - dependency-name: "danmoc-88/paperclip/.github/workflows/pr-trusted.yml"

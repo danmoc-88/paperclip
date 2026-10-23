@@ -578,8 +578,8 @@ jobs:
             shard_count: 2
           - group: general-workspaces-b
             group_label: workspaces-b
-          # db runs alone. The PR caller uses upstream pr-trusted.yml@master,
-          # which already requests this group.
+          # db runs alone. The pinned PR caller executes this file, which
+          # defines this group.
           - group: general-workspaces-c
             group_label: workspaces-c
 
