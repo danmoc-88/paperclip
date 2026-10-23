@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import { attachChildStdinErrorHandler } from "./child-stdin.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -219,7 +220,10 @@ async function execFileText(
   });
 }
 
-async function spawnText(
+// Exported for the stdin-EPIPE regression test (SAK-2143): it is the shared
+// spawn helper behind the SSH command path, and covers the write site without
+// requiring a live SSH server.
+export async function spawnText(
   file: string,
   args: string[],
   options: {
@@ -321,6 +325,14 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
+      // An SSH process that exits before the payload is written closes the
+      // pipe; without a listener the failing write emits an EPIPE `error`
+      // event that would crash the whole server (SAK-2143).
+      attachChildStdinErrorHandler(child.stdin, (error) => {
+        finishReject(
+          Object.assign(error instanceof Error ? error : new Error(String(error)), { code: null }),
+        );
+      });
       child.stdin.end(options.stdin);
     }
   });
