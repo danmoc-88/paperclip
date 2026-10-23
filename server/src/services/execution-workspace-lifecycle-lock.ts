@@ -16,4 +16,3 @@ export async function acquireExecutionWorkspaceLifecycleLock(
     sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspaceId}`}, 0))`,
   );
 }
-

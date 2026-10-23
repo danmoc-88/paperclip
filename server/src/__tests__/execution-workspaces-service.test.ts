@@ -1182,6 +1182,32 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
 
+  it("retain worktree after tracked delivery proof disappears", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await trackDeliveredBase(seeded);
+    const racing = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      beforeTerminalWorkspaceCleanup: async () => {
+        await runGit(seeded.repoRoot, ["update-ref", "refs/remotes/origin/main", "main"]);
+        expect((await svc.getCloseReadiness(seeded.executionWorkspaceId))?.deliveryState).toBe("unmerged");
+      },
+    });
+    const sweep = await racing.sweepTerminalWorkspaces();
+    expect(sweep.archived).toBe(0);
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("retain primary path of another project in same company", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await trackDeliveredBase(seeded);
+    const otherProject = randomUUID();
+    await db.insert(projects).values({id: otherProject, companyId: seeded.companyId, name: "Other project", status: "in_progress"});
+    await db.insert(projectWorkspaces).values({companyId: seeded.companyId, projectId: otherProject, name: "Primary", isPrimary: true, cwd: seeded.worktreePath});
+    const sweep = await svc.sweepTerminalWorkspaces();
+    expect(sweep.archived).toBe(0);
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
   it("refuses cleanup when the worktree changes after delivery assessment", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db.update(executionWorkspaces).set({

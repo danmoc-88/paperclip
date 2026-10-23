@@ -1518,6 +1518,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ) {
       throw new Error("Refusing terminal workspace cleanup because the git worktree changed after delivery was verified");
     }
+    // HEAD can stay unchanged while the tracked base moves or its configuration
+    // changes. Revalidate delivery before each destructive action as well.
+    const delivery = await assessDelivery(workspace, current.git);
+    if (
+      !delivery.sourceIssueTerminal
+      || !delivery.subtreeTerminal
+      || !["merged_by_ancestry", "merged_via_pr"].includes(delivery.deliveryState)
+      || await workspaceHasActiveRun(workspace)
+    ) {
+      throw new Error("Refusing terminal workspace cleanup because delivery or terminal readiness changed");
+    }
   }
 
   async function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
@@ -1543,7 +1554,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     if (!cwd) return false;
     const realCwd = await fs.realpath(cwd).catch(() => path.resolve(cwd));
     const projectPaths = await db.select({ cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
-      .where(and(eq(projectWorkspaces.companyId, workspace.companyId), eq(projectWorkspaces.projectId, workspace.projectId)));
+      .where(eq(projectWorkspaces.companyId, workspace.companyId));
     for (const project of projectPaths) {
       if (!project.cwd) continue;
       const primary = await fs.realpath(project.cwd).catch(() => path.resolve(project.cwd!));
