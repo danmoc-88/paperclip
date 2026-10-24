@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
+  attachChildStdinErrorHandler,
   readPaperclipRuntimeSkillEntries,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -910,6 +912,64 @@ describe("runChildProcess", () => {
         }
       }
     },
+  );
+});
+
+describe("child stdin pipe errors (SAK-2143)", () => {
+  it("swallows EPIPE on a child stdin stream and forwards other errors to onError", () => {
+    const stream = new Writable({ write: (_chunk, _encoding, callback) => callback() });
+    const seen: unknown[] = [];
+    attachChildStdinErrorHandler(stream, (err) => seen.push(err));
+
+    // Without the handler an `error` event on a Socket with no listener is
+    // rethrown by Node and kills the process. The handler must absorb EPIPE.
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    expect(() => stream.emit("error", epipe)).not.toThrow();
+    expect(seen).toEqual([]);
+
+    const destroyed = Object.assign(new Error("stream destroyed"), {
+      code: "ERR_STREAM_DESTROYED",
+    });
+    expect(() => stream.emit("error", destroyed)).not.toThrow();
+    expect(seen).toEqual([]);
+
+    // Any other stdin failure is still observable, just not fatal.
+    const other = Object.assign(new Error("disk gone"), { code: "EIO" });
+    expect(() => stream.emit("error", other)).not.toThrow();
+    expect(seen).toEqual([other]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps the process alive when the child closes stdin before the write lands",
+    async () => {
+      // The child closes its stdin file descriptor and stays alive, so the
+      // parent's write of a >64 KiB payload hits a pipe with no reader and
+      // emits an asynchronous EPIPE on the stdin Socket. Without the stdin
+      // error handler that unhandled `error` event would take down the whole
+      // process (the SAK-2143 crash). The run must instead finish normally.
+      const payload = "x".repeat(256 * 1024);
+      let uncaught: unknown = null;
+      const onUncaught = (err: unknown) => {
+        uncaught = err;
+      };
+      process.once("uncaughtException", onUncaught);
+      try {
+        const result = await runChildProcess(randomUUID(), "sh", ["-c", "exec 0<&-; sleep 1"], {
+          cwd: process.cwd(),
+          env: {},
+          stdin: payload,
+          timeoutSec: 10,
+          graceSec: 2,
+          onLog: async () => {},
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(uncaught).toBeNull();
+      } finally {
+        process.removeListener("uncaughtException", onUncaught);
+      }
+    },
+    15000,
   );
 });
 

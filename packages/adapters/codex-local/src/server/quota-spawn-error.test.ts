@@ -17,7 +17,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-import { fetchCodexQuota, getQuotaWindows } from "./quota.js";
+import { fetchCodexQuota, fetchCodexRpcQuota, getQuotaWindows } from "./quota.js";
 
 function createChildThatErrorsOnMicrotask(err: Error): ChildProcess {
   const child = new EventEmitter() as ChildProcess;
@@ -34,6 +34,25 @@ function createChildThatErrorsOnMicrotask(err: Error): ChildProcess {
     child.emit("error", err);
   });
   return child;
+}
+
+// A child whose stdin is a real EventEmitter, so a test can emit a stdin
+// `error` event the way the runtime emits EPIPE/EIO on the socket.
+function createChildWithLiveStdin(): { child: ChildProcess; emitStdinError: (err: Error) => void } {
+  const child = new EventEmitter() as ChildProcess;
+  const stdin = new EventEmitter() as EventEmitter & {
+    write: (chunk: string) => boolean;
+    end: () => void;
+  };
+  stdin.write = () => true;
+  stdin.end = () => {};
+  Object.assign(child, {
+    stdout: Object.assign(new EventEmitter(), { setEncoding: () => {} }),
+    stderr: Object.assign(new EventEmitter(), { setEncoding: () => {} }),
+    stdin,
+    kill: vi.fn(),
+  });
+  return { child, emitStdinError: (err) => stdin.emit("error", err) };
 }
 
 describe("CodexRpcClient spawn failures", () => {
@@ -220,5 +239,37 @@ describe("CodexRpcClient spawn failures", () => {
     expect(result.windows).toEqual([]);
     expect(result.error).toContain("Codex app-server");
     expect(result.error).toContain("spawn codex ENOENT");
+  });
+
+  it("rejects in-flight requests on a non-EPIPE stdin error instead of waiting for the timeout", async () => {
+    const { child, emitStdinError } = createChildWithLiveStdin();
+    mockSpawn.mockImplementation(() => child);
+
+    // The constructor attaches the stdin error handler synchronously and
+    // initialize() registers its request synchronously, so emitting right
+    // after the call reaches the pending request before the 6s timer fires.
+    const pending = fetchCodexRpcQuota();
+    emitStdinError(Object.assign(new Error("codex stdin EIO"), { code: "EIO" }));
+
+    await expect(pending).rejects.toThrow("codex stdin EIO");
+  });
+
+  it("treats an EPIPE stdin error as a closed pipe, not a pending-request failure", async () => {
+    const { child, emitStdinError } = createChildWithLiveStdin();
+    mockSpawn.mockImplementation(() => child);
+
+    const pending = fetchCodexRpcQuota();
+    // EPIPE is swallowed by the handler, so the request stays pending instead
+    // of rejecting with the EPIPE error.
+    emitStdinError(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    // A different stdin error still rejects the in-flight request, which also
+    // releases this test's pending promise.
+    emitStdinError(Object.assign(new Error("codex stdin EIO"), { code: "EIO" }));
+    await expect(pending).rejects.toThrow("codex stdin EIO");
   });
 });
