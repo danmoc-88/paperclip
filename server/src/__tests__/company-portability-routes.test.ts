@@ -1403,4 +1403,23 @@ describe.sequential("company portability routes", () => {
     expect(res.status).toBe(400);
     expect(mockCompanyPortabilityService.importBundle).not.toHaveBeenCalled();
   });
+
+  it.sequential("rejects an oversized import collection before the portability service runs", async () => {
+    const app = await createBoardApp();
+    const oversizedNameOverrides = Object.fromEntries(
+      Array.from({ length: 5_001 }, (_, index) => [`k${index}`, "x"]),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/imports/preview`)
+      .set(TEST_USER_HEADER, "board-user-a")
+      .send({
+        ...importRequest,
+        nameOverrides: oversizedNameOverrides,
+      });
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("at most 5000 entries");
+    expect(mockCompanyPortabilityService.previewImport).not.toHaveBeenCalled();
+  });
 });

@@ -44,6 +44,19 @@ import {
 import { objectWithoutDefaults } from "./partial.js";
 import { questionSetToAskUserQuestionsPayload } from "../question-set.js";
 
+// Leading collection bounds for the issue API. Zod v4 only enforces a size
+// bound before it parses elements when that bound is the first check on the
+// collection (`sizeCaps`), and only from 4.6.6 on. Keep these `.max()` calls
+// ahead of any refine/default so an oversized array fails with one issue and
+// zero element parses. The values are abuse ceilings well above real payloads:
+// a task has a short blocker list and a small label set, and one execution
+// policy has a handful of review stages.
+export const ISSUE_DEPENDENCY_LIMIT = 100;
+export const ISSUE_LABEL_LIMIT = 100;
+export const ISSUE_EXECUTION_STAGE_LIMIT = 50;
+export const ISSUE_EXECUTION_STAGE_PARTICIPANT_LIMIT = 50;
+export const ISSUE_COMPLETED_STAGE_LIMIT = ISSUE_EXECUTION_STAGE_LIMIT * 2;
+
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
   "awaiting_decision",
@@ -386,7 +399,10 @@ export const issueExecutionStageSchema = z.object({
   id: z.string().guid().optional(),
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   approvalsNeeded: z.literal(1).optional().default(1),
-  participants: z.array(issueExecutionStageParticipantSchema).default([]),
+  participants: z
+    .array(issueExecutionStageParticipantSchema)
+    .max(ISSUE_EXECUTION_STAGE_PARTICIPANT_LIMIT)
+    .default([]),
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({
@@ -436,7 +452,10 @@ export const issueExecutionMonitorPolicySchema = z.object({
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
-  stages: z.array(issueExecutionStageSchema).default([]),
+  stages: z
+    .array(issueExecutionStageSchema)
+    .max(ISSUE_EXECUTION_STAGE_LIMIT)
+    .default([]),
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
@@ -510,7 +529,10 @@ export const issueExecutionStateSchema = z.object({
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
-  completedStageIds: z.array(z.string().guid()).default([]),
+  completedStageIds: z
+    .array(z.string().guid())
+    .max(ISSUE_COMPLETED_STAGE_LIMIT)
+    .default([]),
   lastDecisionId: z.string().guid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
@@ -722,7 +744,10 @@ const createIssueBaseSchema = z.object({
   projectWorkspaceId: z.string().guid().optional().nullable(),
   goalId: z.string().guid().optional().nullable(),
   parentId: z.string().guid().optional().nullable(),
-  blockedByIssueIds: z.array(z.string().guid()).optional(),
+  blockedByIssueIds: z
+    .array(z.string().guid())
+    .max(ISSUE_DEPENDENCY_LIMIT)
+    .optional(),
   unblockDescriptor: z
     .object({
       owner: z.union([
@@ -761,7 +786,7 @@ const createIssueBaseSchema = z.object({
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema
     .optional()
     .nullable(),
-  labelIds: z.array(z.string().guid()).optional(),
+  labelIds: z.array(z.string().guid()).max(ISSUE_LABEL_LIMIT).optional(),
   watchdogDiscovery: z
     .object({
       kind: z.enum(ISSUE_WATCHDOG_DISCOVERY_KINDS),
@@ -954,7 +979,10 @@ export type StalledReviewDecision = z.infer<typeof stalledReviewDecisionSchema>;
 
 export const checkoutIssueSchema = z.object({
   agentId: z.string().guid(),
-  expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
+  expectedStatuses: z
+    .array(z.enum(ISSUE_STATUSES))
+    .nonempty()
+    .max(ISSUE_STATUSES.length),
 });
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
