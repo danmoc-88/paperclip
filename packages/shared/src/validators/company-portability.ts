@@ -15,9 +15,10 @@ import { routineVariableSchema } from "./routine.js";
 // the collection (4.6.6+), so these `.max()` calls stay ahead of any
 // default/optional and the typed records use a pre-parse key count.
 //
-// The ceilings are abuse guards, not product limits: every one is far below the
-// element count the 64 MiB body cap could carry at the smallest element size, so
-// a package that fits the existing body cap is unaffected.
+// The ceilings are abuse guards, not derived product limits. Each one is set
+// well above a typical package, but an unusually large package can exceed an
+// entry-count ceiling while still fitting the body cap. The import path
+// validates the count itself and reports it as a validation error.
 export const PORTABILITY_MANIFEST_COLLECTION_LIMIT = 50_000;
 export const PORTABILITY_ENTITY_COLLECTION_LIMIT = 5_000;
 export const PORTABILITY_ROUTINE_COLLECTION_LIMIT = 1_000;
