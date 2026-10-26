@@ -235,6 +235,15 @@ class LocalRunnerController implements LocalRunnerRunHandle {
     });
     this.#process.on("error", (error) => this.#fail(error));
     this.#process.on("exit", (code, signal) => this.#finish(code, signal));
+    // The runner can exit while a command write is in flight; the failing write
+    // then emits an EPIPE `error` event on the stdin socket. Without a listener
+    // that unhandled event would crash the host process. EPIPE is a closed pipe;
+    // the write callback still rejects the individual command (SAK-2143).
+    this.#process.stdin.on("error", (error: Error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
+      this.#fail(error);
+    });
   }
 
   static async start(options: StartLocalRunnerScenarioOptions): Promise<LocalRunnerController> {

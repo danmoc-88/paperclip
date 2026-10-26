@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,10 +29,11 @@ function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: danmoc-88\/paperclip\/\.github\/workflows\/pr-trusted\.yml@[0-9a-f]{40}\s*$/m,
+    "pr.yml must call this fork's trusted workflow pinned to an immutable commit SHA",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
+  // CI executes the pinned SHA's copy of the workflow. Keep the local file in
+  // sync with the pin so proposed workflow changes are still validated here.
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
@@ -157,8 +158,39 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml calls the fork's pinned trusted PR workflow", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
+});
+
+test("pr.yml pins the trusted workflow to an immutable SHA so fork CI cannot drift from upstream master", () => {
+  // Regression for the drift that blocked the fork: pr.yml followed
+  // paperclipai/paperclip/.github/workflows/pr-trusted.yml@master, which gained
+  // gates for files this fork does not carry. A moving upstream ref must never
+  // come back; the caller has to stay on an immutable SHA of this fork's own
+  // workflow.
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  const calls = [
+    ...caller.matchAll(
+      /^\s+uses: (?<owner>[^/\s]+)\/(?<repo>[^/\s]+)\/\.github\/workflows\/pr-trusted\.yml@(?<ref>[^\s#]+)\s*$/gm,
+    ),
+  ];
+  assert.equal(calls.length, 1, "pr.yml must call exactly one reusable pr-trusted.yml");
+
+  const [{ groups }] = calls;
+  assert.equal(
+    `${groups.owner}/${groups.repo}`,
+    "danmoc-88/paperclip",
+    "the trusted workflow must come from this fork, not upstream's moving master",
+  );
+  assert.match(
+    groups.ref,
+    /^[0-9a-f]{40}$/,
+    `the trusted workflow ref must be a full commit SHA, not the moving ref "${groups.ref}"`,
+  );
+  assert.ok(
+    existsSync(trustedPrWorkflow),
+    "the pinned trusted workflow file must exist in this repository",
+  );
 });
 
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {

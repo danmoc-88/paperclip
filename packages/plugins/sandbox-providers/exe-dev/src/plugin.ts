@@ -633,6 +633,17 @@ async function runSshCommand(
       });
 
       if (options.stdin != null && child.stdin) {
+        // A child that exits before the payload is written closes the pipe;
+        // the failing write then emits an EPIPE `error` event that would crash
+        // the host process. EPIPE is a closed pipe; any other stdin error is
+        // surfaced by rejecting this command (SAK-2143).
+        child.stdin.on("error", (error: Error) => {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
+          if (timer) clearTimeout(timer);
+          if (killTimer) clearTimeout(killTimer);
+          reject(error);
+        });
         child.stdin.write(options.stdin);
         child.stdin.end();
       }

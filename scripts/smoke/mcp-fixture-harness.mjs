@@ -86,6 +86,14 @@ class StdioFixtureClient {
       cwd: repoRoot,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // A fixture that exits before a request is written makes the next
+    // `this.process.stdin.write` emit an asynchronous EPIPE on the socket.
+    // Without a listener the unhandled `error` event would end this harness
+    // process (SAK-2143); fail the in-flight requests instead.
+    this.process.stdin.on("error", (error) => {
+      for (const pending of this.pending.values()) pending.reject(error);
+      this.pending.clear();
+    });
     const rl = createInterface({ input: this.process.stdout });
     rl.on("line", (line) => {
       let response;

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { attachChildStdinErrorHandler } from "./child-stdin.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -4678,6 +4679,8 @@ export async function ensureCommandResolvable(
   throw new Error(`Command not found in PATH: "${command}"`);
 }
 
+export { attachChildStdinErrorHandler };
+
 export async function runChildProcess(
   runId: string,
   command: string,
@@ -4928,6 +4931,9 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          attachChildStdinErrorHandler(stdin, (err) =>
+            onLogError(err, runId, "failed to write to child stdin"),
+          );
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
