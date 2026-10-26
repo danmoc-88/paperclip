@@ -30,8 +30,9 @@ durable mechanism is a `pnpm` patch of the SDK reader.
 
 ## The change
 
-`patches/@cursor__sdk@1.0.28.patch` (registered in `package.json`,
-`pnpm-workspace.yaml`, and `pnpm-lock.yaml`) edits `dist/esm/642.js`:
+`patches/@cursor__sdk@1.0.28.patch` (registered in `package.json` and
+`pnpm-workspace.yaml`) edits `dist/esm/642.js`. The repository does not accept
+committed `pnpm-lock.yaml` changes; CI resolves the stale lockfile inline.
 
 - it tracks the raw bytes accumulated since the last completed event;
 - it rejects one event frame whose UTF-8 byte length exceeds `MAX` before
