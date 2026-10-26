@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { spawn } from "node:child_process";
+import { attachChildStdinErrorHandler } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -256,6 +257,13 @@ export function boardChatRoutes(
         PAPERCLIP_COMPANY_ID: companyId,
       },
     });
+
+    // A `claude` CLI that exits before the prompt is written closes the pipe;
+    // the write then emits EPIPE on the stdin socket. Without a handler that
+    // unhandled `error` event would crash the whole server (SAK-2143).
+    attachChildStdinErrorHandler(proc.stdin, (err) =>
+      console.error("[board/chat/stream stdin error]", err),
+    );
 
     let fullResponse = "";
     let streamedViaDelta = false;

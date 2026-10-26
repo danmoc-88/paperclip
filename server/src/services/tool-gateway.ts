@@ -18,6 +18,7 @@ import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import { logger } from "../middleware/logger.js";
 import { spawn } from "node:child_process";
+import { attachChildStdinErrorHandler } from "@paperclipai/adapter-utils/server-utils";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   and,
@@ -5051,6 +5052,15 @@ export function createToolGatewayService(
       env: input.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // A local stdio MCP server that exits before a request is written closes the
+    // pipe; the write then emits EPIPE on the stdin socket. Without a handler
+    // that unhandled `error` event would crash the whole server (SAK-2143).
+    attachChildStdinErrorHandler(child.stdin, (err) =>
+      logger.warn(
+        { err, connectionId: input.connection.id },
+        "failed to write to local stdio MCP stdin",
+      ),
+    );
     let stdout = "";
     let stderr = "";
     let nextId = 1;

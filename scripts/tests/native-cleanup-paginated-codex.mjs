@@ -51,6 +51,17 @@ async function withServer(home, callback) {
   child.stderr.on("data", () => {});
   const pending = new Map();
   let next = 0;
+  // The provider can exit while a request write is in flight; the failing write
+  // then emits an asynchronous EPIPE on the stdin socket. Without a listener the
+  // unhandled `error` event would end this qualification script (SAK-2143); fail
+  // the in-flight requests instead.
+  child.stdin.on("error", (error) => {
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    pending.clear();
+  });
   createInterface({ input: child.stdout }).on("line", (line) => {
     const frame = JSON.parse(line);
     if (frame.id != null && pending.has(frame.id)) {

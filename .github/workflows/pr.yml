@@ -10,6 +10,16 @@ permissions:
 
 jobs:
   ci:
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # This fork must not call the trusted workflow on upstream's moving
+    # `master`. Upstream gained gates that need files this fork's tree does not
+    # carry (scripts/docker-deps-postinstall.test.mjs,
+    # scripts/docker-compose-secrets.test.mjs, scripts/server-boot-smoke.sh, and
+    # a @paperclipai/server `build:runtime` script), so every pull request went
+    # red on files that are simply absent here.
+    #
+    # Call this fork's own trusted workflow at an immutable commit SHA instead,
+    # exactly as the two-step rollout in .github/workflows/pr-trusted.yml
+    # describes: the active CI definition cannot drift from that file, and it
+    # always matches the code in this repository. Bump the SHA in the same PR
+    # that changes pr-trusted.yml.
+    uses: danmoc-88/paperclip/.github/workflows/pr-trusted.yml@289929806875ad35726763020569e118343257cf

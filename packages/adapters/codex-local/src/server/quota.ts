@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { attachChildStdinErrorHandler } from "@paperclipai/adapter-utils/server-utils";
 import {
   classifyCodexAuthRefreshFailure,
   type CodexAuthRefreshFailureClass,
@@ -480,6 +481,20 @@ class CodexRpcClient {
   private stderr = "";
 
   constructor() {
+    // The codex app-server can exit between the spawn and the first request;
+    // the write then emits EPIPE on the stdin socket. Without a handler that
+    // unhandled `error` event would crash the whole server (SAK-2143).
+    // EPIPE is a closed pipe and is swallowed, but any other stdin error (for
+    // example EIO) must reject the in-flight requests so the caller fails fast
+    // instead of waiting for the per-request timeout.
+    attachChildStdinErrorHandler(this.proc.stdin, (err) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      for (const request of this.pending.values()) {
+        clearTimeout(request.timer);
+        request.reject(error);
+      }
+      this.pending.clear();
+    });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
