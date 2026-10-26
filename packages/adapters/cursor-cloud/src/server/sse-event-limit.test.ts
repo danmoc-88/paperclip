@@ -169,6 +169,18 @@ describe("cursor-cloud SSE event byte limit (real transport)", () => {
     expect(collected.messages[0]?.type).toBe("assistant");
   });
 
+  it("delivers a valid at-limit event when the blank-line separator is split across chunks", async () => {
+    const frame = assistantFrameExactBytes(EVENT_BYTE_LIMIT);
+    const head = encoder.encode(`${frame}\n`);
+    const tail = encoder.encode(`\n${resultFrame()}`);
+    const collected = await collectRun([head, tail]);
+
+    expect(collected.status).toBe("finished");
+    expect(collected.errorCode).toBeUndefined();
+    expect(collected.messages).toHaveLength(1);
+    expect(collected.messages[0]?.type).toBe("assistant");
+  });
+
   it("rejects an event one byte over the limit before JSON.parse and without retry", async () => {
     const frame = assistantFrameExactBytes(EVENT_BYTE_LIMIT + 1);
     const collected = await collectRun([encoder.encode(`${frame}\n\n`)]);
@@ -194,13 +206,86 @@ describe("cursor-cloud SSE event byte limit (real transport)", () => {
     expect(collected.streamFetches).toBe(1);
   });
 
+  it("rejects a fragmented oversized multi-line event, cancels the source, and never parses it", async () => {
+    let streamFetches = 0;
+    let cancelCount = 0;
+    const parsedSizes: number[] = [];
+    const originalParseLocal = JSON.parse;
+    JSON.parse = ((text: string, reviver?: (key: string, value: unknown) => unknown) => {
+      if (typeof text === "string") parsedSizes.push(Buffer.byteLength(text, "utf8"));
+      return originalParseLocal(text, reviver as never);
+    }) as typeof JSON.parse;
+
+    // One event whose joined `data:` payload is well over the limit.
+    const line = `data: ${"a".repeat(64 * 1024)}`;
+    const body = `event: assistant\n${Array.from({ length: 24 }, () => line).join("\n")}\n\n${resultFrame()}`;
+    const encoded = encoder.encode(body);
+    const fragments: Uint8Array[] = [];
+    for (let i = 0; i < encoded.length; i += 16 * 1024) fragments.push(encoded.slice(i, i + 16 * 1024));
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/stream")) {
+        streamFetches += 1;
+        // Left open on purpose so the reader's `cancel()` reaches the source.
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const fragment of fragments) controller.enqueue(fragment);
+          },
+          cancel() {
+            cancelCount += 1;
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url.endsWith("/cancel")) return jsonResponse({ id: RUN_ID });
+      if (/\/v1\/agents\/[^/]+\/runs\/[^/]+$/.test(url)) {
+        return jsonResponse({
+          id: RUN_ID,
+          agentId: AGENT_ID,
+          status: "RUNNING",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      return jsonResponse({});
+    }) as typeof fetch;
+
+    const run = await Agent.getRun(RUN_ID, {
+      runtime: "cloud",
+      agentId: AGENT_ID,
+      apiKey: "test-key",
+    });
+    try {
+      for await (const _message of run.stream()) {
+        // Drain until the reader aborts on the oversized frame.
+      }
+    } catch {
+      // Stream failures surface through `run.wait()` as the run status.
+    }
+    const result = await run.wait();
+
+    expect(result.status).toBe("error");
+    expect(result.error?.code).toBe("sse_event_too_large");
+    // One stream request: the non-retryable error stops the retry loop.
+    expect(streamFetches).toBe(1);
+    // The reader releases the source stream exactly once on the way out.
+    expect(cancelCount).toBe(1);
+    // No fragment of the oversized payload reached JSON.parse.
+    expect(parsedSizes.every((size) => size < 100_000)).toBe(true);
+  });
+
   it("decodes a UTF-8 character split across two chunks", async () => {
-    const text = "café 😀 漢字";
+    const text = "é😀漢字 café";
     const frame = assistantFrame(JSON.stringify({ text }));
     const encoded = encoder.encode(`${frame}${resultFrame()}`);
     const prefixBytes = Buffer.byteLength(`event: assistant\ndata: {"text":"`, "utf8");
-    // Split inside the first multibyte character so the decoder must buffer it.
+    // The first character of `text` is multibyte, so this cut lands inside it.
     const splitAt = prefixBytes + 1;
+    // Prove the cut is inside a multibyte UTF-8 sequence: a lead byte followed
+    // by a continuation byte. The previous test cut after an ASCII character.
+    expect(encoded[prefixBytes]! & 0xc0).toBe(0xc0);
+    expect(encoded[prefixBytes + 1]! & 0xc0).toBe(0x80);
     const collected = await collectRun([encoded.slice(0, splitAt), encoded.slice(splitAt)]);
 
     expect(collected.status).toBe("finished");

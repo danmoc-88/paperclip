@@ -37,7 +37,17 @@ committed `pnpm-lock.yaml` changes; CI resolves the stale lockfile inline.
 - it tracks the raw bytes accumulated since the last completed event;
 - it rejects one event frame whose UTF-8 byte length exceeds `MAX` before
   `JSON.parse`;
-- it rejects the pending (unterminated) accumulation once it exceeds `MAX`.
+- it rejects the pending (unterminated) accumulation once its content exceeds
+  `MAX`.
+
+The pending-accumulation guard measures the event content, not the framing. The
+accumulator holds no `\n\n`, so it is an event-content prefix plus at most the
+single `\n` that may begin the blank-line separator. That trailing newline is not
+charged to the content budget. This matters when a real at-limit event and its
+`\n\n` separator arrive in different network chunks: an earlier revision counted
+the separator byte, so an event of exactly `MAX` bytes was rejected as soon as
+the first `\n` of the separator landed in a separate chunk. The guard now accepts
+that split while still rejecting a frame one byte over `MAX`.
 
 `MAX` is `1048576` bytes (1 MiB). It matches the SDK's own 1 MiB buffer limits
 and stays far below the 10 MiB manifest cap in `357.js`, which is a different,
@@ -57,6 +67,15 @@ and still honours `AbortSignal`.
 
 - It does not cap the number of events, the total size of a run, or the count of
   collection elements inside a frame that is under the limit.
+- It bounds one event's bytes, not peak memory. The reader decodes a whole
+  network chunk and appends it to the accumulator before the check runs, so peak
+  resident memory for the pending event is the limit plus the largest decoded
+  chunk, not exactly the limit.
+- A bounded `JSON.parse` input is not proof that `InteractionUpdateSchema`
+  validation is resistant to deeply nested collections inside a frame that stays
+  under the limit; it only bounds the input the schema sees. A separate
+  collection/depth guard, if needed, must run before element validation rather
+  than as a `.max()` on the parsed arrays.
 - It does not prove which `@cursor/sdk` version a running process uses, and it is
   not evidence of exploitation.
 - It patches the ESM build only. The server uses ESM (`@cursor/sdk` `import`
@@ -71,8 +90,10 @@ integration test are removed together. Rollback is a separate pull request.
 ## Tests
 
 `packages/adapters/cursor-cloud/src/server/sse-event-limit.test.ts` drives the
-real SDK reader over a synthetic stream: at the limit and one byte over, UTF-8
-split across chunks, one large chunk and many small chunks, multi-line `data:`,
-an unterminated event over the limit, several events in one chunk, and
-cancellation. The fetch mock is test-only; the SDK has no transport injection
-point.
+real SDK reader over a synthetic stream: at the limit and one byte over, an
+at-limit event whose `\n\n` separator is split across chunks, UTF-8 split inside
+a multibyte character, one large chunk and many small chunks, multi-line `data:`,
+an unterminated event over the limit, a fragmented oversized multi-line event
+(asserting one stream request, one source cancellation, and that no oversized
+payload reaches `JSON.parse`), several events in one chunk, and cancellation.
+The fetch mock is test-only; the SDK has no transport injection point.
