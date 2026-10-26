@@ -67,15 +67,20 @@ and still honours `AbortSignal`.
 
 - It does not cap the number of events, the total size of a run, or the count of
   collection elements inside a frame that is under the limit.
-- It bounds one event's bytes, not peak memory. The reader decodes a whole
-  network chunk and appends it to the accumulator before the check runs, so peak
-  resident memory for the pending event is the limit plus the largest decoded
-  chunk, not exactly the limit.
+- It bounds one event's input bytes, not process peak memory. The reader decodes a
+  whole network chunk and appends it to the accumulator before the check runs, so
+  the accumulator can briefly hold up to roughly the limit plus the largest
+  decoded chunk. That figure describes the accumulator input only; it is not a
+  formula for resident set size. It ignores V8 string and object overhead, the
+  decoded string copy, garbage-collection timing, concurrent runs, and every other
+  allocation in the process. Do not read it as a memory-usage prediction.
 - A bounded `JSON.parse` input is not proof that `InteractionUpdateSchema`
   validation is resistant to deeply nested collections inside a frame that stays
-  under the limit; it only bounds the input the schema sees. A separate
-  collection/depth guard, if needed, must run before element validation rather
-  than as a `.max()` on the parsed arrays.
+  under the limit; it only bounds the input the schema sees. A small input byte
+  count says nothing about validation depth, stack use, or traversal cost, so it
+  is not evidence of resistance to nesting. A separate collection/depth guard, if
+  needed, must run before element validation rather than as a `.max()` on the
+  parsed arrays.
 - It does not prove which `@cursor/sdk` version a running process uses, and it is
   not evidence of exploitation.
 - It patches the ESM build only. The server uses ESM (`@cursor/sdk` `import`
