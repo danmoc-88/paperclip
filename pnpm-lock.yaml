@@ -36,9 +36,6 @@ patchedDependencies:
   '@chat-adapter/telegram@4.39.0':
     hash: wl4uiwewrapxf5u6ksnm7elv44
     path: patches/@chat-adapter__telegram@4.39.0.patch
-  '@cursor/sdk@1.0.28':
-    hash: rmn2mhuceun6pcr4yz6ldns3qy
-    path: patches/@cursor__sdk@1.0.28.patch
   '@discordjs/ws@1.2.3':
     hash: vbylpnnxt5av2zdnuqmf6hjyjy
     path: patches/@discordjs__ws@1.2.3.patch
@@ -224,7 +221,7 @@ importers:
     dependencies:
       '@cursor/sdk':
         specifier: ^1.0.28
-        version: 1.0.28(patch_hash=rmn2mhuceun6pcr4yz6ldns3qy)
+        version: 1.0.28
       '@paperclipai/adapter-utils':
         specifier: workspace:*
         version: link:../../adapter-utils
@@ -9934,7 +9931,7 @@ snapshots:
   '@cursor/sdk-win32-x64@1.0.28':
     optional: true
 
-  '@cursor/sdk@1.0.28(patch_hash=rmn2mhuceun6pcr4yz6ldns3qy)':
+  '@cursor/sdk@1.0.28':
     dependencies:
       '@bufbuild/protobuf': 1.10.0
       '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.0)
