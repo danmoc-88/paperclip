@@ -5,7 +5,7 @@ import { runtimeConnectionIntentRoutes } from "../routes/connection-intents.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { errorHandler } from "../middleware/index.js";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -35,6 +35,8 @@ import {
   acceptSteeredIdentity,
 } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { connectionIntentService } from "../services/connection-intents.js";
+import type { RuntimeToolsTokenClaims } from "../runtime-tools-token.js";
 import {
   filterResolvedGitHubConnectionsForRun,
   resolveManagedGitHubIdentitySelection,
@@ -210,6 +212,85 @@ const support = await getEmbeddedPostgresTestSupport();
       });
       await acceptSteeredIdentity(db, context!);
     }
+    /** Bind the seeded task to the agent and build runtime tool claims for it. */
+    async function taskBoundClaims(
+      input: Awaited<ReturnType<typeof seed>>,
+      responsibleUser: string,
+    ): Promise<RuntimeToolsTokenClaims> {
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: input.agentId })
+        .where(
+          and(
+            eq(issues.id, input.issueId),
+            eq(issues.companyId, input.companyId),
+          ),
+        );
+      return {
+        sub: input.agentId,
+        company_id: input.companyId,
+        run_id: input.runId,
+        responsible_user_id: responsibleUser,
+        scope: "connection_intents",
+        iat: 1,
+        exp: 2,
+        instance_id: "test",
+      };
+    }
+    it("discloses the connected managed shell identity while tool access stays needs_user_action", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      const claims = await taskBoundClaims(input, "A");
+      // The runtime credential path resolves the same grant without any tool
+      // permission, so shell git and gh work while the catalog reports the
+      // tool-layer gap instead of sending the agent to request a Connect card.
+      expect(
+        await resolveGitHubOperationCredentials(db, input),
+      ).toMatchObject({
+        status: "available",
+        source: "personal",
+        login: "A",
+        authenticationMode: "managed",
+      });
+      const search = await connectionIntentService(db).search(claims, "github");
+      const github = search.results.find(
+        (result) => result.service === "github",
+      );
+      expect(github).toMatchObject({
+        state: "needs_user_action",
+        reason:
+          "Managed GitHub shell access is connected for this run (git and gh receive the run identity); these results only report GitHub MCP tool access",
+      });
+      expect(search.instruction).toBe(
+        "Managed GitHub shell access (git and gh) is already connected for this run: use git and gh directly for repository work instead of creating a connection request. Call connection_request with service github only if the task needs the GitHub MCP tools.",
+      );
+    });
+    it("does not disclose the managed shell identity without an install for this agent", async () => {
+      const input = await seed();
+      const granted = await grant(input, "A");
+      await db.delete(toolConnectionInstalls).where(
+        and(
+          eq(toolConnectionInstalls.companyId, input.companyId),
+          eq(toolConnectionInstalls.connectionId, granted.connectionId),
+        ),
+      );
+      const claims = await taskBoundClaims(input, "A");
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+        status: "absent",
+        env: {},
+      });
+      const search = await connectionIntentService(db).search(claims, "github");
+      const github = search.results.find(
+        (result) => result.service === "github",
+      );
+      expect(github).toMatchObject({
+        state: "needs_user_action",
+        reason: "Review identity and access for this agent",
+      });
+      expect(search.instruction).toBe(
+        "Call connection_request with the returned service identifier. The user already asked to connect: do not ask a generic confirmation or imitate the setup card. Follow the returned instruction.",
+      );
+    });
     it("resolves A → B → A without retaining tokens, and records only redacted diagnostics", async () => {
       const input = await seed();
       await grant(input, "A");

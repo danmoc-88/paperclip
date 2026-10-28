@@ -51,6 +51,16 @@ type ConnectionRunClaims = Pick<RuntimeToolsTokenClaims, "sub" | "company_id" | 
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
+// GitHub's managed connection serves two channels from one identity: MCP tools
+// gated by per-agent tool permissions, and shell git/gh credentials brokering
+// the same grant without them. The catalog deliberately reports tool-layer
+// readiness, so a shell-only task must learn from the result that the identity
+// is already connected instead of requesting a redundant Connect card.
+const MANAGED_GITHUB_SHELL_REASON =
+  "Managed GitHub shell access is connected for this run (git and gh receive the run identity); these results only report GitHub MCP tool access";
+const MANAGED_GITHUB_SHELL_INSTRUCTION =
+  "Managed GitHub shell access (git and gh) is already connected for this run: use git and gh directly for repository work instead of creating a connection request. Call connection_request with service github only if the task needs the GitHub MCP tools.";
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -307,6 +317,18 @@ export function connectionIntentService(db: Db) {
     return activeOrganization.length === 1 ? usable(activeOrganization[0]!.connection) : null;
   }
 
+  /**
+   * Read-only discovery mirror of the runtime credential broker's gate. A
+   * resolved grant means the run's managed GitHub identity is connected; it
+   * never contacts GitHub, refreshes tokens, or reads secret values.
+   */
+  async function managedGitHubShellConnected(companyId: string, agentId: string, responsibleUserId: string | null) {
+    const selection = await resolveManagedGitHubIdentitySelection(db, companyId, {
+      agentId, responsibleUserId,
+    });
+    return Boolean(selection.grant);
+  }
+
   async function administrativeDenial(companyId: string, agentId: string, serviceSlug: string, inventory: Awaited<ReturnType<typeof connectionInventory>>) {
     const effective = await access.getEffectiveProfilesForAgent(companyId, agentId);
     const installed = effective.installedConnections.filter((connection) => sourceSlugForConnection(connection, inventory.applicationsById) === serviceSlug);
@@ -385,6 +407,8 @@ export function connectionIntentService(db: Db) {
     const authorizedCatalogs = new Map<string, Awaited<ReturnType<typeof indexedCatalog>>>();
     const discoveryMethods = (app: (typeof APP_STORE_DEFINITIONS)[number]) => getAvailableConnectionMethods(app)
       .filter(method => method.purpose !== "channel" || app.slug === "agentmail" || settings.enableChatConnectors);
+    // Set when the GitHub result discloses the run's connected managed shell identity.
+    let githubShellConnected = false;
     const services = [...APP_STORE_DEFINITIONS.filter(app => discoveryMethods(app).length).map((app) => app.slug),
       ...inventory.connections.filter((connection) =>
         sourceSlugForConnection(connection, inventory.applicationsById)?.startsWith("connection:")
@@ -428,14 +452,23 @@ export function connectionIntentService(db: Db) {
       const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
         responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory });
       const denied = !aiOnly && !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory);
+      const attention = matching.some((connection) => isToolConnectionAttentionHealth(connection.healthStatus));
+      const state = ready ? "ready" : denied ? "unavailable" : !app.available || !app.methods.length ? "unavailable"
+        : matching.length ? "needs_user_action" : "available";
+      let reason = ready ? "Connection is installed and usable by this agent" : denied ? "An administrator has not permitted executable tools for this agent; reconnecting cannot grant that permission" : !app.available ? "Connection is disabled or unavailable"
+        : attention ? "Connection needs attention"
+        : matching.length ? "Review identity and access for this agent" : "Connect this service to continue";
+      if (service === "github" && state === "needs_user_action" && !attention) {
+        // Tool readiness stays per-agent; the shell channel comes from the same
+        // identity without tool permissions. Only a resolved grant discloses it.
+        githubShellConnected = await managedGitHubShellConnected(run.companyId, agent.id, run.responsibleUserId!);
+        if (githubShellConnected) reason = MANAGED_GITHUB_SHELL_REASON;
+      }
       candidates.push({ score, nameScore, item: {
         service, name: app.name, description: app.description ?? null, logoUrl: app.branding.logoUrl ?? null,
         methods: app.methods, source: app.source,
-        state: ready ? "ready" : denied ? "unavailable" : !app.available || !app.methods.length ? "unavailable"
-          : matching.length ? "needs_user_action" : "available",
-        reason: ready ? "Connection is installed and usable by this agent" : denied ? "An administrator has not permitted executable tools for this agent; reconnecting cannot grant that permission" : !app.available ? "Connection is disabled or unavailable"
-          : matching.some((connection) => isToolConnectionAttentionHealth(connection.healthStatus)) ? "Connection needs attention"
-          : matching.length ? "Review identity and access for this agent" : "Connect this service to continue",
+        state,
+        reason,
         connectionId: ready?.id ?? null,
       }});
     }
@@ -481,7 +514,7 @@ export function connectionIntentService(db: Db) {
           aggregatorAlternatives(service.slug, service.name, service)))).flat();
         if (otherRoutes.length) return discoverySuggestions([...ranked(), ...otherRoutes]);
       }
-      return directSearchResult(query, ranked());
+      return directSearchResult(query, ranked(), false, githubShellConnected);
     }
     async function aggregatorAlternatives(targetService: string, targetName: string, publicService?: AggregatorServiceDefinition) {
       const alternatives: ConnectionSearchResultItem[] = [];
@@ -539,7 +572,7 @@ export function connectionIntentService(db: Db) {
         aggregatorAlternatives(service.slug, service.name, service)))).flat();
       if (matches.length) return discoverySuggestions([...ranked(), ...matches]);
     }
-    if (!alternatives.length) return directSearchResult(query, ranked(), true);
+    if (!alternatives.length) return directSearchResult(query, ranked(), true, githubShellConnected);
     const question = aggregatorProviderQuestion(targetService, targetName, alternatives);
     const latest = previous[0];
     if (latest && (latest.status === "pending" || !options.retryProviderChoice)) {
@@ -564,7 +597,7 @@ export function connectionIntentService(db: Db) {
     }
   }
 
-  function directSearchResult(query: string, results: ConnectionSearchResultItem[], suggestions = false): ConnectionsSearchResult {
+  function directSearchResult(query: string, results: ConnectionSearchResultItem[], suggestions = false, githubShellConnected = false): ConnectionsSearchResult {
     return { version: 1, query, results, instruction: !results.length
       ? "No verified connection route was found. Explain that support could not be verified; do not invent a provider route or request unsupported services."
       : !suggestions && isRemoteMcpConnectorId(results[0]!.service) && results[0]!.state !== "unavailable"
@@ -579,6 +612,8 @@ export function connectionIntentService(db: Db) {
           : "Call connection_request with service agentmail to show the inline API-key card. Do not send a setup link or ask for the key in chat. The card creates an inbox for this agent; wait for completion before claiming an email address."
       : results[0]!.methods.every(method => method.purpose && method.purpose !== "tool")
         ? "Choose the method relevant to the task using its purpose and label. Share its setupPath with the user to open the existing channel or AI setup flow. These methods do not use the tool connection_request card. Do not claim tools or an inbox are ready before setup finishes."
+      : results[0]!.service === "github" && results[0]!.state === "needs_user_action" && githubShellConnected
+        ? MANAGED_GITHUB_SHELL_INSTRUCTION
       : results[0]!.state === "ready" ? "Use the installed connection. Do not create another connection request."
       : results[0]!.state === "unavailable" ? "This connection is unavailable or administratively restricted. Explain the reason. Do not bypass it using another provider."
       : "Call connection_request with the returned service identifier. The user already asked to connect: do not ask a generic confirmation or imitate the setup card. Follow the returned instruction." };
