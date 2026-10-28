@@ -688,6 +688,17 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// resumeQueuedRuns() revisits stranded deferred wakes on every scheduler tick.
+// Once a wake has been visited this many times without reaching a terminal
+// status, its receipt is closed instead of being renewed forever. The counter
+// lives in the wake payload, so no schema change is needed.
+export const STRANDED_WAKE_RESUME_ATTEMPT_CAP = 10;
+const STRANDED_WAKE_RESUME_ATTEMPTS_KEY = "_paperclipResumeAttempts";
+// An unpromotable stranded wake is re-stamped as a scan cursor only after this
+// window: the bounded 50-row scan must still cycle through a large stuck set,
+// but renewing every wake on every tick is what kept an undeliverable queue
+// fresh forever.
+export const STRANDED_WAKE_ROTATION_MS = 15 * 60_000;
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
@@ -19614,6 +19625,15 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  function readStrandedResumeAttempts(payload: unknown): number {
+    const value = (payload as Record<string, unknown> | null | undefined)?.[
+      STRANDED_WAKE_RESUME_ATTEMPTS_KEY
+    ];
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : 0;
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19637,13 +19657,29 @@ export function heartbeatService(
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
+    // Owners that cannot run are excluded from the scan: re-delivering to them
+    // fails every tick and renewing their receipts would keep the loop alive
+    // forever, so their rows stay untouched until the owner is invokable again.
+    const strandedInvokabilityByAgent = new Map<
+      string,
+      Promise<Awaited<ReturnType<typeof evaluateAgentInvokabilityFromDb>>>
+    >();
+    const strandedWakeInvokability = (agentId: string) => {
+      const cached = strandedInvokabilityByAgent.get(agentId);
+      if (cached) return cached;
+      const pending = getAgent(agentId).then((agent) => evaluateAgentInvokabilityFromDb(db, agent));
+      strandedInvokabilityByAgent.set(agentId, pending);
+      return pending;
+    };
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
+      .innerJoin(agents, eq(agents.id, agentWakeupRequests.agentId))
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        notInArray(agents.status, [...DIRECT_NON_INVOKABLE_STATUSES]),
         isNull(issues.executionRunId),
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
@@ -19655,14 +19691,50 @@ export function heartbeatService(
     for (const { wake } of strandedQueues) {
       if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+      // An invalid reporting chain blocks delivery just like a pause does, but
+      // it is not a row status, so it is checked here. Leave such a wake alone.
+      const invokability = await strandedWakeInvokability(wake.agentId);
+      if (!invokability.invokable) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      if (!latest || latest.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(latest.status)) {
+        // Nothing this path can promote: advance the scan cursor only after the
+        // rotation window, so one unactionable wake cannot starve the bounded
+        // window while its receipt is renewed on every tick. No attempt is
+        // charged here, because run handoff, not this sweep, owns those wakes.
+        if (Date.now() - wake.updatedAt.getTime() >= STRANDED_WAKE_ROTATION_MS) {
+          await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+            eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ));
+        }
+        continue;
+      }
+      const attempts = readStrandedResumeAttempts(wake.payload);
+      if (attempts >= STRANDED_WAKE_RESUME_ATTEMPT_CAP) {
+        // The wake cannot be promoted or delivered: close the receipt instead of
+        // renewing it on every tick. The saved comments stay in the issue thread.
+        const now = new Date();
+        const [closed] = await db.update(agentWakeupRequests).set({
+          status: "skipped",
+          error: `Stranded wake resume stopped after ${attempts} attempts`,
+          finishedAt: now,
+          updatedAt: now,
+        }).where(and(
+          eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        )).returning({ id: agentWakeupRequests.id });
+        if (closed) {
+          logger.warn({ queueId: wake.id, attempts }, "stranded wake resume attempt budget exhausted");
+        }
+        continue;
+      }
+      await db.update(agentWakeupRequests).set({
+        payload: { ...parseObject(wake.payload), [STRANDED_WAKE_RESUME_ATTEMPTS_KEY]: attempts + 1 },
+        updatedAt: new Date(),
+      }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
-      if (!latest || latest.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(latest.status)) continue;
       const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
         latest.errorCode === "execution_reconciliation_required";
       if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
