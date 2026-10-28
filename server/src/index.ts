@@ -1156,6 +1156,20 @@ async function startServerWithDatabaseTeardown(
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  const periodicWorkInFlight = new Set<string>();
+  // The scheduler fires every `heartbeatSchedulerIntervalMs`, but the heavy
+  // periodic sweeps below routinely take longer than that. Without a guard each
+  // tick starts a fresh copy while the previous one still holds issue row locks
+  // inside a transaction, the copies stack, and the shared connection pool is
+  // exhausted by waiters on one hot row, which starves every DB-backed route.
+  const startPeriodicWork = (key: string, work: () => Promise<unknown>, failureMessage: string) => {
+    if (periodicWorkInFlight.has(key)) return;
+    periodicWorkInFlight.add(key);
+    trackHeartbeatSchedulerWork(Promise.resolve()
+      .then(work)
+      .catch((err: unknown) => logger.error({ err, key }, failureMessage))
+      .finally(() => { periodicWorkInFlight.delete(key); }));
+  };
   const executionControlSweepsInFlight = new Set<string>();
   // Finished runs keep identifiers and routing keys; rendered prompt text and
   // duplicated comment bodies are dropped an hour after the run ends.
@@ -1651,9 +1665,7 @@ async function startServerWithDatabaseTeardown(
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));
-        trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
-          logger.error({ err }, "decision retention sweep failed");
-        }));
+        startPeriodicWork("retention", runRetentionSweep, "decision retention sweep failed");
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -1779,7 +1791,7 @@ async function startServerWithDatabaseTeardown(
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
+          startPeriodicWork("heartbeat_recovery", () => heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
@@ -1823,10 +1835,7 @@ async function startServerWithDatabaseTeardown(
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
               }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic heartbeat recovery failed");
-            }));
+            }), "periodic heartbeat recovery failed");
         }
       })().catch((err) => {
         logger.error({ err }, "heartbeat scheduler tick failed");
