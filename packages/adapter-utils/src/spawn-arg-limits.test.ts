@@ -33,7 +33,10 @@ async function spawnWithSingleArg(bytes: number): Promise<{ started: boolean; er
 // Probe the host instead of assuming 4 KiB pages: on a host with larger
 // pages the 131072-byte boundary is not the real limit and the boundary test
 // would assert something the platform does not do.
-const reproducesMaxArgStrlen = await spawnWithSingleArg(MAX_ARG_STRLEN_BYTES);
+const maxArgStrlenProbe = await spawnWithSingleArg(MAX_ARG_STRLEN_BYTES);
+const reproducesMaxArgStrlen =
+  !maxArgStrlenProbe.started &&
+  maxArgStrlenProbe.error?.message.includes("E2BIG") === true;
 
 describe("spawn argv limits", () => {
   it.runIf(reproducesMaxArgStrlen)(
@@ -57,7 +60,7 @@ describe("spawn argv limits", () => {
       runChildProcess("e2big-sizes", "/bin/true", ["--cwd", "/tmp", oversized], baseOptions),
     ).rejects.toThrow(
       new RegExp(
-        `argv: 4 entries, \\d+ bytes total, largest entry #3 with ${ALWAYS_OVER_LIMIT_BYTES} bytes\\.` +
+        `argv: 4 entries, \\d+ bytes total, largest entry #3 with ${ALWAYS_OVER_LIMIT_BYTES + 1} bytes\\.` +
           ` env: \\d+ entries, \\d+ bytes total, largest "\\w+" with \\d+ bytes\\.`,
       ),
     );

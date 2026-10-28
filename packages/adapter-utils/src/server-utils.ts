@@ -4728,7 +4728,7 @@ function formatE2bigSpawnErrorMessage(
   let largestArgIndex = 0;
   let largestArgBytes = -1;
   argvEntries.forEach((value, index) => {
-    const bytes = Buffer.byteLength(value ?? "", "utf8");
+    const bytes = Buffer.byteLength(value ?? "", "utf8") + 1;
     argvBytes += bytes;
     if (bytes > largestArgBytes) {
       largestArgBytes = bytes;
@@ -4742,7 +4742,7 @@ function formatE2bigSpawnErrorMessage(
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue;
     envEntries += 1;
-    const bytes = Buffer.byteLength(value, "utf8");
+    const bytes = Buffer.byteLength(`${key}=${value}`, "utf8") + 1;
     envBytes += bytes;
     if (bytes > largestEnvBytes) {
       largestEnvBytes = bytes;

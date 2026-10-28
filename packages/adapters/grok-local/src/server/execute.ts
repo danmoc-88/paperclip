@@ -20,9 +20,11 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
+  runAdapterExecutionTargetShellCommand,
   writeAdapterExecutionTargetFile,
   type AdapterExecutionTarget,
 } from "@paperclipai/adapter-utils/execution-target";
+import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
   asBoolean,
   asNumber,
@@ -74,8 +76,10 @@ type GrokPromptFile = {
  *
  * Local runs write into the run scratch directory (cleaned with the run) and
  * fall back to the OS temp directory when no run scratch is set. Remote runs
- * write into the managed runtime directory of the execution target, which the
- * workspace teardown removes with the run.
+ * write into the managed runtime directory of the execution target and the
+ * attempt's cleanup removes the file after each run: SSH teardown excludes
+ * `.paperclip-runtime`, so relying on teardown alone would keep the full
+ * prompt on the host between runs.
  */
 async function writeGrokPromptFile(input: {
   runId: string;
@@ -96,7 +100,17 @@ async function writeGrokPromptFile(input: {
       timeoutSec: input.timeoutSec,
       onLog: input.onLog,
     });
-    return { path: filePath, cleanup: async () => undefined };
+    return {
+      path: filePath,
+      cleanup: async () => {
+        await runAdapterExecutionTargetShellCommand(input.runId, input.executionTarget, `rm -f -- ${shellQuote(filePath)}`, {
+          cwd: input.cwd,
+          env: input.env,
+          timeoutSec: Math.min(input.timeoutSec || 15, 15),
+          onLog: async () => {},
+        }).catch(() => undefined);
+      },
+    };
   }
   const scratchDir = input.env.PAPERCLIP_RUN_SCRATCH_DIR?.trim() ||
     path.join(os.tmpdir(), `paperclip-grok-${input.runId}`);

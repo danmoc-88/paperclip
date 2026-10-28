@@ -24,6 +24,10 @@ const mocks = vi.hoisted(() => {
     resolveCommandForLogsMock: vi.fn(async () => "grok"),
     runProcessMock: vi.fn(),
     writeFileMock: vi.fn(async (..._args: unknown[]) => undefined),
+    runShellMock: vi.fn(async (..._args: unknown[]) => ({
+      exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+      startedAt: new Date().toISOString(),
+    })),
     prepareRuntimeMock: vi.fn(
       async (input: { assets?: Array<{ key: string; localDir: string; followSymlinks?: boolean }> }) => {
         const override = state.prepareRuntimeResult;
@@ -48,6 +52,7 @@ const {
   resolveCommandForLogsMock,
   runProcessMock,
   writeFileMock,
+  runShellMock,
   prepareRuntimeMock,
 } = mocks;
 
@@ -74,10 +79,13 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
     (mocks.runProcessMock as (...args: unknown[]) => unknown)(...args),
   writeAdapterExecutionTargetFile: (...args: unknown[]) =>
     (mocks.writeFileMock as (...args: unknown[]) => unknown)(...args),
+  runAdapterExecutionTargetShellCommand: (...args: unknown[]) =>
+    (mocks.runShellMock as (...args: unknown[]) => unknown)(...args),
 }));
 
 import { execute } from "./execute.js";
 import { resolveManagedGrokHomeDir } from "./grok-home.js";
+import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 
 const tempRoots: string[] = [];
 
@@ -230,6 +238,8 @@ describe("grok_local execute", () => {
     prepareRuntimeMock.mockClear();
     resolveCommandForLogsMock.mockClear();
     runProcessMock.mockReset();
+    writeFileMock.mockClear();
+    runShellMock.mockClear();
   });
 
   afterEach(async () => {
@@ -780,7 +790,8 @@ describe("grok_local execute", () => {
 
         const flagIndex = deliveredArgs.indexOf("--prompt-file");
         expect(flagIndex).toBeGreaterThan(-1);
-        expect(deliveredArgs[flagIndex + 1]).toMatch(
+        const writtenPath = deliveredArgs[flagIndex + 1];
+        expect(writtenPath).toMatch(
           /^\/remote\/workspace\/\.paperclip-runtime\/grok\/grok-prompt-oversized-prompt-remote\.txt$/,
         );
         expect(writeFileMock).toHaveBeenCalledTimes(1);
@@ -788,6 +799,12 @@ describe("grok_local execute", () => {
         expect(
           deliveredArgs.every((entry) => Buffer.byteLength(entry, "utf8") < MAX_ARG_STRLEN_BYTES),
         ).toBe(true);
+        expect(runShellMock).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.anything(),
+          `rm -f -- ${shellQuote(writtenPath)}`,
+          expect.objectContaining({ timeoutSec: expect.any(Number) }),
+        );
       } finally {
         remoteState.isRemote = false;
       }
