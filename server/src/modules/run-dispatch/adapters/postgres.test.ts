@@ -651,6 +651,23 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       15_000,
     );
 
+    it.each([true, false])("revalidates queued summary against current document (current wait: %s)", async currentWait => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const wait = "## Next Action\n- Wait for reviewer feedback or approval before continuing executor work.";
+      const resume = "## Next Action\n- Resume implementation from the latest decision.";
+      await seedContinuationSummary({ companyId, issueId, agentId, body: currentWait ? wait : resume });
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: {
+        issueId, wakeReason: "issue_continuation_needed",
+        paperclipContinuationSummary: { body: currentWait ? resume : wait },
+      } });
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId, companyId, expectedStatus: "queued", now: new Date(),
+      });
+      expect(result.outcome).toBe(currentWait ? "cancelled" : "not_stale");
+    });
+
     it("maps a review-parking continuation summary into a stale queued-run decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
