@@ -167,7 +167,7 @@ describeEmbeddedPostgres("conversation interruption resume", () => {
     return action!;
   }
 
-  it.each(["orphaned_running_run", "process_lost", "server_shutdown_interrupted"])(
+  it.each(["orphaned_running_run", "process_lost", "server_shutdown_interrupted", "lease_released_before_terminal"])(
     "queues one fresh session after %s",
     async (errorCode) => {
       const fixture = await seed({ errorCode });
@@ -225,21 +225,24 @@ describeEmbeddedPostgres("conversation interruption resume", () => {
     expect(await wakesFor(fixture.action.id)).toHaveLength(0);
   });
 
-  it("two reconciliation passes queue one wake and do not recreate the action", async () => {
-    const fixture = await seed({ errorCode: "orphaned_running_run" });
-    await settleUnrecoverableExecutions(db);
-    await settleUnrecoverableExecutions(db);
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
-    await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
-    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
-    expect(actions).toHaveLength(1);
-    expect(actions[0]?.id).toBe(fixture.action.id);
-    expect(actions[0]?.evidence.executionReconciliation).toMatchObject({ runId: fixture.runId });
-    const wakes = await wakesFor(fixture.action.id);
-    expect(wakes).toHaveLength(1);
-    await deliverReconciledExecutions(db, (async () => ({ id: randomUUID() })) as never);
-    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toHaveLength(1);
-  });
+  it.each(["orphaned_running_run", "lease_released_before_terminal"])(
+    "two reconciliation passes after %s queue one wake and do not recreate the action",
+    async (errorCode) => {
+      const fixture = await seed({ errorCode });
+      await settleUnrecoverableExecutions(db);
+      await settleUnrecoverableExecutions(db);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+      expect(actions).toHaveLength(1);
+      expect(actions[0]?.id).toBe(fixture.action.id);
+      expect(actions[0]?.evidence.executionReconciliation).toMatchObject({ runId: fixture.runId });
+      const wakes = await wakesFor(fixture.action.id);
+      expect(wakes).toHaveLength(1);
+      await deliverReconciledExecutions(db, (async () => ({ id: randomUUID() })) as never);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toHaveLength(1);
+    },
+  );
 
   it("does not wake when the task is blocked between settlement and delivery", async () => {
     const fixture = await seed({ errorCode: "process_lost" });

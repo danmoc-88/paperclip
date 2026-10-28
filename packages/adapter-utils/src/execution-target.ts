@@ -1286,6 +1286,149 @@ export async function ensureAdapterExecutionTargetFile(
 }
 
 /**
+ * Publish a remote Grok prompt without ever creating a world-readable file
+ * or following a symlink. The body stays on stdin.
+ *
+ * The destination must live in its own directory (not directly in /tmp).
+ * That directory is created mode 0700 and rejected when it is a symlink or
+ * is not owned by the remote user. The bytes land in a 0600 temp file inside
+ * that directory, then `mv -T` publishes them. `mv -T` replaces a symlink
+ * instead of writing through it. A kill during the copy leaves the temp file
+ * private and does not publish a partial destination.
+ */
+export function grokPromptRemotePublishCommand(filePath: string): string {
+  const quoted = shellQuote(filePath);
+  return [
+    "set -eu",
+    "umask 077",
+    `dest=${quoted}`,
+    'parent=${dest%/*}',
+    'name=${dest##*/}',
+    'case "$parent" in',
+    "  /|/tmp|/var/tmp|/dev/shm)",
+    '    echo "refusing to publish a prompt file directly in a shared directory" >&2',
+    "    exit 1",
+    "    ;;",
+    "esac",
+    'case "$name" in',
+    '  ""|.|..)',
+    '    echo "refusing an empty prompt file name" >&2',
+    "    exit 1",
+    "    ;;",
+    "esac",
+    'if [ -L "$parent" ]; then',
+    '  echo "refusing to follow a symlink prompt directory" >&2',
+    "  exit 1",
+    "fi",
+    'if mkdir -m 700 "$parent" 2>/dev/null; then',
+    "  :",
+    "fi",
+    'if [ -L "$parent" ] || [ ! -d "$parent" ]; then',
+    '  echo "prompt directory is not a real directory" >&2',
+    "  exit 1",
+    "fi",
+    "uid=$(id -u)",
+    "info=$(stat -c '%u %a' \"$parent\")",
+    "set -- $info",
+    'if [ "$1" != "$uid" ] || [ "$2" != "700" ]; then',
+    '  echo "prompt directory is not private" >&2',
+    "  exit 1",
+    "fi",
+    'if [ -L "$dest" ]; then',
+    '  rm -f -- "$dest"',
+    "fi",
+    'if [ -e "$dest" ] && [ ! -f "$dest" ]; then',
+    '  echo "prompt path is not a regular file" >&2',
+    "  exit 1",
+    "fi",
+    'tmp=$(mktemp "$parent/.prompt.XXXXXX")',
+    "cleanup() {",
+    '  if [ -n "${tmp-}" ]; then',
+    '    rm -f -- "$tmp"',
+    "  fi",
+    "}",
+    "trap cleanup EXIT",
+    "trap 'cleanup; exit 1' INT TERM",
+    'cat > "$tmp"',
+    'if [ -L "$tmp" ]; then',
+    '  echo "prompt temp file became a symlink" >&2',
+    "  exit 1",
+    "fi",
+    "mode=$(stat -c %a \"$tmp\")",
+    'if [ "$mode" != "600" ]; then',
+    '  echo "prompt temp file is not private" >&2',
+    "  exit 1",
+    "fi",
+    'mv -fT "$tmp" "$dest"',
+    "trap - EXIT INT TERM",
+    "tmp=",
+    'if [ -L "$dest" ] || [ ! -f "$dest" ]; then',
+    '  echo "published prompt path is not a regular file" >&2',
+    "  exit 1",
+    "fi",
+    "mode=$(stat -c %a \"$dest\")",
+    'if [ "$mode" != "600" ]; then',
+    '  rm -f -- "$dest"',
+    '  echo "published prompt file is not private" >&2',
+    "  exit 1",
+    "fi",
+  ].join("\n");
+}
+
+/**
+ * Write a text file on a remote execution target. The body travels on stdin.
+ * It is not placed in argv or in an environment variable: both share Linux
+ * MAX_ARG_STRLEN, and a prompt past that limit is why this exists.
+ */
+export async function writeAdapterExecutionTargetTextFile(
+  runId: string,
+  target: AdapterExecutionTarget | null | undefined,
+  filePath: string,
+  body: string,
+  options: AdapterExecutionTargetShellOptions,
+): Promise<void> {
+  if (!target || target.kind === "local") {
+    throw new Error("Local prompt files are written on the host, not through the remote installer.");
+  }
+  if (!filePath.startsWith("/") || filePath.split("/").includes("..")) {
+    throw new Error(`Remote prompt path must be an absolute path inside the target: "${filePath}"`);
+  }
+  if (Buffer.byteLength(filePath) >= 131072) {
+    throw new Error(`Remote prompt path is ${Buffer.byteLength(filePath)} bytes and does not fit in one argument.`);
+  }
+  const command = grokPromptRemotePublishCommand(filePath);
+  if (command.includes(body)) {
+    throw new Error("Refusing to place the prompt on the remote command line.");
+  }
+  const publishEnv: Record<string, string> = {};
+  const pathValue = options.env.PATH;
+  if (typeof pathValue === "string" && pathValue.length > 0 && Buffer.byteLength(pathValue) < 131072) {
+    publishEnv.PATH = pathValue;
+  }
+  for (const value of Object.values(publishEnv)) {
+    if (value === body || Buffer.byteLength(value) >= 131072) {
+      throw new Error("Refusing to publish a prompt file with the prompt in the environment.");
+    }
+  }
+  const runner = adapterExecutionTargetCommandRunner(target);
+  const shell = adapterExecutionTargetShellCommand(target);
+  const result = await runner.execute({
+    command: shell,
+    args: shellCommandArgs(command),
+    cwd: target.remoteCwd,
+    env: sanitizeRemoteExecutionEnv(publishEnv),
+    stdin: body,
+    timeoutMs: (options.timeoutSec ?? 60) * 1000,
+    bypassSession: true,
+  });
+  if (result.timedOut || (result.exitCode ?? 1) !== 0) {
+    throw new Error(
+      `Failed to publish the Grok prompt file for run ${runId} (${Buffer.byteLength(body)} bytes) into the execution target (exit ${result.exitCode ?? "null"}).`,
+    );
+  }
+}
+
+/**
  * Ensure a working directory exists (and is a directory) on the execution target.
  *
  * For local targets this delegates to the local `ensureAbsoluteDirectory` helper
