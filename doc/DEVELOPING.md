@@ -28,21 +28,26 @@ GitHub Actions owns `pnpm-lock.yaml`.
 
 ## Trusted PR Workflow
 
-The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
-The AWS runner group `paperclip-public-pr` must allow
-`paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master`.
-New workflow versions merged into master then receive runner access without a
-separate SHA allowlist update. Dependabot leaves this first-party reference on
-master.
+This fork's PR caller pins `danmoc-88/paperclip/.github/workflows/pr-trusted.yml`
+to an immutable commit SHA.
+
+The fork must not follow
+`paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`. Upstream's
+workflow gained gates for files this fork's tree does not carry
+(`scripts/docker-deps-postinstall.test.mjs`, `scripts/docker-compose-secrets.test.mjs`,
+`scripts/server-boot-smoke.sh`, and a `@paperclipai/server` `build:runtime`
+script), so every pull request failed on files that are simply absent here. The
+pinned SHA keeps the active CI definition equal to
+`.github/workflows/pr-trusted.yml` in this repository. Bump the SHA in the same
+pull request that changes that file.
+
+The fork's copy fails the upstream runner-routing check closed, so its jobs run on
+GitHub-hosted runners. The `paperclip-public-pr` AWS runner group is not used here.
 
 Keep the `.github/**` rule in `.github/CODEOWNERS` and the active master ruleset's
 code-owner review requirement enabled. This covers the caller, the trusted
 workflow, and CODEOWNERS itself. Existing administrator pull-request bypasses
 remain governed by the repository ruleset.
-
-When changing the workflow path or branch, authorize the new reference before
-updating the caller. Retain older authorized SHA references while queued runs or
-supported reruns still use them.
 
 ## Start Dev
 
@@ -1720,6 +1725,23 @@ results for up to five seconds after completion. The cache holds at most 256
 entries. Close-readiness checks, the terminal-workspace reaper, and the final
 cleanup validation still inspect Git afresh. A display result never authorizes
 worktree removal.
+
+The collection inventory deliberately returns `deliveryState: "unknown"` without
+Git or GitHub inspection. Use the workspace `close-readiness` endpoint for a
+fresh delivery assessment; the terminal reaper runs that assessment itself.
+When the saved base is a local branch, delivery comparison uses its existing
+remote-tracking upstream only if it tracks the same branch in the same GitHub
+repository. This avoids a stale local base hiding a completed merge. The check
+uses local refs without a network fetch, does not change the saved base, and
+reports the comparison ref in `git.baseRef`. Missing or unrelated tracking
+configuration retains the original comparison. An unavailable PR lookup remains
+unknown unless Git ancestry independently proves delivery.
+
+The terminal reaper retains shared and project workspace directories, main Git
+checkouts, live runtime leases, active runs, open issue trees, dirty files, and
+commits absent from the delivery base or verified merged PR. Delivery evidence
+alone does not authorize cleanup. Lease and directory checks also run at the
+final cleanup fence.
 
 The connection-health sweep selects only due IDs in SQL before applying its
 limit. Legacy `paperclip_plugin` placeholder connections are excluded: their

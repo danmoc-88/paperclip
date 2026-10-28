@@ -14,6 +14,10 @@ export interface QuotaWindow {
 
 /** result for one provider from the quota-windows endpoint */
 export interface ProviderQuotaResult {
+  /** Quota availability is independent of monetary spend. */
+  quotaStatus?: "available" | "auth_error" | "version_error" | "unavailable";
+  /** Historical observation only; never current quota after a failed read. */
+  lastSuccessful?: { observedAt: string; windows: QuotaWindow[] } | null;
   /** provider slug, e.g. "anthropic", "openai" */
   provider: string;
   /** source label when the provider reports where the quota data came from */
