@@ -8,6 +8,50 @@ import {
 } from "./issue.js";
 import { routineVariableSchema } from "./routine.js";
 
+// Leading collection bounds for the company portability contracts. The import
+// body is already capped (64 MiB inline), but an unbounded `z.array` or a typed
+// `z.record` still makes Zod build one issue per invalid element or key. Zod v4
+// only aborts before parsing elements when a size bound is the leading check on
+// the collection (4.6.6+), so these `.max()` calls stay ahead of any
+// default/optional and the typed records use a pre-parse key count.
+//
+// The ceilings are abuse guards, not derived product limits. Each one is set
+// well above a typical package, but an unusually large package can exceed an
+// entry-count ceiling while still fitting the body cap. The import path
+// validates the count itself and reports it as a validation error.
+export const PORTABILITY_MANIFEST_COLLECTION_LIMIT = 50_000;
+export const PORTABILITY_ENTITY_COLLECTION_LIMIT = 5_000;
+export const PORTABILITY_ROUTINE_COLLECTION_LIMIT = 1_000;
+export const PORTABILITY_SELECTOR_LIMIT = 100_000;
+export const PORTABILITY_INLINE_FILE_LIMIT = 50_000;
+export const PORTABILITY_OVERRIDE_MAP_LIMIT = 5_000;
+
+// Zod bounds arrays, sets, and maps before parsing elements, but not records.
+// Count the keys before the record parses its values, so an oversized map fails
+// with one issue and parses no entry. The `.pipe` does not run the record schema
+// once the key-count check adds an issue.
+function boundedRecordKeys<T extends z.ZodTypeAny>(
+  recordSchema: T,
+  maxKeys: number,
+  label: string,
+): T {
+  return z
+    .unknown()
+    .superRefine((value, ctx) => {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        return;
+      }
+      const keyCount = Object.keys(value as Record<string, unknown>).length;
+      if (keyCount > maxKeys) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${label} must have at most ${maxKeys} entries`,
+        });
+      }
+    })
+    .pipe(recordSchema) as unknown as T;
+}
+
 export const portabilityIncludeSchema = z
   .object({
     company: z.boolean().optional(),
@@ -55,8 +99,14 @@ export const portabilityCompanyManifestEntrySchema = z.object({
 });
 
 export const portabilitySidebarOrderSchema = z.object({
-  agents: z.array(z.string().min(1)).default([]),
-  projects: z.array(z.string().min(1)).default([]),
+  agents: z
+    .array(z.string().min(1))
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
+  projects: z
+    .array(z.string().min(1))
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
 });
 
 export const portabilityLabelManifestEntrySchema = z.object({
@@ -74,7 +124,10 @@ export const portabilityAgentManifestEntrySchema = z.object({
   slug: z.string().min(1),
   name: z.string().min(1),
   path: z.string().min(1),
-  skills: z.array(z.string().min(1)).default([]),
+  skills: z
+    .array(z.string().min(1))
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
   role: z.string().min(1),
   title: z.string().nullable(),
   icon: z.string().nullable(),
@@ -88,7 +141,7 @@ export const portabilityAgentManifestEntrySchema = z.object({
   permissionGrants: z.array(z.object({
     permissionKey: z.enum(PERMISSION_KEYS),
     scope: z.record(z.string(), z.unknown()).nullable().default(null),
-  })).default([]),
+  })).max(PORTABILITY_ENTITY_COLLECTION_LIMIT).default([]),
   budgetMonthlyCents: z.number().int().nonnegative(),
   metadata: z.record(z.string(), z.unknown()).nullable(),
 });
@@ -108,7 +161,7 @@ export const portabilitySkillManifestEntrySchema = z.object({
   fileInventory: z.array(z.object({
     path: z.string().min(1),
     kind: z.string().min(1),
-  })).default([]),
+  })).max(PORTABILITY_ENTITY_COLLECTION_LIMIT).default([]),
 });
 
 export const portabilityProjectManifestEntrySchema = z.object({
@@ -134,7 +187,7 @@ export const portabilityProjectManifestEntrySchema = z.object({
     cleanupCommand: z.string().nullable(),
     metadata: z.record(z.string(), z.unknown()).nullable(),
     isPrimary: z.boolean(),
-  })).default([]),
+  })).max(PORTABILITY_ENTITY_COLLECTION_LIMIT).default([]),
   metadata: z.record(z.string(), z.unknown()).nullable(),
 });
 
@@ -151,8 +204,15 @@ export const portabilityIssueRoutineTriggerManifestEntrySchema = z.object({
 export const portabilityIssueRoutineManifestEntrySchema = z.object({
   concurrencyPolicy: z.string().nullable(),
   catchUpPolicy: z.string().nullable(),
-  variables: z.array(routineVariableSchema).nullable().optional(),
-  triggers: z.array(portabilityIssueRoutineTriggerManifestEntrySchema).default([]),
+  variables: z
+    .array(routineVariableSchema)
+    .max(PORTABILITY_ROUTINE_COLLECTION_LIMIT)
+    .nullable()
+    .optional(),
+  triggers: z
+    .array(portabilityIssueRoutineTriggerManifestEntrySchema)
+    .max(PORTABILITY_ROUTINE_COLLECTION_LIMIT)
+    .default([]),
 });
 
 export const portabilityIssueCommentManifestEntrySchema = z.object({
@@ -214,17 +274,38 @@ export const portabilityIssueManifestEntrySchema = z.object({
   legacyRecurrence: z.record(z.string(), z.unknown()).nullable(),
   status: z.string().nullable(),
   priority: z.string().nullable(),
-  labelIds: z.array(z.string().min(1)).default([]),
-  labelNames: z.array(z.string().min(1)).default([]),
+  labelIds: z
+    .array(z.string().min(1))
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
+  labelNames: z
+    .array(z.string().min(1))
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
   billingCode: z.string().nullable(),
   executionWorkspaceSettings: z.record(z.string(), z.unknown()).nullable(),
   assigneeAdapterOverrides: z.record(z.string(), z.unknown()).nullable(),
-  comments: z.array(portabilityIssueCommentManifestEntrySchema).default([]),
-  blockedBy: z.array(z.string().min(1)).default([]),
-  documents: z.array(portabilityIssueDocumentManifestEntrySchema).default([]),
-  workProducts: z.array(portabilityIssueWorkProductManifestEntrySchema).default([]),
+  comments: z
+    .array(portabilityIssueCommentManifestEntrySchema)
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
+  blockedBy: z
+    .array(z.string().min(1))
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
+  documents: z
+    .array(portabilityIssueDocumentManifestEntrySchema)
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
+  workProducts: z
+    .array(portabilityIssueWorkProductManifestEntrySchema)
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
   monitor: portabilityIssueMonitorManifestEntrySchema.nullable().default(null),
-  attachments: z.array(portabilityIssueAttachmentManifestEntrySchema).default([]),
+  attachments: z
+    .array(portabilityIssueAttachmentManifestEntrySchema)
+    .max(PORTABILITY_ENTITY_COLLECTION_LIMIT)
+    .default([]),
   parentSlug: z.string().min(1).nullable().optional(),
   createdAt: z.string().datetime().nullable().optional(),
   updatedAt: z.string().datetime().nullable().optional(),
@@ -252,20 +333,44 @@ export const portabilityManifestSchema = z.object({
   }),
   company: portabilityCompanyManifestEntrySchema.nullable(),
   sidebar: portabilitySidebarOrderSchema.nullable(),
-  labels: z.array(portabilityLabelManifestEntrySchema).default([]),
-  blobs: z.array(portabilityBlobManifestEntrySchema).default([]),
-  agents: z.array(portabilityAgentManifestEntrySchema),
-  skills: z.array(portabilitySkillManifestEntrySchema).default([]),
-  projects: z.array(portabilityProjectManifestEntrySchema).default([]),
-  issues: z.array(portabilityIssueManifestEntrySchema).default([]),
-  envInputs: z.array(portabilityEnvInputSchema).default([]),
+  labels: z
+    .array(portabilityLabelManifestEntrySchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
+  blobs: z
+    .array(portabilityBlobManifestEntrySchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
+  agents: z
+    .array(portabilityAgentManifestEntrySchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT),
+  skills: z
+    .array(portabilitySkillManifestEntrySchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
+  projects: z
+    .array(portabilityProjectManifestEntrySchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
+  issues: z
+    .array(portabilityIssueManifestEntrySchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
+  envInputs: z
+    .array(portabilityEnvInputSchema)
+    .max(PORTABILITY_MANIFEST_COLLECTION_LIMIT)
+    .default([]),
 });
 
 export const portabilitySourceSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("inline"),
     rootPath: z.string().min(1).optional().nullable(),
-    files: z.record(z.string(), portabilityFileEntrySchema),
+    files: boundedRecordKeys(
+      z.record(z.string(), portabilityFileEntrySchema),
+      PORTABILITY_INLINE_FILE_LIMIT,
+      "files",
+    ),
     // Self-describing completeness count. The client sets this to
     // `Object.keys(files).length`; the import path rejects the payload when the
     // received file set is smaller, so a truncated or re-framed body fails
@@ -292,19 +397,19 @@ export const portabilityTargetSchema = z.discriminatedUnion("mode", [
 
 export const portabilityAgentSelectionSchema = z.union([
   z.literal("all"),
-  z.array(z.string().min(1)),
+  z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT),
 ]);
 
 export const portabilityCollisionStrategySchema = z.enum(["rename", "skip", "replace"]);
 
 export const companyPortabilityExportSchema = z.object({
   include: portabilityIncludeSchema.optional(),
-  agents: z.array(z.string().min(1)).optional(),
-  skills: z.array(z.string().min(1)).optional(),
-  projects: z.array(z.string().min(1)).optional(),
-  issues: z.array(z.string().min(1)).optional(),
-  projectIssues: z.array(z.string().min(1)).optional(),
-  selectedFiles: z.array(z.string().min(1)).optional(),
+  agents: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
+  skills: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
+  projects: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
+  issues: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
+  projectIssues: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
+  selectedFiles: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
   expandReferencedSkills: z.boolean().optional(),
   sidebarOrder: portabilitySidebarOrderSchema.partial().optional(),
 });
@@ -317,8 +422,12 @@ export const companyPortabilityPreviewSchema = z.object({
   target: portabilityTargetSchema,
   agents: portabilityAgentSelectionSchema.optional(),
   collisionStrategy: portabilityCollisionStrategySchema.optional(),
-  nameOverrides: z.record(z.string().min(1), z.string().min(1)).optional(),
-  selectedFiles: z.array(z.string().min(1)).optional(),
+  nameOverrides: boundedRecordKeys(
+    z.record(z.string().min(1), z.string().min(1)),
+    PORTABILITY_OVERRIDE_MAP_LIMIT,
+    "nameOverrides",
+  ).optional(),
+  selectedFiles: z.array(z.string().min(1)).max(PORTABILITY_SELECTOR_LIMIT).optional(),
 });
 
 export type CompanyPortabilityPreview = z.infer<typeof companyPortabilityPreviewSchema>;
@@ -329,8 +438,16 @@ export const portabilityAdapterOverrideSchema = z.object({
 });
 
 export const companyPortabilityImportSchema = companyPortabilityPreviewSchema.extend({
-  adapterOverrides: z.record(z.string().min(1), portabilityAdapterOverrideSchema).optional(),
-  secretValues: z.record(z.string().min(1), z.string()).optional(),
+  adapterOverrides: boundedRecordKeys(
+    z.record(z.string().min(1), portabilityAdapterOverrideSchema),
+    PORTABILITY_OVERRIDE_MAP_LIMIT,
+    "adapterOverrides",
+  ).optional(),
+  secretValues: boundedRecordKeys(
+    z.record(z.string().min(1), z.string()),
+    PORTABILITY_OVERRIDE_MAP_LIMIT,
+    "secretValues",
+  ).optional(),
   pauseAutomations: z.boolean().optional(),
 });
 

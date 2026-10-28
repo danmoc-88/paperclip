@@ -454,7 +454,7 @@ describe("ACPX installation integrity", () => {
       },
       {
         name: "zod",
-        version: "4.4.3",
+        version: "4.6.7",
         directory: join(dependencyRoot, "zod"),
       },
     ] as const;

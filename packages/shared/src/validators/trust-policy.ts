@@ -8,6 +8,12 @@ import {
 
 export const trustPresetSchema = z.enum(TRUST_PRESETS);
 
+// Leading bound for every list in a low-trust review boundary. The boundary is
+// set by an operator or agent when it creates an issue, so a leading `.max()`
+// (no refine before it) stops an oversized list before Zod parses elements on
+// zod >= 4.6.6. The ceiling is far above a real review scope.
+export const TRUST_BOUNDARY_COLLECTION_LIMIT = 200;
+
 export const lowTrustOutputPromotionTargetSchema = z.object({
   type: z.literal("issue"),
   issueId: z.string().guid(),
@@ -16,12 +22,27 @@ export const lowTrustOutputPromotionTargetSchema = z.object({
 export const lowTrustBoundarySchema = z.object({
   mode: z.literal(LOW_TRUST_REVIEW_PRESET),
   companyId: z.string().guid().optional(),
-  projectIds: z.array(z.string().guid()).optional(),
+  projectIds: z
+    .array(z.string().guid())
+    .max(TRUST_BOUNDARY_COLLECTION_LIMIT)
+    .optional(),
   rootIssueId: z.string().guid().optional(),
-  issueIds: z.array(z.string().guid()).optional(),
-  allowedAgentIds: z.array(z.string().guid()).optional(),
-  allowedSecretBindingIds: z.array(z.string().guid()).optional(),
-  allowedToolClasses: z.array(z.string().trim().min(1)).optional(),
+  issueIds: z
+    .array(z.string().guid())
+    .max(TRUST_BOUNDARY_COLLECTION_LIMIT)
+    .optional(),
+  allowedAgentIds: z
+    .array(z.string().guid())
+    .max(TRUST_BOUNDARY_COLLECTION_LIMIT)
+    .optional(),
+  allowedSecretBindingIds: z
+    .array(z.string().guid())
+    .max(TRUST_BOUNDARY_COLLECTION_LIMIT)
+    .optional(),
+  allowedToolClasses: z
+    .array(z.string().trim().min(1))
+    .max(TRUST_BOUNDARY_COLLECTION_LIMIT)
+    .optional(),
   outputPromotionTarget: lowTrustOutputPromotionTargetSchema.optional(),
 }).strict();
 
