@@ -242,6 +242,14 @@ Use it for:
 
 Blocked issues should stay idle while blockers remain unresolved. Paperclip should not create a queued heartbeat run for that issue until the final blocker is done and the `issue_blockers_resolved` wake can start real work.
 
+Removing the last blocker through an issue PATCH also requests
+`issue_blockers_resolved` for an assigned, still-blocked issue. The request uses
+the remaining blocker set (including an empty set) and the current blocked cycle
+for deduplication. Repeating an unchanged empty list does not wake the issue.
+The existing execution controller still enforces review, recovery, pause,
+dependency, and active-run gates; removing a relation does not bypass them or
+reopen completed or cancelled work.
+
 `cancelled` is terminal for the blocker issue itself, but it does not satisfy the dependency. A cancelled blocker edge remains unresolved until the edge is removed or replaced, and Paperclip must surface blocker attention on the dependent regardless of whether that dependent is currently displayed as `blocked`, `todo`, `backlog`, or another non-terminal agent-owned status.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.

@@ -428,6 +428,83 @@ describe("issue dependency wakeups in issue routes", () => {
     };
   }
 
+  it("wakes exactly once when PATCH removes the last unresolved blocker", async () => {
+    const blockerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const issue = issueRecord({ status: "blocked", blockedTransitionAt: new Date("2026-10-06T12:00:00Z") });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValueOnce({
+      blockedBy: [{ id: blockerId, status: "blocked" }], blocks: [],
+    });
+    const app = await createApp();
+    expect((await request(app).patch("/api/issues/issue-1").send({ blockedByIssueIds: [] })).status).toBe(200);
+    await vi.waitFor(() => expect(mockWakeup).toHaveBeenCalledTimes(1));
+    expect(mockWakeup).toHaveBeenCalledWith("agent-1", expect.objectContaining({
+      reason: "issue_blockers_resolved",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: issue.id, blockerIssueIds: [], blockedTransitionAt: issue.blockedTransitionAt,
+      }),
+      payload: expect.objectContaining({ issueId: issue.id, resolvedBlockerIssueId: blockerId, blockerIssueIds: [] }),
+    }));
+    expect((await request(app).patch("/api/issues/issue-1").send({ blockedByIssueIds: [] })).status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["blocked", "done", "cancelled", "in_review"])("does not wake an unchanged empty blocker set on %s", async (status) => {
+    const issue = issueRecord({ status });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(issue);
+    expect((await request(await createApp()).patch("/api/issues/issue-1").send({ blockedByIssueIds: [] })).status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["done", "cancelled", "in_review"])("does not replay %s work when its last blocker is removed", async (status) => {
+    const issue = issueRecord({ status });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValueOnce({
+      blockedBy: [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", status: "blocked" }], blocks: [],
+    });
+    expect((await request(await createApp()).patch("/api/issues/issue-1").send({ blockedByIssueIds: [] })).status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["blocked", "cancelled", "pending_finalize"])("does not wake after removal while another blocker is %s", async (state) => {
+    const removedId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const remainingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const issue = issueRecord({ status: "blocked" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValueOnce({
+      blockedBy: [{ id: removedId, status: "blocked" }, { id: remainingId, status: state }], blocks: [],
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: issue.id, blockerIssueIds: [remainingId],
+      unresolvedBlockerIssueIds: [remainingId], unresolvedBlockerCount: 1,
+      pendingFinalizeBlockerIssueIds: state === "pending_finalize" ? [remainingId] : [],
+      allBlockersDone: false, isDependencyReady: false,
+    });
+    expect((await request(await createApp()).patch("/api/issues/issue-1").send({ blockedByIssueIds: [remainingId] })).status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["queued", "claimed", "completed"])("deduplicates last-blocker removal against a %s ready-state wake", async (status) => {
+    const issue = issueRecord({ status: "blocked" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValueOnce({
+      blockedBy: [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", status: "blocked" }], blocks: [],
+    });
+    mockFindExistingIssueBlockersResolvedWakeForReadyState.mockResolvedValue({ id: "wake-1", status } as never);
+    expect((await request(await createApp()).patch("/api/issues/issue-1").send({ blockedByIssueIds: [] })).status).toBe(200);
+    await vi.waitFor(() => expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalled());
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
   it("wakes a Release-like dependent after a terminal reset using the current blocked cycle", async () => {
     const reviewIssueId = "11111111-1111-4111-8111-111111111111";
     const releaseIssueId = "22222222-2222-4222-8222-222222222222";
