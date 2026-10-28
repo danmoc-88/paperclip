@@ -197,3 +197,9 @@ apps without that scope require reinstalling with the updated manifest. Other
 people's bot DMs remain inaccessible. Scheduling uses ordinary Paperclip routines,
 not a Slack-specific timer. Routine results are sent explicitly through the tool;
 ordinary task finals are not automatically broadcast to Slack.
+
+## Decision publication policy foundation
+
+The separate company decision policy is preparation only. See
+[Slack decision disclosure preparation](CHAT-CONNECTOR-UX.md#slack-decision-disclosure-preparation)
+for its classification API, resolver contract, and current transport limitations.

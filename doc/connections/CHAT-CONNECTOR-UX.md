@@ -352,3 +352,44 @@ Chat connections in the catalog keep **Finish setup** visible for drafts. Put
 including drafts. Confirm removal, explain that existing tasks remain, and keep
 the dialog available for retry if removal fails. Use the existing provider lifecycle
 action; removing a Paperclip connection does not delete the provider app or bot.
+
+### Slack decision disclosure preparation
+
+The decision-card implementation is not connected to the Slack transport yet.
+It does not enable an application or send messages. The resolver requires an
+explicit enabled dependency and otherwise refuses every resolution.
+
+`PUT /api/chat-endpoints/:endpointId/slack/decision-disclosures/:interactionId`
+is a Board-only classification API, using the existing company and
+`tools:manage_connections` checks. A signed-in operator may classify the exact
+source digest with `disclosure: { sourceDigest, topic, expiresAt }`, where topic
+is `product_direction` or `implementation_plan`, or revoke it with
+`disclosure: null`. Classification asserts that all source fields are safe for
+external disclosure; it must not be inferred from an agent-supplied payload or
+the absence of a sensitive keyword. This endpoint does not grant Slack identity,
+activate interactivity, or authorize a decision. There is no classification UI
+or automatic classifier in this preparation stage.
+
+The existing company/endpoint-scoped `chat_actions` ledger holds the
+`slack_decision_disclosure` administrative record. Its key is separate from
+provider callback tokens; its payload contains only a digest, topic and expiry.
+Writes record a content-free activity event in the same transaction. The
+resolver defaults to this protected source and retains a shared record lock
+through the canonical decision transaction. Revoked, missing, malformed,
+expired or source-mismatched classifications fail closed to the MyDay card.
+No new database schema or production migration is introduced.
+
+The company publication helper prepares copy without enqueueing messages or
+issuing actions. Long cards use a neutral canonical link instead of truncating
+consequences. It does not fetch documents behind source links.
+
+Resolution and the Slack audit commit together through the canonical interaction
+service. The audit retains provider IDs, operation, and plan revision, but excludes
+answer text and rejection reasons. Stale plan targets expire; panel/callback races
+permit one terminal resolution. The transport must supply a transactional
+authorization/action-consumption hook before enabling the resolver.
+
+Provider identity/signature checks, one-use action issuance, modals, company
+routing, historical delivery deduplication, and transport retry are not wired to
+this helper yet. The policy tests and isolated database tests establish these
+internal contracts; they do not establish a live Slack integration.

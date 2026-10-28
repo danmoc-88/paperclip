@@ -211,3 +211,12 @@ export const replayChatDeliverySchema = z.object({}).strict();
 export const chatPublicEndpointIdSchema = z
   .string()
   .regex(/^[a-zA-Z0-9_-]{32,128}$/);
+
+/** Operator classification; never accepted on an interaction or provider callback. */
+export const updateSlackDecisionDisclosureSchema = z.object({
+  disclosure: z.object({
+    sourceDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    topic: z.enum(["product_direction", "implementation_plan"]),
+    expiresAt: z.string().datetime(),
+  }).strict().nullable(),
+}).strict();

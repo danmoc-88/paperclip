@@ -10,6 +10,7 @@ import type { Db } from "@paperclipai/db";
 import {
   CHAT_PROVIDERS,
   configureChatEndpointSchema,
+  updateSlackDecisionDisclosureSchema,
   inspectPhotonProjectSchema,
   confirmChatIdentityLinkSchema,
   createChatEndpointSchema,
@@ -28,6 +29,7 @@ import {
   type ChatChannelService,
   type ChatChannelServiceOptions,
 } from "../services/chat-channels.js";
+import { slackDecisionDisclosureService } from "../services/slack-decision-disclosures.js";
 import { accessService } from "../services/access.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { recordChatWebhookStage } from "../services/chat-webhook-diagnostics.js";
@@ -219,6 +221,19 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
       res.json(
         await service.update(endpointId(req), req.body, actorUserId(req)),
       );
+    },
+  );
+
+  router.put(
+    "/chat-endpoints/:endpointId/slack/decision-disclosures/:interactionId",
+    validate(updateSlackDecisionDisclosureSchema),
+    async (req, res) => {
+      if (!(await assertEndpointManagementAccess(req, res))) return;
+      const userId = actorUserId(req);
+      if (!userId) throw badRequest("A signed-in Paperclip user is required");
+      const interactionId = req.params.interactionId as string;
+      if (!isUuidLike(interactionId)) throw badRequest("A valid interaction ID is required");
+      res.json(await slackDecisionDisclosureService(db).update(endpointId(req), interactionId, req.body, userId));
     },
   );
 
