@@ -128,7 +128,10 @@
       "react-dom": "^19.2.8",
       "@codemirror/state": "^6.7.2",
       "@codemirror/view": "^6.43.11",
-      "@lezer/common": "^1.5.2"
+      "@lezer/common": "^1.5.2",
+      "@connectrpc/connect-node@1.7.0>undici": "6.29.1",
+      "undici@>=6.0.0 <6.29.1": "6.29.1",
+      "undici@>=8.0.0 <8.12.2": "8.12.2"
     }
   }
 }
