@@ -47,3 +47,8 @@ overrides:
   # Parsers and highlighters must share NodeProp IDs from one Lezer instance.
   # Mixed copies can interpret unrelated node metadata as highlighting tags.
   "@lezer/common": "^1.5.2"
+
+  # Security fixes; connect-node 1.x needs an explicit major override.
+  "@connectrpc/connect-node@1.7.0>undici": "6.29.1"
+  "undici@>=6.0.0 <6.29.1": "6.29.1"
+  "undici@>=8.0.0 <8.12.2": "8.12.2"
