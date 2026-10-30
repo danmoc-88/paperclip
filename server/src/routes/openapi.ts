@@ -1455,6 +1455,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/tool-connections/{connectionId}/railway/ssh",
   "POST /api/tool-connections/{connectionId}/catalog/refresh",
   "GET /api/tool-connections/{connectionId}/catalog",
+  "GET /api/tool-connections/{connectionId}/catalog/persisted",
   "GET /api/tool-connections/{connectionId}/activity",
   "GET /api/tool-connections/{connectionId}/test-agents",
   "GET /api/tool-connections/{connectionId}/test-agents/{agentId}/access",
@@ -10794,6 +10795,13 @@ registerCurrentRoute({
   path: "/api/tool-connections/{connectionId}/catalog/refresh",
   tags: ["tool-access"],
   summary: "Refresh a tool connection catalog",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/tool-connections/{connectionId}/catalog/persisted",
+  tags: ["tool-access"],
+  summary: "Read the persisted catalog without discovery or access changes (board only)",
 });
 
 registerCurrentRoute({

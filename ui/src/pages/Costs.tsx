@@ -31,6 +31,7 @@ import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange"
 import { queryKeys } from "../lib/queryKeys";
 import { billingTypeDisplayName, cn, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -169,6 +170,10 @@ export function Costs({
   const queryClient = useQueryClient();
 
   const [mainTab, setMainTab] = useState<CostsMainTab>(initialTab);
+  const [companyBudgetDraft, setCompanyBudgetDraft] = useState("");
+  const companyBudgetCents = Math.round(Number(companyBudgetDraft) * 100);
+  const validCompanyBudget = companyBudgetDraft.trim() !== ""
+    && Number.isSafeInteger(companyBudgetCents) && companyBudgetCents > 0;
   const [activeProvider, setActiveProvider] = useState("all");
   const [activeBiller, setActiveBiller] = useState("all");
   const showSummaryChrome = !(embedded && lockTab && initialTab === "budgets");
@@ -221,13 +226,19 @@ export function Costs({
     staleTime: 5_000,
   });
 
-  const invalidateBudgetViews = () => {
+  const invalidateBudgetViews = async () => {
     if (!selectedCompanyId) return;
-    queryClient.invalidateQueries({ queryKey: queryKeys.budgets.overview(selectedCompanyId) });
+    await queryClient.invalidateQueries({ queryKey: queryKeys.budgets.overview(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(selectedCompanyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    queryClient.invalidateQueries({ queryKey: ["costs", selectedCompanyId] });
     queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.projects.all(selectedCompanyId) });
   };
+
+  useEffect(() => {
+    setCompanyBudgetDraft("");
+  }, [selectedCompanyId]);
 
   const policyMutation = useMutation({
     mutationFn: (input: {
@@ -930,7 +941,45 @@ export function Costs({
                 </div>
               ) : null}
 
+              {policyMutation.error ? (
+                <p role="alert" className="text-sm text-destructive">{policyMutation.error.message}</p>
+              ) : null}
+
               <div className="space-y-5">
+                {budgetPoliciesByScope.company.length === 0 ? (
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="text-base">Organization monthly budget</CardTitle>
+                      <CardDescription>
+                        No monthly cap configured. Set a limit for the UTC calendar month.
+                        A soft alert fires at 80%; reaching the limit pauses company execution.
+                        Costs still in flight can exceed the limit.
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <form className="flex flex-col gap-3 sm:flex-row sm:items-end" onSubmit={(event) => {
+                        event.preventDefault();
+                        if (!selectedCompanyId || !validCompanyBudget || policyMutation.isPending) return;
+                        policyMutation.mutate({
+                          scopeType: "company",
+                          scopeId: selectedCompanyId,
+                          amount: companyBudgetCents,
+                          windowKind: "calendar_month_utc",
+                        });
+                      }}>
+                        <div className="flex flex-1 flex-col gap-2">
+                          <label htmlFor="company-monthly-budget" className="text-sm">Monthly budget (USD)</label>
+                          <Input id="company-monthly-budget" inputMode="decimal" placeholder="0.00"
+                            value={companyBudgetDraft} disabled={policyMutation.isPending}
+                            onChange={(event) => setCompanyBudgetDraft(event.target.value)} />
+                        </div>
+                        <Button type="submit" disabled={!selectedCompanyId || !validCompanyBudget || policyMutation.isPending}>
+                          {policyMutation.isPending ? "Saving..." : "Set organization budget"}
+                        </Button>
+                      </form>
+                    </CardContent>
+                  </Card>
+                ) : null}
                 {(["company", "agent", "project"] as const).map((scopeType) => {
                   const rows = budgetPoliciesByScope[scopeType];
                   if (rows.length === 0) return null;
@@ -969,7 +1018,7 @@ export function Costs({
                 {budgetPolicies.length === 0 ? (
                   <Card>
                     <CardContent className="px-5 py-8 text-sm text-muted-foreground">
-                      No budget policies yet. Set agent and project budgets from their detail pages, or use the existing organization monthly budget control.
+                      No budget policies yet. Set the organization monthly budget above, or set agent and project budgets from their detail pages.
                     </CardContent>
                   </Card>
                 ) : null}

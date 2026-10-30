@@ -5652,6 +5652,30 @@ describeEmbeddedPostgres("tool access service", () => {
     ];
     currentTime = new Date(currentTime.getTime() + 60_001);
 
+    const accessBefore = await Promise.all([
+      db.select().from(toolProfiles), db.select().from(toolProfileEntries),
+      db.select().from(toolProfileBindings), db.select().from(toolPolicies),
+    ]);
+    const routeRead = await request(createRouteApp(db))
+      .get(`/api/tool-connections/${connected.connectionId}/catalog/persisted`);
+    expect(routeRead.status).toBe(200);
+    expect(routeRead.body.readMode).toBe("persisted");
+    const deniedAgent = await request(createRouteApp(db, agentJwtActor(company.id, randomUUID(), randomUUID())))
+      .get(`/api/tool-connections/${connected.connectionId}/catalog/persisted`);
+    expect(deniedAgent.status).toBe(403);
+    const otherCompany = await createCompany(db);
+    const deniedCompany = await request(createRouteApp(db, boardSessionActor(otherCompany.id, "operator", "unrelated-operator")))
+      .get(`/api/tool-connections/${connected.connectionId}/catalog/persisted`);
+    expect(deniedCompany.status).toBe(404);
+    expect(routeRead.body.catalog.map((entry: { toolName: string }) => entry.toolName)).toEqual(cached.map((entry) => entry.toolName));
+    const persisted = await service.listCatalog(connected.connectionId, company.id, { cacheOnly: true });
+    expect(persisted.map((entry) => entry.toolName)).toEqual(cached.map((entry) => entry.toolName));
+    expect(fetchMock).toHaveBeenCalledTimes(discoveryCallsAfterConnect);
+    expect(await Promise.all([
+      db.select().from(toolProfiles), db.select().from(toolProfileEntries),
+      db.select().from(toolProfileBindings), db.select().from(toolPolicies),
+    ])).toEqual(accessBefore);
+
     const refreshed = await service.listCatalog(connected.connectionId);
 
     expect(refreshed.map((entry) => entry.toolName)).toContain("fresh_read");
@@ -5665,6 +5689,10 @@ describeEmbeddedPostgres("tool access service", () => {
         expect.objectContaining({ toolName: "fresh_read" }),
       ]),
     );
+    const callsBeforeEmpty = fetchMock.mock.calls.length;
+    await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connected.connectionId));
+    await expect(service.listCatalog(connected.connectionId, company.id, { cacheOnly: true })).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(callsBeforeEmpty);
   });
 
   it("commits a 'Just me' key to the caller's own grant and never to the connection or an organization grant", async () => {

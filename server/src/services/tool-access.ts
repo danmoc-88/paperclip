@@ -18352,6 +18352,7 @@ export function toolAccessService(
     listCatalog: async (
       connectionId: string,
       companyId?: string,
+      options: { cacheOnly?: boolean } = {},
     ): Promise<ToolCatalogEntry[]> => {
       const connection = await getConnectionRow(connectionId, companyId);
       let rows = await db
@@ -18366,7 +18367,7 @@ export function toolAccessService(
           !connection.lastCatalogRefreshAt ||
           connection.lastCatalogRefreshAt.getTime() <=
             now().getTime() - catalogCacheTtlMs);
-      if (cacheExpired) {
+      if (cacheExpired && !options.cacheOnly) {
         try {
           await singleFlight(catalogRefreshFlights, connection.id, () =>
             refreshCatalog(connection.id, {
