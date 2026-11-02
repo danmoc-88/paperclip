@@ -28,6 +28,7 @@ patchedDependencies:
   "@chat-adapter/teams@4.39.0": patches/@chat-adapter__teams@4.39.0.patch
   "@chat-adapter/github@4.39.0": patches/@chat-adapter__github@4.39.0.patch
   "@discordjs/ws@1.2.3": patches/@discordjs__ws@1.2.3.patch
+  "@cursor/sdk@1.0.28": patches/@cursor__sdk@1.0.28.patch
 
 # Agent CLIs share the current runtime used by the native provider pack.
 # pnpm patches change package files, but overrides control dependency resolution.
