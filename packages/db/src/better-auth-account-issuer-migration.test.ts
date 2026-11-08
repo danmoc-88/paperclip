@@ -41,18 +41,17 @@ async function migrationHash() {
 }
 
 describe("account issuer schema", () => {
-  it("declares the column Better Auth requires and the key it indexes on", () => {
+  it("retains nullable legacy issuer and indexes the current provider key", () => {
     const config = getTableConfig(authAccounts);
     const issuer = config.columns.find((column) => column.name === "issuer");
     expect(issuer).toBeDefined();
-    expect(issuer?.notNull).toBe(true);
+    expect(issuer?.notNull).toBe(false);
 
-    // Better Auth declares `(issuer, accountId)` unique on the account model
-    // and resolves accounts by that pair.
-    const unique = config.indexes.find((index) => index.config.name === UNIQUE_INDEX);
+    // Better Auth 1.7.3+ resolves accounts by provider and account ID.
+    const unique = config.indexes.find((index) => index.config.name === "account_provider_account_id_uq");
     expect(unique?.config.unique).toBe(true);
     expect(unique?.config.columns.map((column) => (column as { name: string }).name)).toEqual([
-      "issuer",
+      "provider_id",
       "account_id",
     ]);
   });
@@ -74,6 +73,8 @@ describeEmbeddedPostgres("account issuer migration", () => {
     cleanups.push(database.cleanup);
     const sql = postgres(database.connectionString, { max: 1 });
     cleanups.push(async () => sql.end());
+
+    await sql`DROP INDEX IF EXISTS "account_provider_account_id_uq"`;
 
     // Rewind to the pre-upgrade shape: no issuer column, no unique index.
     await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
