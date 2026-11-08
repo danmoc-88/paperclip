@@ -491,3 +491,26 @@ reservation cannot silently disappear. Failed cleanup or an ambiguous storage
 write requires operator reconciliation before an unattached reservation is
 removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
 limits and the operator override.
+
+### Better Auth 1.7.7 account compatibility
+
+Migration `0295_better_auth_provider_key.sql` replaces the legacy issuer key
+with a unique `(provider_id, account_id)` key. It retains all `issuer` values
+and makes that column nullable because Better Auth 1.7.3+ no longer writes it.
+The migration takes an exclusive account-table lock. Duplicate provider/account
+pairs stop the transaction with an explicit error; an operator must resolve
+ambiguous identities before retrying. The migration never merges accounts.
+
+Before an approved deployment, back up the database and check for duplicate
+pairs with `SELECT provider_id, account_id, count(*) FROM account GROUP BY
+provider_id, account_id HAVING count(*) > 1`. Allow time for the table lock.
+No live-instance migration is authorized by the dependency-update PR itself.
+
+A code revert alone is unsafe after this migration. Before returning to Better
+Auth 1.7.2, stop auth writes in an approved maintenance window, inspect and
+backfill missing issuer values (`local:credential` for password accounts;
+review each OAuth provider's actual issuer separately), and verify uniqueness
+of `(issuer, account_id)`. Restore the old unique index and NOT NULL constraint
+through a reviewed forward migration before rolling back the application.
+Do not delete migration history or assume a code revert undoes SQL. Returning
+to 1.7.2 also restores the security defects; prefer a forward fix.
