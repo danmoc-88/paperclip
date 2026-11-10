@@ -275,6 +275,89 @@ describe("issue thread interaction schemas", () => {
     }
   });
 
+  it("accepts a stored gallery connection key and keeps document revisions bound", () => {
+    const storedKey =
+      "connection:app-gallery:cloudflare:11111111-1111-4111-8111-111111111111/cloudflare-abcdef12:user:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const connectionRevision = "2026-11-08T23:14:14.566Z";
+    expect(storedKey.length).toBe(128);
+
+    const stored = requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Connect your Cloudflare account to continue",
+      target: {
+        type: "custom",
+        key: storedKey,
+        revisionId: connectionRevision,
+        label: "Connect Cloudflare",
+        href: "/apps/11111111-1111-4111-8111-111111111111/permissions",
+      },
+    });
+    expect(stored.target).toMatchObject({
+      type: "custom",
+      key: storedKey,
+      revisionId: connectionRevision,
+    });
+
+    const maxNamespace = "a".repeat(160);
+    const maxName = "b".repeat(160);
+    const maxUserId = "U".repeat(500);
+    const maxKey = `connection:${maxNamespace}/${maxName}-abcdef12:user:${maxUserId}`;
+    expect(requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Connect your account to continue",
+      target: { type: "custom", key: maxKey, revisionId: connectionRevision },
+    }).target).toMatchObject({ key: maxKey, revisionId: connectionRevision });
+
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Proceed?",
+      target: { type: "custom", key: "x".repeat(121) },
+    })).toThrow(/connection authorization keys/);
+
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Connect your account to continue",
+      target: {
+        type: "custom",
+        key: `connection:${"a".repeat(161)}/${maxName}-abcdef12:user:${maxUserId}`,
+        revisionId: connectionRevision,
+      },
+    })).toThrow();
+
+    const documentRevisionId = "33333333-3333-4333-8333-333333333333";
+    expect(requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Accept the latest plan revision?",
+      target: {
+        type: "issue_document",
+        key: "plan",
+        revisionId: documentRevisionId,
+      },
+    }).target).toMatchObject({
+      type: "issue_document",
+      key: "plan",
+      revisionId: documentRevisionId,
+    });
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Accept the latest plan revision?",
+      target: {
+        type: "issue_document",
+        key: "plan",
+        revisionId: connectionRevision,
+      },
+    })).toThrow();
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Accept the latest plan revision?",
+      target: {
+        type: "issue_document",
+        key: "p".repeat(65),
+        revisionId: documentRevisionId,
+      },
+    })).toThrow();
+  });
+
   it("parses ask_user_questions supersede flags and expired results", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "ask_user_questions",
