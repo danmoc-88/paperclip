@@ -16,6 +16,7 @@ import {
   requestItemVerdictsResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
 } from "./validators/issue.js";
+import { startConnectionAuthorizationSchema } from "./validators/tool-access.js";
 
 describe("issue thread interaction schemas", () => {
   it("derives every legacy question from a complete mixed canonical form", () => {
@@ -357,6 +358,27 @@ describe("issue thread interaction schemas", () => {
       },
     })).toThrow();
   });
+
+  it.each([" ", "\t", "\n"])(
+    "accepts supported whitespace inside long connection user ids (%j)",
+    (whitespace) => {
+      const subjectUserId = `${"U".repeat(249)}${whitespace}${"U".repeat(250)}`;
+      const authorization = startConnectionAuthorizationSchema.parse({ subjectUserId });
+      const key = `connection:paperclip/cloudflare-abcdef12:user:${authorization.subjectUserId}`;
+      const payload = {
+        version: 1,
+        prompt: "Connect your account to continue",
+        target: { type: "custom", key },
+      };
+
+      expect(key.length).toBeGreaterThan(120);
+      expect(requestConfirmationPayloadSchema.parse(payload).target).toMatchObject({ key });
+      expect(() => requestConfirmationPayloadSchema.parse({
+        ...payload,
+        target: { ...payload.target, key: `${key}U` },
+      })).toThrow(/connection authorization keys/);
+    },
+  );
 
   it("parses ask_user_questions supersede flags and expired results", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
