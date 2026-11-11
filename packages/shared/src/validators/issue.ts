@@ -1527,10 +1527,53 @@ export const requestConfirmationIssueDocumentTargetSchema =
     revisionNumber: z.number().int().positive().nullable().optional(),
   });
 
+/** Ordinary custom confirmation targets stay short. */
+export const REQUEST_CONFIRMATION_CUSTOM_TARGET_KEY_MAX_LENGTH = 120;
+
+/**
+ * `connectionUid` keeps 160 characters for the application key and 160 for the
+ * connection name, then appends an 8-character id. Gallery rows still use the
+ * older application key `app-gallery:<slug>:<uuid>`. Authorization cards
+ * address that uid as `connection:<uid>:user:<userId>`. The user id follows
+ * the actor binding cap. A shorter cap here rejects the stored card and
+ * `GET /interactions` fails for the whole issue.
+ */
+const CONNECTION_UID_SEGMENT_MAX_LENGTH = 160;
+const CONNECTION_UID_ID_SUFFIX_LENGTH = 8;
+const CONNECTION_AUTHORIZATION_USER_ID_MAX_LENGTH = 500;
+export const CONNECTION_AUTHORIZATION_TARGET_KEY_MAX_LENGTH =
+  "connection:".length +
+  CONNECTION_UID_SEGMENT_MAX_LENGTH +
+  1 +
+  CONNECTION_UID_SEGMENT_MAX_LENGTH +
+  1 +
+  CONNECTION_UID_ID_SUFFIX_LENGTH +
+  ":user:".length +
+  CONNECTION_AUTHORIZATION_USER_ID_MAX_LENGTH;
+
+const connectionAuthorizationTargetKeyPattern = new RegExp(
+  `^connection:[a-z0-9._:-]{1,${CONNECTION_UID_SEGMENT_MAX_LENGTH}}/[a-z0-9._:-]{1,${CONNECTION_UID_SEGMENT_MAX_LENGTH}}-[0-9a-f]{${CONNECTION_UID_ID_SUFFIX_LENGTH}}:user:[\\s\\S]{1,${CONNECTION_AUTHORIZATION_USER_ID_MAX_LENGTH}}$`,
+);
+
+const requestConfirmationCustomTargetKeySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(CONNECTION_AUTHORIZATION_TARGET_KEY_MAX_LENGTH)
+  .superRefine((key, ctx) => {
+    if (key.length <= REQUEST_CONFIRMATION_CUSTOM_TARGET_KEY_MAX_LENGTH) return;
+    if (connectionAuthorizationTargetKeyPattern.test(key)) return;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "Custom confirmation target keys longer than 120 characters must be connection authorization keys",
+    });
+  });
+
 export const requestConfirmationCustomTargetSchema =
   requestConfirmationTargetBaseSchema.extend({
     type: z.literal("custom"),
-    key: z.string().trim().min(1).max(120),
+    key: requestConfirmationCustomTargetKeySchema,
     revisionId: z.string().trim().min(1).max(255).nullable().optional(),
     revisionNumber: z.number().int().positive().nullable().optional(),
   });

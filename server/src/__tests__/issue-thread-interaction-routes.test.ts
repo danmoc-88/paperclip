@@ -1077,6 +1077,42 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
   });
 
+  it("rejects withdrawal of a stored gallery connection card by an unrelated agent", async () => {
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-gallery-connection",
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: CREATED_AGENT_ID,
+      sourceRunId: RUN_1,
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Connect your Cloudflare account to continue",
+        target: {
+          type: "custom",
+          key: "connection:app-gallery:cloudflare:11111111-1111-4111-8111-111111111111/cloudflare-abcdef12:user:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          revisionId: "2026-11-08T23:14:14.566Z",
+        },
+      },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: RUN_3,
+    });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-gallery-connection/withdraw")
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Only the interaction creator, current issue assignee, or a board user may withdraw it",
+    });
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
   it("lets a watchdog-scoped assignee withdraw through ordinary containment", async () => {
     mockResolveTaskWatchdogMutationScope.mockResolvedValue({
       kind: "watchdog",

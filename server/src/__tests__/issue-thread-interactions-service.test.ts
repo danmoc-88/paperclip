@@ -3621,6 +3621,104 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.status).toBe("pending");
   });
 
+  it("reads a stored gallery connection card and still changes issue status", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Gallery connection key");
+    const documentTarget = await attachPlanDocument(companyId, issueId);
+    const connectionKey =
+      "connection:app-gallery:cloudflare:11111111-1111-4111-8111-111111111111/cloudflare-abcdef12:user:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const connectionRevision = "2026-11-08T23:14:14.566Z";
+    const connectionInteractionId = randomUUID();
+
+    // The authorization writer inserts this payload directly. The key is the
+    // older gallery uid, which is longer than the ordinary custom-target cap.
+    await db.insert(issueThreadInteractions).values({
+      id: connectionInteractionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      idempotencyKey: "connection-authorization:gallery-cloudflare",
+      title: "Connect your Cloudflare",
+      addresseeUserId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      payload: {
+        version: 1,
+        prompt: "Connect your Cloudflare account to continue",
+        target: {
+          type: "custom",
+          key: connectionKey,
+          revisionId: connectionRevision,
+          label: "Connect Cloudflare",
+          href: "/apps/11111111-1111-4111-8111-111111111111/permissions",
+        },
+      },
+    });
+
+    const documentCard = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      resolverPolicy: "human_only",
+      payload: {
+        version: 1,
+        prompt: "Accept the latest plan revision?",
+        target: documentTarget,
+      },
+    }, { userId: "local-board" });
+
+    const before = await interactionsSvc.listForIssue(issueId);
+    expect(before).toHaveLength(2);
+    expect(before.find((interaction) => interaction.id === connectionInteractionId)).toMatchObject({
+      status: "pending",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        target: {
+          type: "custom",
+          key: connectionKey,
+          revisionId: connectionRevision,
+        },
+      },
+    });
+    expect(before.find((interaction) => interaction.id === documentCard.id)).toMatchObject({
+      status: "pending",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        target: {
+          type: "issue_document",
+          key: "plan",
+          revisionId: documentTarget.revisionId,
+        },
+      },
+    });
+
+    const updated = await issuesSvc.update(issueId, { status: "todo" });
+    expect(updated?.status).toBe("todo");
+
+    const after = await interactionsSvc.listForIssue(issueId);
+    expect(after.find((interaction) => interaction.id === connectionInteractionId)).toMatchObject({
+      status: "pending",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        target: {
+          key: connectionKey,
+          revisionId: connectionRevision,
+        },
+      },
+    });
+    expect(after.find((interaction) => interaction.id === documentCard.id)).toMatchObject({
+      status: "pending",
+      payload: {
+        target: {
+          type: "issue_document",
+          key: "plan",
+          revisionId: documentTarget.revisionId,
+        },
+      },
+    });
+  });
+
   it("lists interactions whose stored result predates the current schema without throwing (LOOA-629)", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Legacy result outcome");
 

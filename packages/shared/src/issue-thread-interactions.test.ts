@@ -16,6 +16,7 @@ import {
   requestItemVerdictsResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
 } from "./validators/issue.js";
+import { startConnectionAuthorizationSchema } from "./validators/tool-access.js";
 
 describe("issue thread interaction schemas", () => {
   it("derives every legacy question from a complete mixed canonical form", () => {
@@ -274,6 +275,110 @@ describe("issue thread interaction schemas", () => {
       });
     }
   });
+
+  it("accepts a stored gallery connection key and keeps document revisions bound", () => {
+    const storedKey =
+      "connection:app-gallery:cloudflare:11111111-1111-4111-8111-111111111111/cloudflare-abcdef12:user:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const connectionRevision = "2026-11-08T23:14:14.566Z";
+    expect(storedKey.length).toBe(128);
+
+    const stored = requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Connect your Cloudflare account to continue",
+      target: {
+        type: "custom",
+        key: storedKey,
+        revisionId: connectionRevision,
+        label: "Connect Cloudflare",
+        href: "/apps/11111111-1111-4111-8111-111111111111/permissions",
+      },
+    });
+    expect(stored.target).toMatchObject({
+      type: "custom",
+      key: storedKey,
+      revisionId: connectionRevision,
+    });
+
+    const maxNamespace = "a".repeat(160);
+    const maxName = "b".repeat(160);
+    const maxUserId = "U".repeat(500);
+    const maxKey = `connection:${maxNamespace}/${maxName}-abcdef12:user:${maxUserId}`;
+    expect(requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Connect your account to continue",
+      target: { type: "custom", key: maxKey, revisionId: connectionRevision },
+    }).target).toMatchObject({ key: maxKey, revisionId: connectionRevision });
+
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Proceed?",
+      target: { type: "custom", key: "x".repeat(121) },
+    })).toThrow(/connection authorization keys/);
+
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Connect your account to continue",
+      target: {
+        type: "custom",
+        key: `connection:${"a".repeat(161)}/${maxName}-abcdef12:user:${maxUserId}`,
+        revisionId: connectionRevision,
+      },
+    })).toThrow();
+
+    const documentRevisionId = "33333333-3333-4333-8333-333333333333";
+    expect(requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Accept the latest plan revision?",
+      target: {
+        type: "issue_document",
+        key: "plan",
+        revisionId: documentRevisionId,
+      },
+    }).target).toMatchObject({
+      type: "issue_document",
+      key: "plan",
+      revisionId: documentRevisionId,
+    });
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Accept the latest plan revision?",
+      target: {
+        type: "issue_document",
+        key: "plan",
+        revisionId: connectionRevision,
+      },
+    })).toThrow();
+    expect(() => requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Accept the latest plan revision?",
+      target: {
+        type: "issue_document",
+        key: "p".repeat(65),
+        revisionId: documentRevisionId,
+      },
+    })).toThrow();
+  });
+
+  it.each([" ", "\t", "\n"])(
+    "accepts supported whitespace inside long connection user ids (%j)",
+    (whitespace) => {
+      const subjectUserId = `${"U".repeat(249)}${whitespace}${"U".repeat(250)}`;
+      const authorization = startConnectionAuthorizationSchema.parse({ subjectUserId });
+      const key = `connection:paperclip/cloudflare-abcdef12:user:${authorization.subjectUserId}`;
+      const payload = {
+        version: 1,
+        prompt: "Connect your account to continue",
+        target: { type: "custom", key },
+      };
+
+      expect(key.length).toBeGreaterThan(120);
+      expect(requestConfirmationPayloadSchema.parse(payload).target).toMatchObject({ key });
+      expect(() => requestConfirmationPayloadSchema.parse({
+        ...payload,
+        target: { ...payload.target, key: `${key}U` },
+      })).toThrow(/connection authorization keys/);
+    },
+  );
 
   it("parses ask_user_questions supersede flags and expired results", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
