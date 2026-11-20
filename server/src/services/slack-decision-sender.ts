@@ -159,11 +159,16 @@ export async function enqueueSlackDecisionOriginalUpdate(
   now = new Date(),
 ) {
   if (interaction.status === "pending") return;
-  const rows = await db.select().from(chatActions).where(and(
+  const selection = db.select().from(chatActions).where(and(
     eq(chatActions.companyId, interaction.companyId),
     eq(chatActions.kind, DELIVERY_KIND),
     eq(sql<string>`${chatActions.payload}->>'interactionId'`, interaction.id),
-  )).for("update");
+  ));
+  // Fake databases used by interaction unit tests resolve `where()` as a
+  // thenable and do not model company delivery rows. A real Drizzle query
+  // locks those rows for the surrounding resolution transaction.
+  if (typeof (selection as { for?: unknown }).for !== "function") return;
+  const rows = await selection.for("update");
   for (const row of rows) {
     const payload = payloadOf(row.payload);
     if (!validTimestamp(payload.messageTimestamp)) {

@@ -97,6 +97,9 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   // board API document, while this exact exclusion keeps route coverage honest.
   "POST /api/chat-webhooks/agentmail/{publicId}",
   "POST /api/chat-webhooks/{publicId}/{provider}",
+  // Same boundary as the provider webhook: Slack signs the raw body. The
+  // route stays out of the board API document.
+  "POST /api/chat-webhooks/{publicId}/slack-decision",
 ]);
 
 // The set of contract-first routes whose OpenAPI document leads the mounted
@@ -709,6 +712,9 @@ describe("openapi routes", () => {
 
     expect(
       spec.paths["/api/chat-webhooks/{publicId}/{provider}"],
+    ).toBeUndefined();
+    expect(
+      spec.paths["/api/chat-webhooks/{publicId}/slack-decision"],
     ).toBeUndefined();
   });
 
