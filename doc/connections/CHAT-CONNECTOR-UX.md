@@ -432,6 +432,27 @@ timestamp exists. Reject and answer buttons prepare a modal in memory; the HTTP
 acknowledgement stays empty. A recorded view receipt is required before a
 submission can resolve. Closing a modal does not reject the card. The callback
 rechecks the route and an active company membership inside the canonical
-resolution transaction, then consumes the action. It does not post a message,
-update the original Slack message, or retry through Slack. The existing agent
-webhook path is unchanged. These tests do not establish a live Slack integration.
+resolution transaction, then consumes the action. It does not post a message.
+The existing agent webhook path is unchanged. These tests do not establish a
+live Slack integration.
+
+The interactive flag is off unless a caller passes `interactive: true`. A
+granted route then plans one link-only delivery for that source digest and
+still does not issue tokens. The sender accepts an injected transport, posts
+that linked text once, and never constructs a Slack client or reads the host
+notification script. A key already present in the historical registry
+(`companyId:interactionId:sourceDigest`, the interaction id, or the issue id)
+is marked `skipped_historical` and is not posted again. HTTP 429 and 5xx
+schedule 15s, 30s, then 60s before one more attempt; a fourth failure is
+`failed`. An unknown POST result stays unknown until reconciliation. Finding
+the message adopts its timestamp. Finding no message allows one later post.
+It does not send a second card while the result is unknown.
+
+A terminal card cancels a delivery that has no message timestamp. A delivery
+that already has a timestamp queues one replacement: `Daniel · yyyy-mm-dd
+hh:mm Europe/Warsaw · <public label>`, plus the same card link and no
+decision buttons. The public label is the confirmation verb, the selected
+option labels, or a generic closed/answered line. Rejection reasons and
+free-text answers are not copied. A failed replacement retries on the same
+timestamp and does not resolve the card again. No timer in this preparation
+stage calls the sender, and the host notification script is not modified.

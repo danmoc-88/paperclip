@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { chatActions, chatEndpoints, companyMemberships, type Db } from "@paperclipai/db";
 import type { IssueThreadInteraction } from "@paperclipai/shared";
 import { prepareSlackDecisionPublication } from "./chat-interaction-publications.js";
@@ -21,6 +21,17 @@ import { logger } from "../middleware/logger.js";
 const DELIVERY_KIND = "slack_decision_delivery";
 const deliveryKey = (interactionId: string, sourceDigest: string) =>
   `slack-decision-delivery:${interactionId}:${sourceDigest}`;
+
+/** Shared owner key for one company card revision. The host notification
+ * registry and this publisher must both treat a hit as already delivered.
+ */
+export function slackDecisionDeliveryDedupeKey(
+  companyId: string,
+  interactionId: string,
+  sourceDigest: string,
+) {
+  return `${companyId}:${interactionId}:${sourceDigest}`;
+}
 
 type Writer = Pick<Db, "select" | "insert" | "update">;
 
@@ -50,6 +61,7 @@ export async function planCompanySlackDecisionDelivery(
   db: Writer,
   interaction: IssueThreadInteraction,
   now = new Date(),
+  options: { interactive?: boolean } = {},
 ) {
   if (interaction.status !== "pending") return { mode: "disabled" as const };
   if (interaction.kind !== "request_confirmation" && interaction.kind !== "ask_user_questions") {
@@ -63,22 +75,41 @@ export async function planCompanySlackDecisionDelivery(
     userId: route.userId,
     publicBaseUrl: route.publicBaseUrl,
   }, now);
-  if (!prepared) return { mode: "disabled" as const };
+  if (!prepared?.cardUrl || !prepared.payload.text.includes(prepared.cardUrl)) {
+    return { mode: "disabled" as const };
+  }
   const sourceDigest = slackDecisionSourceDigest(interaction);
-  await db.insert(chatActions).values({
+  // The route grant is not the launch flag. Interactive buttons stay off
+  // unless this call opts in, so a granted route still plans a link.
+  const mode = options.interactive === true && prepared.mode === "decision" ? "decision" : "link_only";
+  const providerActionId = deliveryKey(interaction.id, sourceDigest);
+  const payload = {
+    mode,
+    interactionId: interaction.id,
+    issueId: interaction.issueId,
+    sourceDigest,
+    dedupeKey: slackDecisionDeliveryDedupeKey(route.companyId, interaction.id, sourceDigest),
+    awaitingReceipt: mode === "decision",
+    text: prepared.payload.text,
+    cardUrl: prepared.cardUrl,
+    attempts: 0,
+  };
+  const inserted = await db.insert(chatActions).values({
     companyId: route.companyId,
     endpointId: route.endpointId,
     kind: DELIVERY_KIND,
-    providerActionId: deliveryKey(interaction.id, sourceDigest),
+    providerActionId,
     status: "pending",
-    payload: {
-      mode: prepared.mode,
-      interactionId: interaction.id,
-      sourceDigest,
-      awaitingReceipt: prepared.mode === "decision",
-    },
-  }).onConflictDoNothing({ target: [chatActions.endpointId, chatActions.providerActionId] });
-  return { mode: prepared.mode };
+    payload,
+  }).onConflictDoNothing({
+    target: [chatActions.endpointId, chatActions.providerActionId],
+  }).returning({ payload: chatActions.payload });
+  const stored = inserted[0]?.payload ?? (await db.select({ payload: chatActions.payload }).from(chatActions).where(and(
+    eq(chatActions.endpointId, route.endpointId),
+    eq(chatActions.providerActionId, providerActionId),
+  )))[0]?.payload;
+  const storedMode = stored && typeof stored === "object" && !Array.isArray(stored) ? stored.mode : mode;
+  return { mode: storedMode === "decision" ? "decision" as const : "link_only" as const };
 }
 
 /** Issues one-use actions only after the publisher has a message timestamp.
@@ -111,10 +142,10 @@ export async function commitSlackDecisionPublicationReceipt(
       eq(chatActions.endpointId, route.endpointId),
       eq(chatActions.kind, DELIVERY_KIND),
       eq(chatActions.providerActionId, deliveryKey(interaction.id, sourceDigest)),
-      eq(chatActions.status, "pending"),
+      inArray(chatActions.status, ["pending", "sending", "sent"]),
     )).for("update");
     const payload = deliveryPayload(delivery?.payload);
-    if (!delivery || payload.interactionId !== interaction.id || payload.sourceDigest !== sourceDigest) {
+    if (!delivery || payload.mode !== "decision" || payload.interactionId !== interaction.id || payload.sourceDigest !== sourceDigest) {
       throw new SlackDecisionPolicyError();
     }
     if (typeof payload.messageTimestamp === "string" && payload.messageTimestamp !== messageTimestamp) {
@@ -141,7 +172,15 @@ export async function commitSlackDecisionPublicationReceipt(
       }, now));
     }
     await tx.update(chatActions).set({
-      payload: { mode: "decision", interactionId: interaction.id, sourceDigest, messageTimestamp, actionIds },
+      payload: {
+        ...payload,
+        mode: "decision",
+        interactionId: interaction.id,
+        sourceDigest,
+        messageTimestamp,
+        actionIds,
+        awaitingReceipt: false,
+      },
       updatedAt: now,
     }).where(eq(chatActions.id, delivery.id));
     return actionIds;

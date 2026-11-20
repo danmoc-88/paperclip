@@ -210,7 +210,7 @@ export function projectSlackDecisionPublication(
   });
   payload.text += `\n\nOtwórz kartę: ${projection.cardUrl}`;
   payload.card!.actions = [{ type: "link", label: "Otwórz kartę", url: projection.cardUrl }];
-  return { mode: projection.mode, payload };
+  return { mode: projection.mode, payload, cardUrl: projection.cardUrl };
 }
 
 export type SlackDecisionResolution =

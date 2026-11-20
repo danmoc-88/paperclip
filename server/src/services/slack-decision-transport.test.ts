@@ -23,10 +23,17 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { slackDecisionDisclosureService } from "./slack-decision-disclosures.js";
 import { slackDecisionSourceDigest } from "./slack-decision-policy.js";
 import {
+  dispatchSlackDecisionDeliveries,
+  reconcileSlackDecisionDeliveries,
+  type SlackDecisionMessageTransport,
+  type SlackDecisionSendResult,
+} from "./slack-decision-sender.js";
+import {
   commitSlackDecisionPublicationReceipt,
   handleSlackDecisionCallback,
   planCompanySlackDecisionDelivery,
   recordSlackDecisionModalReceipt,
+  slackDecisionDeliveryDedupeKey,
 } from "./slack-decision-transport.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -165,8 +172,8 @@ describeEmbeddedPostgres("slack decision transport", () => {
     await db.insert(companyMemberships).values({
       companyId, principalType: "user", principalId: "local-board", status: "active",
     });
-    expect(await planCompanySlackDecisionDelivery(db, interaction)).toEqual({ mode: "decision" });
-    expect(await planCompanySlackDecisionDelivery(db, interaction)).toEqual({ mode: "decision" });
+    expect(await planCompanySlackDecisionDelivery(db, interaction, new Date(), { interactive: true })).toEqual({ mode: "decision" });
+    expect(await planCompanySlackDecisionDelivery(db, interaction, new Date(), { interactive: true })).toEqual({ mode: "decision" });
     const deliveries = await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery"));
     expect(deliveries).toHaveLength(1);
     expect(JSON.stringify(deliveries[0]?.payload)).not.toContain("pcsd:");
@@ -208,7 +215,7 @@ describeEmbeddedPostgres("slack decision transport", () => {
     await db.insert(companyMemberships).values({
       companyId, principalType: "user", principalId: "local-board", status: "active",
     });
-    await planCompanySlackDecisionDelivery(db, interaction);
+    await planCompanySlackDecisionDelivery(db, interaction, new Date(), { interactive: true });
     const actionIds = await commitSlackDecisionPublicationReceipt(db, interaction, "123.456");
     const rejectId = actionIds[1]!;
     const opened = await handleSlackDecisionCallback(db, {
@@ -246,5 +253,147 @@ describeEmbeddedPostgres("slack decision transport", () => {
       eq(activityLog.entityId, interaction.id),
     ));
     expect(JSON.stringify(audits)).not.toContain("PRIVATE REASON");
+  });
+
+  function recordingTransport(result: () => SlackDecisionSendResult) {
+    const posts: Array<{ text: string; buttons?: unknown; cardUrl: string }> = [];
+    const updates: Array<{ text: string; buttons?: unknown; messageTimestamp: string }> = [];
+    let inspected: "absent" | "present" | "unknown" = "absent";
+    const transport: SlackDecisionMessageTransport = {
+      async post(message) {
+        posts.push({ text: message.text, buttons: message.buttons, cardUrl: message.cardUrl });
+        return result();
+      },
+      async update(message) {
+        updates.push({ text: message.text, buttons: message.buttons, messageTimestamp: message.messageTimestamp });
+        return { outcome: "sent", messageTimestamp: message.messageTimestamp };
+      },
+      async inspect(query) {
+        return inspected === "present"
+          ? { outcome: "present", messageTimestamp: query.messageTimestamp ?? "123.456", text: updates.at(-1)?.text }
+          : { outcome: inspected };
+      },
+    };
+    return { transport, posts, updates, setInspected: (value: typeof inspected) => { inspected = value; } };
+  }
+
+  async function classified(interactive = false) {
+    const seeded = await seed();
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    await slackDecisionDisclosureService(db).update(seeded.endpointId, seeded.interaction.id, {
+      disclosure: { sourceDigest: slackDecisionSourceDigest(seeded.interaction), topic: "product_direction", expiresAt },
+    }, "local-board");
+    await grantRoute(seeded.companyId, seeded.endpointId);
+    await db.insert(companyMemberships).values({
+      companyId: seeded.companyId, principalType: "user", principalId: "local-board", status: "active",
+    });
+    await planCompanySlackDecisionDelivery(db, seeded.interaction, new Date(), { interactive });
+    return seeded;
+  }
+
+  it("keeps the flag off: one linked message, no buttons, no tokens, and no historical resend", async () => {
+    const { companyId, interaction } = await classified(false);
+    const planned = await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery"));
+    expect(planned).toHaveLength(1);
+    expect(planned[0]?.payload).toMatchObject({ mode: "link_only" });
+    expect(JSON.stringify(planned[0]?.payload)).toContain("Otwórz kartę:");
+    await expect(commitSlackDecisionPublicationReceipt(db, interaction, "123.456")).rejects.toThrow("requires a response in MyDay");
+    expect(await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_action"))).toHaveLength(0);
+
+    const seen = recordingTransport(() => ({ outcome: "sent", messageTimestamp: "123.456" }));
+    const digest = slackDecisionSourceDigest(interaction);
+    await dispatchSlackDecisionDeliveries(db, seen.transport, {
+      historicalKeys: new Set([slackDecisionDeliveryDedupeKey(companyId, interaction.id, digest)]),
+    });
+    expect(seen.posts).toHaveLength(0);
+    expect((await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0]?.status)
+      .toBe("skipped_historical");
+
+    await db.update(chatActions).set({ status: "pending" }).where(eq(chatActions.kind, "slack_decision_delivery"));
+    await dispatchSlackDecisionDeliveries(db, seen.transport);
+    await dispatchSlackDecisionDeliveries(db, seen.transport);
+    expect(seen.posts).toHaveLength(1);
+    expect(seen.posts[0]?.buttons).toBeUndefined();
+    expect(seen.posts[0]?.text).toContain(seen.posts[0]?.cardUrl ?? "");
+    expect(seen.updates).toHaveLength(0);
+    expect(await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_action"))).toHaveLength(0);
+  });
+
+  it("retries a 429 and does not post again after an unknown result until reconciliation finds no message", async () => {
+    await classified(false);
+    const now = new Date("2026-11-20T06:47:00.000Z");
+    let posts = 0;
+    const transport = recordingTransport(() => {
+      posts += 1;
+      if (posts === 1) return { outcome: "retryable", statusCode: 429 };
+      if (posts === 2) return { outcome: "unknown" };
+      return { outcome: "sent", messageTimestamp: "123.456" };
+    });
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now });
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now });
+    expect(posts).toBe(1);
+    expect((await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0]?.status)
+      .toBe("retry");
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now: new Date(now.getTime() + 15_000) });
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now: new Date(now.getTime() + 15_000) });
+    expect(posts).toBe(2);
+    expect((await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0]?.status)
+      .toBe("delivery_unknown");
+    await reconcileSlackDecisionDeliveries(db, transport.transport, { now: new Date(now.getTime() + 15_000) });
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now: new Date(now.getTime() + 20_000) });
+    expect(posts).toBe(3);
+    expect((await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0]?.status)
+      .toBe("sent");
+  });
+
+  it("updates the original message once after a decision and retries a failed replacement without resolving again", async () => {
+    const { endpointId, publicId, interaction } = await classified(true);
+    let updates = 0;
+    const updateMessages: Array<{ text: string; buttons?: unknown }> = [];
+    const transport = recordingTransport(() => ({ outcome: "sent", messageTimestamp: "123.456" }));
+    transport.transport.update = async (message) => {
+      updates += 1;
+      updateMessages.push({ text: message.text, buttons: message.buttons });
+      if (updates === 2) return { outcome: "retryable", statusCode: 503 };
+      return { outcome: "sent", messageTimestamp: message.messageTimestamp };
+    };
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { interactive: true });
+    expect(transport.posts).toHaveLength(1);
+    expect(transport.posts[0]?.buttons).toBeUndefined();
+    expect(updates).toBe(1);
+    const delivery = (await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0];
+    const actionIds = (delivery?.payload as { actionIds?: string[] }).actionIds ?? [];
+    expect(actionIds).toHaveLength(2);
+    const accepted = await handleSlackDecisionCallback(db, {
+      publicId, ...signedRequest(button(actionIds[0]!)), readSigningSecret: async () => secret,
+    });
+    expect(accepted.status).toBe(200);
+    expect((await issueThreadInteractionService(db).getById(interaction.id))?.status).toBe("accepted");
+    const queued = (await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0];
+    expect(queued?.status).toBe("update_pending");
+    const queuedText = (queued?.payload as { update?: { text?: string } }).update?.text ?? "";
+    expect(queuedText).toMatch(/Daniel · \d{4}-\d{2}-\d{2} \d{2}:\d{2} Europe\/Warsaw · Zatwierdź/);
+    expect(queuedText).not.toContain("pcsd:");
+    const now = new Date("2026-11-20T07:00:00.000Z");
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now });
+    expect(updates).toBe(2);
+    expect((await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0]?.status)
+      .toBe("update_retry");
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now: new Date(now.getTime() + 15_000) });
+    await dispatchSlackDecisionDeliveries(db, transport.transport, { now: new Date(now.getTime() + 15_000) });
+    expect(updates).toBe(3);
+    expect(updateMessages[1]?.buttons).toBeUndefined();
+    expect(updateMessages[1]?.text).toContain("Otwórz kartę:");
+    expect(updateMessages[1]?.text).not.toContain(secret);
+    expect((await db.select().from(chatActions).where(eq(chatActions.kind, "slack_decision_delivery")))[0]?.status)
+      .toBe("updated");
+    const replay = await handleSlackDecisionCallback(db, {
+      publicId, ...signedRequest(button(actionIds[0]!)), readSigningSecret: async () => secret,
+    });
+    expect(replay.status).toBe(200);
+    expect((await issueThreadInteractionService(db).getById(interaction.id))?.status).toBe("accepted");
+    const audits = await db.select().from(activityLog).where(eq(activityLog.action, "slack.decision_resolved"));
+    expect(audits).toHaveLength(1);
+    expect(endpointId).toBeTruthy();
   });
 });
