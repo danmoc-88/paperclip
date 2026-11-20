@@ -355,9 +355,9 @@ action; removing a Paperclip connection does not delete the provider app or bot.
 
 ### Slack decision disclosure preparation
 
-The decision-card implementation is not connected to the Slack transport yet.
-It does not enable an application or send messages. The resolver requires an
-explicit enabled dependency and otherwise refuses every resolution.
+The decision-card route is fail-closed. It does not enable an application or
+send messages. With no granted company route, publication planning writes
+nothing and the decision callback answers 404 without reading a signature.
 
 `PUT /api/chat-endpoints/:endpointId/slack/decision-disclosures/:interactionId`
 is a Board-only classification API, using the existing company and
@@ -418,7 +418,20 @@ view binding before that receipt commits.
 Issuance is internal and requires a publication receipt; no HTTP issuance API or
 transport is enabled by this helper.
 
-Decision callback dispatch, action issuance by the publisher, modal transport, company
-routing, historical delivery deduplication, and transport retry are not wired to
-this helper yet. The policy tests and isolated database tests establish these
-internal contracts; they do not establish a live Slack integration.
+`POST /api/chat-webhooks/:publicId/slack-decision` is a separate ingress from the
+agent webhook. It loads one granted `slack_decision_route` record
+(`providerActionId` `slack-decision-route`, `enabled: true`) for that Slack
+endpoint, verifies the captured body, and only then loads the opaque action.
+There is no API in this preparation stage that creates or enables that record.
+A missing, revoked, duplicated, or malformed route stays off.
+
+When a route is granted, creating a pending question or confirmation claims one
+`slack_decision_delivery` row for that source digest and does not call Slack.
+One-use action tokens are issued only by the receipt helper after a message
+timestamp exists. Reject and answer buttons prepare a modal in memory; the HTTP
+acknowledgement stays empty. A recorded view receipt is required before a
+submission can resolve. Closing a modal does not reject the card. The callback
+rechecks the route and an active company membership inside the canonical
+resolution transaction, then consumes the action. It does not post a message,
+update the original Slack message, or retry through Slack. The existing agent
+webhook path is unchanged. These tests do not establish a live Slack integration.

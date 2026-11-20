@@ -249,6 +249,9 @@ export async function enqueueIssueInteractionChatPublications(
   db: ChatPublicationDb,
   interaction: IssueThreadInteraction,
 ) {
+  // Loaded lazily so the company planner can depend on this module without a cycle.
+  const { planCompanySlackDecisionDelivery } = await import("./slack-decision-transport.js");
+  await planCompanySlackDecisionDelivery(db, interaction);
   if (interaction.status !== "pending") return [];
   // The first native-chat wave intentionally externalizes only questions and
   // confirmations. Other governance interactions have richer partial and

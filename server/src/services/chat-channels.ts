@@ -38373,6 +38373,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     finishSlackSetup: (endpointId: string, userId: string) => test(endpointId, { optionalSlackTestForUser: userId }),
     setupTestStatus,
     handleWebhook,
+    readSlackSigningSecret: async (publicId: string) => {
+      if (typeof publicId !== "string" || publicId.length === 0 || publicId.length > 200) return null;
+      const endpoint = await db.select().from(chatEndpoints).where(and(
+        eq(chatEndpoints.publicId, publicId),
+        eq(chatEndpoints.provider, "slack"),
+      )).then((rows) => rows[0] ?? null);
+      if (!endpoint || endpoint.status === "archived") return null;
+      try {
+        const credentials = await resolveCredentials(endpoint);
+        return typeof credentials.signingSecret === "string" && credentials.signingSecret.length > 0
+          ? credentials.signingSecret
+          : null;
+      } catch {
+        return null;
+      }
+    },
     listResources,
     replaceResources,
     listPrincipals,
