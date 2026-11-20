@@ -355,9 +355,9 @@ action; removing a Paperclip connection does not delete the provider app or bot.
 
 ### Slack decision disclosure preparation
 
-The decision-card implementation is not connected to the Slack transport yet.
-It does not enable an application or send messages. The resolver requires an
-explicit enabled dependency and otherwise refuses every resolution.
+The decision-card route is fail-closed. It does not enable an application or
+send messages. With no granted company route, publication planning writes
+nothing and the decision callback answers 404 without reading a signature.
 
 `PUT /api/chat-endpoints/:endpointId/slack/decision-disclosures/:interactionId`
 is a Board-only classification API, using the existing company and
@@ -389,7 +389,70 @@ answer text and rejection reasons. Stale plan targets expire; panel/callback rac
 permit one terminal resolution. The transport must supply a transactional
 authorization/action-consumption hook before enabling the resolver.
 
-Provider identity/signature checks, one-use action issuance, modals, company
-routing, historical delivery deduplication, and transport retry are not wired to
-this helper yet. The policy tests and isolated database tests establish these
-internal contracts; they do not establish a live Slack integration.
+The shared Slack signature preflight checks the captured bytes with HMAC-SHA256,
+constant-time digest comparison, and a five-minute timestamp window. The decision
+callback preflight additionally binds workspace, app, user, channel, message and
+opaque action IDs; modal submissions require the recorded view ID and matching
+opaque metadata. A modal close is a distinct event, never a rejection. This
+preflight is not a durable receipt or authorization to resolve: the company route
+must still load its binding from protected state and recheck current authority
+while consuming the action in the canonical resolution transaction.
+
+The decision modal renderer retains classified questions and consequences without
+truncation, uses a rejection-only confirmation form, and falls back to the card
+when provider limits cannot preserve the source. Its decoder accepts only the
+expected input fields, maps source option IDs and private text through the
+canonical answer validator, and rejects incomplete or extra fields. These
+helpers do not open views or consume actions.
+
+The internal decision action ledger stores opaque tokens separately from
+classification records. Each token binds company, endpoint, source digest,
+operation, user, workspace, app, channel, message receipt and expiry. Consumption
+locks the pending record inside the canonical resolution transaction, compares
+all bound fields and records only receive/consume times. Rollback restores the
+action; concurrent consumers cannot both succeed. The caller must still verify
+current route and user authorization in that transaction before consumption.
+A modal token exists before opening its view; a separate transaction binds the
+confirmed view receipt once and refuses replacement. Submissions have no valid
+view binding before that receipt commits.
+Issuance is internal and requires a publication receipt; no HTTP issuance API or
+transport is enabled by this helper.
+
+`POST /api/chat-webhooks/:publicId/slack-decision` is a separate ingress from the
+agent webhook. It loads one granted `slack_decision_route` record
+(`providerActionId` `slack-decision-route`, `enabled: true`) for that Slack
+endpoint, verifies the captured body, and only then loads the opaque action.
+There is no API in this preparation stage that creates or enables that record.
+A missing, revoked, duplicated, or malformed route stays off.
+
+When a route is granted, creating a pending question or confirmation claims one
+`slack_decision_delivery` row for that source digest and does not call Slack.
+One-use action tokens are issued only by the receipt helper after a message
+timestamp exists. Reject and answer buttons prepare a modal in memory; the HTTP
+acknowledgement stays empty. A recorded view receipt is required before a
+submission can resolve. Closing a modal does not reject the card. The callback
+rechecks the route and an active company membership inside the canonical
+resolution transaction, then consumes the action. It does not post a message.
+The existing agent webhook path is unchanged. These tests do not establish a
+live Slack integration.
+
+The interactive flag is off unless a caller passes `interactive: true`. A
+granted route then plans one link-only delivery for that source digest and
+still does not issue tokens. The sender accepts an injected transport, posts
+that linked text once, and never constructs a Slack client or reads the host
+notification script. A key already present in the historical registry
+(`companyId:interactionId:sourceDigest`, the interaction id, or the issue id)
+is marked `skipped_historical` and is not posted again. HTTP 429 and 5xx
+schedule 15s, 30s, then 60s before one more attempt; a fourth failure is
+`failed`. An unknown POST result stays unknown until reconciliation. Finding
+the message adopts its timestamp. Finding no message allows one later post.
+It does not send a second card while the result is unknown.
+
+A terminal card cancels a delivery that has no message timestamp. A delivery
+that already has a timestamp queues one replacement: `Daniel · yyyy-mm-dd
+hh:mm Europe/Warsaw · <public label>`, plus the same card link and no
+decision buttons. The public label is the confirmation verb, the selected
+option labels, or a generic closed/answered line. Rejection reasons and
+free-text answers are not copied. A failed replacement retries on the same
+timestamp and does not resolve the card again. No timer in this preparation
+stage calls the sender, and the host notification script is not modified.

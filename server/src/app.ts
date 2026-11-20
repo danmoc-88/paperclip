@@ -597,7 +597,7 @@ export async function createApp(
   // before Paperclip persists or acts on any event.
   const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
   app.use(emailWebhookRoutes(emailChannels));
-  app.use(chatWebhookRoutes(chatChannels));
+  app.use(chatWebhookRoutes(chatChannels, { db }));
   // The instance validates single-use registration state and its trusted
   // current origin. This exact GET is the only public setup return.
   app.get("/api/chat-github/manifest/callback", async (req, res) => {

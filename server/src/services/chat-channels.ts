@@ -1,3 +1,4 @@
+import { slackRequestSignatureIsValid } from "./slack-request-authentication.js";
 import { withSlackBoardLease } from "./slack-board-lease.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { authorizeSlackBoardPublication } from "./slack-board-authority.js";
@@ -456,28 +457,6 @@ function publicationPrecedes(
       ),
     ),
   );
-}
-
-function slackRequestSignatureIsValid(
-  request: Request,
-  body: string,
-  signingSecret: string,
-): boolean {
-  const timestamp = request.headers.get("x-slack-request-timestamp");
-  const signature = request.headers.get("x-slack-signature");
-  if (!timestamp || !signature) return false;
-  const timestampSeconds = Number(timestamp);
-  if (
-    !Number.isFinite(timestampSeconds) ||
-    Math.abs(Math.floor(Date.now() / 1000) - timestampSeconds) > 300
-  )
-    return false;
-  const expected = `v0=${createHmac("sha256", signingSecret).update(`v0:${timestamp}:${body}`).digest("hex")}`;
-  try {
-    return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch {
-    return false;
-  }
 }
 
 function slackRequestWorkspaceId(
@@ -26922,15 +26901,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
     if (provider === "slack" && endpoint.providerAccountId) {
       const inspection = request.clone();
-      const body = await inspection.text();
+      const rawBody = new Uint8Array(await inspection.arrayBuffer());
       const credentials = await resolveCredentials(endpoint);
       if (
         slackRequestSignatureIsValid(
           inspection,
-          body,
+          rawBody,
           credentials.signingSecret,
         )
       ) {
+        const body = new TextDecoder().decode(rawBody);
         const incomingWorkspaceId = slackRequestWorkspaceId(
           body,
           inspection.headers.get("content-type") ?? "",
@@ -38393,6 +38373,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     finishSlackSetup: (endpointId: string, userId: string) => test(endpointId, { optionalSlackTestForUser: userId }),
     setupTestStatus,
     handleWebhook,
+    readSlackSigningSecret: async (publicId: string) => {
+      if (typeof publicId !== "string" || publicId.length === 0 || publicId.length > 200) return null;
+      const endpoint = await db.select().from(chatEndpoints).where(and(
+        eq(chatEndpoints.publicId, publicId),
+        eq(chatEndpoints.provider, "slack"),
+      )).then((rows) => rows[0] ?? null);
+      if (!endpoint || endpoint.status === "archived") return null;
+      try {
+        const credentials = await resolveCredentials(endpoint);
+        return typeof credentials.signingSecret === "string" && credentials.signingSecret.length > 0
+          ? credentials.signingSecret
+          : null;
+      } catch {
+        return null;
+      }
+    },
     listResources,
     replaceResources,
     listPrincipals,

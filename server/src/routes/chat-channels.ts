@@ -30,6 +30,7 @@ import {
   type ChatChannelServiceOptions,
 } from "../services/chat-channels.js";
 import { slackDecisionDisclosureService } from "../services/slack-decision-disclosures.js";
+import { handleSlackDecisionCallback } from "../services/slack-decision-transport.js";
 import { accessService } from "../services/access.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { recordChatWebhookStage } from "../services/chat-webhook-diagnostics.js";
@@ -56,6 +57,7 @@ type ChatChannelRouteOptions = ChatChannelServiceOptions & {
 
 type ChatWebhookRouteOptions = {
   rateLimiter?: InviteRateLimiter;
+  db?: Db;
 };
 
 const CHAT_WEBHOOK_RATE_LIMIT_WINDOW_MS = 60_000;
@@ -580,6 +582,37 @@ export function chatWebhookRoutes(
       windowMs: CHAT_WEBHOOK_RATE_LIMIT_WINDOW_MS,
       maxRequests: CHAT_WEBHOOK_RATE_LIMIT_MAX_REQUESTS,
     });
+  router.post("/api/chat-webhooks/:publicId/slack-decision", async (req, res) => {
+    const limit = rateLimiter.consume(
+      `${req.params.publicId}:slack-decision:${req.ip || req.socket?.remoteAddress || "unknown"}`,
+    );
+    res.setHeader("X-RateLimit-Limit", String(limit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(limit.remaining));
+    if (!limit.allowed) {
+      res.setHeader("Retry-After", String(limit.retryAfterSeconds));
+      throw tooManyRequests("Too many chat webhook requests", {
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+    }
+    const captured = (req as ExpressRequest & { rawBody?: Buffer }).rawBody;
+    if (!options.db || !Buffer.isBuffer(captured)) {
+      res.status(401).end();
+      return;
+    }
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (Array.isArray(value)) value.forEach((entry) => headers.append(name, entry));
+      else if (value !== undefined) headers.set(name, value);
+    }
+    const publicId = req.params.publicId as string;
+    const result = await handleSlackDecisionCallback(options.db, {
+      publicId,
+      headers,
+      rawBody: new Uint8Array(captured),
+      readSigningSecret: () => service.readSlackSigningSecret(publicId),
+    });
+    res.status(result.status).end();
+  });
   router.post("/api/chat-webhooks/:publicId/:provider", async (req, res) => {
     recordChatWebhookStage("handler_started");
     // Provider signatures are intentionally verified inside Chat SDK, but an
